@@ -1,18 +1,18 @@
-ZeraPS5 — distribuições experimentais
+ZeraPS5 — experimental releases
 
-Distribuição pública organizada por Metallrock (metallrockdev).
-Destino: https://github.com/zeraps5/ZeraPS5-Releases
+Public distribution maintained by Metallrock (metallrockdev).
+Repository: https://github.com/zeraps5/ZeraPS5-Releases
 
-Este repositório destina-se a pacotes e fontes correspondentes das versões distribuídas.
-Consulte Releases para os downloads e as limitações de cada versão. Os arquivos
-automáticos “Source code” do GitHub não substituem o asset versionado *-source.zip
-nem os materiais sources/ incluídos no pacote do programa.
+This repository hosts packaged releases and their corresponding source code.
+See Releases for downloads and the limitations of each version. GitHub’s
+automatically generated “Source code” archives do not replace the versioned
+*-source.zip asset or the sources/ materials included in the application package.
 
-O ZeraPS5 é experimental. Não há garantia de compatibilidade, estabilidade ou FPS.
-Jogos, firmware, chaves e módulos do console não acompanham os pacotes.
-Leia LEIA-ME.txt, docs/LIMITACOES.txt e docs/RECOMPILAR.txt dentro do ZIP.
+ZeraPS5 is experimental. Compatibility, stability, and FPS are not guaranteed.
+Games, firmware, keys, and console modules are not included in the packages.
+Read LEIA-ME.txt, docs/LIMITACOES.txt, and docs/RECOMPILAR.txt inside the ZIP.
 
-Licenciamento: consulte LICENSE e CREDITS.txt; os pacotes incluem as licenças dos
-componentes, os fontes correspondentes, os fontes FFmpeg e objetos para religação.
-O desenvolvimento privado permanece separado deste repositório de distribuição.
-Não há afiliação com a Sony.
+Licensing: see LICENSE and CREDITS.txt. Packages include component licenses,
+corresponding source code, FFmpeg sources, and object files for relinking.
+Private development is kept separate from this distribution repository.
+ZeraPS5 is not affiliated with Sony.
