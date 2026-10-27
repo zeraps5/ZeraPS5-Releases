@@ -1,0 +1,4 @@
+Pacote: 0.1.0+d7a2182 (build 553, 2026-10-27)
+Revisão dos fontes: d7a218278885f122698b4e4fe51d4df978ab3a58
+Tag proposta da distribuição: v0.1.0-b553
+A revisão dos fontes não é o commit-alvo da futura tag de distribuição.

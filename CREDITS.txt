@@ -1,0 +1,24 @@
+ZeraPS5 — créditos e componentes
+
+Identidade pública e organização: Metallrock (metallrockdev).
+Desenvolvimento preservado: Metallrock, Claude, Codex e Codex (ZeraPS5).
+Esta organização não atribui ao pseudônimo o trabalho dos demais colaboradores.
+
+ZeraPS5 contém arquivos GPL-2.0-or-later e adaptações GPL-2.0-only. O binário
+combinado é distribuído sob GPL versão 2. LICENSE foi preservada.
+KytyPS5 / Kyty contributors: referências e adaptações identificadas nos fontes,
+incluindo shader_bvh_spirv.h. AnyPS5 (boykopovar) contributors: adaptações de
+resampling, snapshot refresh e instruções identificadas nos fontes.
+shadPS4 contributors: referências de ABI e arquitetura indicadas no código.
+Os avisos, atribuições e cabeçalhos de origem foram mantidos.
+
+FFmpeg 7.1.2 contributors: áudio/vídeo, LGPL-2.1-or-later, ligação estática.
+Fontes exatas sem modificações e objetos para religação acompanham o pacote.
+Khronos Group / Vulkan-Headers contributors: cabeçalhos Vulkan, Apache-2.0.
+AMD, Copyright (c) 2007-2024 Advanced Micro Devices, Inc.: tabelas addrlib
+usadas em vk_texture_3d.h; permissão e aviso de garantia em licenses/.
+MinGW-w64 / winpthreads contributors e Lockless Inc.: runtime de compilação.
+GCC runtime: avisos e exceção de runtime em licenses/.
+
+Windows, Vulkan loader e drivers são componentes do sistema. Sony,
+PlayStation e os jogos pertencem aos respectivos titulares. Não há afiliação.
