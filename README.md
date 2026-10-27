@@ -1,13 +1,13 @@
 # ZeraPS5 — experimental releases
 
-[![Windows application downloads (build 553)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b553/ZeraPS5-v0.1.0-b553-win64.zip?displayAssetName=false&label=Windows%20downloads%20%28build%20553%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b553)
+[![Windows application downloads (build 555)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b555/ZeraPS5-v0.1.0-b555-win64.zip?displayAssetName=false&label=Windows%20downloads%20%28build%20555%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b555)
 
-*Application ZIP downloads for build 553, including updates and tests; not unique users. The badge refreshes automatically and may be cached.*
+*Application ZIP downloads for build 555, including updates and tests; not unique users. The badge refreshes automatically and may be cached.*
 
 ## Download and run
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 553](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b553/ZeraPS5-v0.1.0-b553-win64.zip)
+- [Download for Windows x64 — build 555](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b555/ZeraPS5-v0.1.0-b555-win64.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a writable folder and open **ZeraPS5.exe**.
