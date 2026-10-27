@@ -1,5 +1,17 @@
 ZeraPS5 — experimental releases
 
+Download and run
+
+Latest release, downloads, and release notes:
+https://github.com/zeraps5/ZeraPS5-Releases/releases/latest
+
+Direct Windows x64 download — build 553:
+https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b553/ZeraPS5-v0.1.0-b553-win64.zip
+
+1. Download the application ZIP above, rather than GitHub’s automatic source archive.
+2. Extract the ZIP to a writable folder and open ZeraPS5.exe.
+3. Read the included instructions, then add your own games and required console libraries.
+
 Public distribution maintained by Metallrock (metallrockdev).
 Repository: https://github.com/zeraps5/ZeraPS5-Releases
 
