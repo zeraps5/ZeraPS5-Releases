@@ -1,6 +1,6 @@
 # ZeraPS5 — experimental releases
 
-[![Windows application downloads (build 571)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b571/ZeraPS5-v0.1.0-b571-win64.zip?displayAssetName=false&label=Windows%20downloads%20%28build%20571%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b571)
+[![Windows application downloads (build 571)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b571/ZeraPS5-v0.1.0-b571-win64.zip.svg?displayAssetName=false&label=Windows%20downloads%20%28build%20571%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b571)
 
 *Application ZIP downloads for build 571, including updates and tests; not unique users. The badge refreshes automatically and may be cached.*
 
