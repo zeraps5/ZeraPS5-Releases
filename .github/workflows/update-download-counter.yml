@@ -1,0 +1,92 @@
+name: Update Windows download counter
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-download-counter
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Refresh the latest Windows application download count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNTER_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, html, json, os, re, urllib.error, urllib.request
+
+          repo = os.environ['COUNTER_REPOSITORY']
+          if repo != 'zeraps5/ZeraPS5-Releases':
+              raise RuntimeError('This counter is scoped to zeraps5/ZeraPS5-Releases')
+          headers = {'User-Agent': 'ZeraPS5-download-counter', 'Content-Type': 'application/json',
+                     'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'}
+          if os.environ.get('GH_TOKEN'):
+              headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
+
+          def api(path, data=None, optional=False):
+              url = 'https://api.github.com/repos/' + repo + path
+              req = urllib.request.Request(url, headers=headers,
+                  data=None if data is None else json.dumps(data).encode('utf-8'),
+                  method='GET' if data is None else 'PUT')
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if optional and error.code == 404:
+                      return None
+                  raise
+
+          release = api('/releases/latest')
+          tag = release['tag_name']
+          match = re.fullmatch(r'v\d+\.\d+\.\d+-b(\d+)', tag)
+          if not match or release['draft'] or release['prerelease']:
+              raise RuntimeError('Expected a published ZeraPS5 build')
+          name = 'ZeraPS5-' + tag + '-win64.zip'
+          assets = [a for a in release['assets'] if a['name'] == name]
+          if len(assets) != 1:
+              raise RuntimeError('Expected one Windows application ZIP; keeping the last counter')
+          count = assets[0]['download_count']
+          if type(count) is not int or count < 0:
+              raise RuntimeError('Invalid download count; keeping the last counter')
+          label = 'Windows downloads (build ' + match[1] + ')'
+          left = len(label) * 7 + 12
+          right = max(24, len(str(count)) * 7 + 12)
+          width = left + right
+          title = html.escape(label + ': ' + str(count))
+          svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="22" role="img" aria-label="{title}">'
+                 f'<title>{title}</title><rect width="{width}" height="22" rx="3" fill="#555"/>'
+                 f'<path d="M{left} 0h{right}v22h-{right}z" fill="#2ea44f"/>'
+                 '<g fill="#fff" text-anchor="middle" font-family="Verdana,Arial,sans-serif" font-size="11">'
+                 f'<text x="{left/2}" y="15">{html.escape(label)}</text>'
+                 f'<text x="{left+right/2}" y="15">{count}</text></g></svg>\n')
+          if os.environ.get('COUNTER_DRY_RUN') == '1':
+              print(svg, end='')
+          else:
+              current = api('/contents/docs/downloads.svg?ref=main', optional=True)
+              if current and base64.b64decode(current['content']).decode('utf-8') == svg:
+                  print('Counter unchanged; no commit needed')
+              else:
+                  update = {'message': 'docs: refresh Windows download counter',
+                            'content': base64.b64encode(svg.encode('utf-8')).decode('ascii'),
+                            'branch': 'main',
+                            'committer': {'name': 'github-actions[bot]',
+                              'email': '41898282+github-actions[bot]@users.noreply.github.com'}}
+                  if current:
+                      update['sha'] = current['sha']
+                  api('/contents/docs/downloads.svg', update)
+                  print('Counter updated for ' + tag + ': ' + str(count))
+          PY
