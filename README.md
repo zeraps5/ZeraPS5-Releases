@@ -1,18 +1,19 @@
 # ZeraPS5 — experimental releases
 
-[![Windows application downloads (build 561)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b561/ZeraPS5-v0.1.0-b561-win64.zip?displayAssetName=false&label=Windows%20downloads%20%28build%20561%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b561)
+[![Windows application downloads (build 571)](https://img.shields.io/github/downloads/zeraps5/ZeraPS5-Releases/v0.1.0-b571/ZeraPS5-v0.1.0-b571-win64.zip?displayAssetName=false&label=Windows%20downloads%20%28build%20571%29&color=2ea44f)](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b571)
 
-*Application ZIP downloads for build 561, including updates and tests; not unique users. The badge refreshes automatically and may be cached.*
+*Application ZIP downloads for build 571, including updates and tests; not unique users. The badge refreshes automatically and may be cached.*
 
 ## Download and run
 
-**Current release: v0.1.0-b561.**
+**Current release: v0.1.0-b571.**
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 561](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b561/ZeraPS5-v0.1.0-b561-win64.zip)
+- [Download for Windows x64 — build 571](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b571/ZeraPS5-v0.1.0-b571-win64.zip)
+- [Download source code — build 571](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b571/ZeraPS5-v0.1.0-b571-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
-2. Extract the ZIP to a writable folder and open **ZeraPS5.exe**.
+2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
 3. Read the included instructions, then add your own games and required console libraries.
 
 ## Game compatibility
