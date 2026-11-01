@@ -1,9 +1,7 @@
 # ZeraPS5 — experimental releases
 
 <p align="center">
-  <img src="docs/zeraps5-logo.png" alt="ZeraPS5" width="420" align="middle" />
-  &nbsp;
-  <img src="docs/zeraps5-mascot.png" alt="ZeraPS5 capybara mascot in a black hoodie with lime accents" width="170" align="middle" />
+  <img src="docs/zeraps5-cover.png" alt="ZeraPS5 logo and capybara mascot" width="900" />
 </p>
 
 [![Windows application downloads (latest release)](docs/downloads.svg)](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
