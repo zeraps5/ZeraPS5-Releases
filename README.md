@@ -1,5 +1,11 @@
 # ZeraPS5 — experimental releases
 
+<p align="center">
+  <img src="docs/zeraps5-logo.png" alt="ZeraPS5" width="420" align="middle" />
+  &nbsp;
+  <img src="docs/zeraps5-mascot.png" alt="ZeraPS5 capybara mascot in a black hoodie with lime accents" width="170" align="middle" />
+</p>
+
 [![Windows application downloads (latest release)](docs/downloads.svg)](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
 
 *Windows application ZIP downloads for the latest release, including updates and tests; not unique users. Updated automatically on an hourly schedule and after a release. GitHub may delay refreshes or cache the image.*
@@ -40,4 +46,5 @@ See [LICENSE](LICENSE) and [CREDITS.txt](CREDITS.txt). Packages include componen
 corresponding source code, FFmpeg sources, and object files for relinking.
 Private development is kept separate from this distribution repository.
 ZeraPS5 is not affiliated with Sony.
+
 
