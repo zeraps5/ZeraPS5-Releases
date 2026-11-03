@@ -12,13 +12,13 @@
 
 ## Download and run
 
-**Current release: v0.1.0-b705.**
+**Current release: v0.1.0-b786.**
 
-**Wolverine & ASTRO BOT development milestones, graphics fixes and 2D progress on Intel Iris Xe.** See the [technical changelog and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b705). The compatibility list keeps the actual tested builds and hardware for these development results.
+**Graphics fixes, PSP/PS1 classics and 12 new compatibility records.** See the [technical changelog and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b786). Ratchet & Clank: Size Matters and Disney's Atlantis reached gameplay in notebook development tests; the list preserves each result's original build and hardware. Other titles still have initialization failures, missing graphics or low speed.
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 705](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b705/ZeraPS5-v0.1.0-b705-win64.zip)
-- [Download source code — build 705](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b705/ZeraPS5-v0.1.0-b705-win64-source.zip)
+- [Download for Windows x64 — build 786](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b786/ZeraPS5-v0.1.0-b786-win64.zip)
+- [Download source code — build 786](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b786/ZeraPS5-v0.1.0-b786-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
@@ -46,6 +46,3 @@ See [LICENSE](LICENSE) and [CREDITS.txt](CREDITS.txt). Packages include componen
 corresponding source code, FFmpeg sources, and object files for relinking.
 Private development is kept separate from this distribution repository.
 ZeraPS5 is not affiliated with Sony.
-
-
-
