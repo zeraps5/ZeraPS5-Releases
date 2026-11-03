@@ -2,11 +2,34 @@
 
 From 2D gameplay on integrated graphics to experimental PS5 scene rendering, these records show the progress reached in ZeraPS5. Each entry keeps its own tested build or dated development assessment and hardware.
 
-Updated: **2026-11-01**. Current public package: **b705**. A development result is not automatically a b705 result. Where a per-run build was not recorded, the dated assessment is shown. Playable segments do not imply an entire game was completed.
+Updated: **2026-11-02**. Current public package: **b786**. A development result is not automatically a b786 result. Where a per-run build was not recorded, the dated assessment is shown. Playable segments do not imply an entire game was completed.
 
 **Intel integrated-graphics spotlight:** New Joe & Mac: Caveman Ninja is reported at **60 FPS on Core i5-1235U / Intel Iris Xe** in the development assessment. This result is specific to that game/profile; it was not remeasured in the final b705 package.
 
 **Wolverine and ASTRO BOT:** development has advanced in menu/save handling and visible hub rendering. Their detailed stages and remaining work are listed below.
+
+## New records accompanying build 786
+
+The nine RTX 5060 Ti sessions used **build 756 (`1c4893f`)**. The three notebook results used **Core i5-1235U / Intel Iris Xe** and the revisions named below. The classic-game fixes are included in b786; Atlantis was not retested on the merge, and neither classic was retested on RTX for this release. None of these sessions is relabeled as a b786 benchmark. All twelve titles were tested on 2 November 2026.
+
+| Game | Hardware and tested build | Observed result |
+| --- | --- | --- |
+| BUBBLE BOBBLE Sugar Dungeons | RTX 5060 Ti · build 756, `1c4893f` | Bub responds to controls in the starting area and reaches the Training Room movement/bubble tutorial. Gameplay FPS not measured. |
+| Planet of Lana | RTX 5060 Ti · build 756, `1c4893f` | New Game reaches the village movement tutorial; Lana crosses the walkway with analog input. Gameplay FPS not measured. |
+| Fatal Frame / Project Zero: Maiden of Black Water | RTX 5060 Ti · build 756, `1c4893f` | Reaches Miu Hinasaki's camera tutorial in the prologue; dialog and camera respond. The scene is very dark. Gameplay FPS not measured. |
+| TMNT: Splintered Fate | RTX 5060 Ti · build 756, `1c4893f` | Opening image stays black and stops at 196 frames; X does not reach the menu within 80 seconds. |
+| Tetris Effect: Connected | RTX 5060 Ti · build 756, `1c4893f` | Exits before the menu; memory mapping fails with `0x8002000d` in two runs. |
+| Double Dragon Gaiden: Rise of the Dragons | RTX 5060 Ti · build 756, `1c4893f` | Exits during initialization before the menu, on a null-address read. |
+| Jurassic Park Classic Games Collection | RTX 5060 Ti · build 756, `1c4893f` | Exits before game selection, after an unimplemented memory call and a null-address write. |
+| TMNT Arcade: Wrath of the Mutants | RTX 5060 Ti · build 756, `1c4893f` | Black screen and exit before the menu; a PSN-module version warning precedes an invalid access. |
+| Arcade Game Zone | RTX 5060 Ti · build 756, `1c4893f` | Black frames and exit during text/content initialization. |
+| Ratchet & Clank: Size Matters — PSP classic | Core i5-1235U / Iris Xe · `claude/ratchet-psp`, then merge candidate `d5872a5` | Reaches gameplay in Pokitaru with correct textures/colors. About 11–13 FPS on the test branch and 14–15 FPS in the merge-candidate run; game menu about 29 FPS. Emulator Options menu text is missing. |
+| Disney's Atlantis: The Lost Empire — PS1 classic | Core i5-1235U / Iris Xe · `claude/ratchet-psp` | Reaches Whitmore's Mansion at about 6–7 FPS; menu about 60 FPS. Emulator hint text is missing. Not retested on the merged build or RTX. |
+| The Mortuary Assistant | Core i5-1235U / Iris Xe · `1c4893f` | Logos/warning at about 40–60 FPS; main menu visible at about 1 FPS. Gameplay not confirmed. |
+
+TMNT: Splintered Fate, TMNT Arcade: Wrath of the Mutants and TMNT: Mutants Unleashed are separate games. Reaching a short playable segment does not establish complete-game compatibility.
+
+## Earlier recorded results
 
 | Game / title ID | Last recorded test or assessment | Stage reached | Hardware | Context |
 | --- | --- | --- | --- | --- |
@@ -49,4 +72,4 @@ Try a recent build and share the emulator build, game version, hardware, setting
 
 Records combine dated developer assessments and isolated test runs. Intel Iris Xe and RTX results remain separate. Experimental profiles, private resolution experiments and optional performance modes are identified in their notes; their results do not establish default-package performance.
 
-[Download b705 and read the technical changelog](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b705) · [Back to README](README.md)
+[Download b786 and read the technical changelog](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b786) · [Back to README](README.md)
