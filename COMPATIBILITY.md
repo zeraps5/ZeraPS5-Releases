@@ -2,7 +2,7 @@
 
 From 2D gameplay on integrated graphics to experimental PS5 scene rendering, these records show the progress reached in ZeraPS5. Each entry keeps its own tested build or dated development assessment and hardware.
 
-Updated: **2026-11-02**. Current public package: **b786**. A development result is not automatically a b786 result. Where a per-run build was not recorded, the dated assessment is shown. Playable segments do not imply an entire game was completed.
+Updated: **2026-11-06**. Current candidate package: **b838**. A development result is not automatically a b786 result. Where a per-run build was not recorded, the dated assessment is shown. Playable segments do not imply an entire game was completed.
 
 **Intel integrated-graphics spotlight:** New Joe & Mac: Caveman Ninja is reported at **60 FPS on Core i5-1235U / Intel Iris Xe** in the development assessment. This result is specific to that game/profile; it was not remeasured in the final b705 package.
 
@@ -73,3 +73,41 @@ Try a recent build and share the emulator build, game version, hardware, setting
 Records combine dated developer assessments and isolated test runs. Intel Iris Xe and RTX results remain separate. Experimental profiles, private resolution experiments and optional performance modes are identified in their notes; their results do not establish default-package performance.
 
 [Download b786 and read the technical changelog](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b786) · [Back to README](README.md)
+
+
+## External-drive startup survey — 2026-11-06, build 837
+
+Hardware: Ryzen 7 5700G, RTX 5060 Ti 16 GB, Windows. Exact source: `913a5ec`. 28 short sessions, normally 90 s with selected extensions. Capture and staging work were enabled: this was not an FPS comparison. Original saves were preserved. Several windows were manually closed, so normal code-0 closures are not classified as crashes. A title, video, preview or attract scene is not a gameplay confirmation. Short new sessions do not replace earlier verified gameplay records.
+
+| Game | ID | Version | Stage observed | Observation |
+|---|---|---|---|---|
+| Shadow of the Ninja | PPSA20450 | 01.000.000 | Title | Opening animation and PRESS ANY BUTTON. Gameplay not tested. |
+| Planet of Lana | PPSA19450 | 01.010.000 | Loading | Loading icon, then black frames during the 90 s window. Earlier gameplay record is not invalidated by this short load test. |
+| Atari 50: The Anniversary Celebration | PPSA08601 | 01.009.000 | Gallery/menu | Pong cabinet and text rendered in the gallery. Minigame controls not tested. |
+| Goosebumps: Terror in Little Creek | PPSA27305 | 01.000.002 | Loading | Publisher logos and street/loading screen. No gameplay in 182 s. |
+| PROJECT ZERO: MAIDEN OF BLACK WATER | PPSA04333 | 01.000.005 | In-game tutorial | 3D prologue scene with Miu and a movement tutorial. Scene is dark; analog movement was not verified in this session. |
+| Tomb Raider IV-VI Remastered | PPSA18154 | 01.000.005 | License agreement | Agreement displayed; not accepted automatically. Gameplay pending user acceptance. |
+| Resident Evil 4 | PPSA07411 | 01.000.000 | Initialization fault | Memory access fault in PlayGo thread, libc+0x479b, after about 7 s. Root cause not established. |
+| TMNT: Splintered Fate | PPSA25582 | 01.017.000 | Terms / UI defect | Terms panel displayed, displaced/cropped at the lower right. Agreement not accepted automatically. |
+| Arcade Game Zone | PPSA19015 | 01.003.000 | Rendered scene | Air-hockey court, paddles, puck and score rendered. May be attract/demo mode; player control not verified. |
+| The Smurfs: Mission Vileaf | PPSA02876 | 01.000.001 | Opening | Splash/title artwork. Menu and gameplay not reached in this session. |
+| Grand Theft Auto: San Andreas – The Definitive Edition | PPSA03524 | 01.003.000 | Opening | San Andreas logo displayed. No gameplay in this session. |
+| SONIC FRONTIERS | PPSA03831 | 01.041.000 | Opening cutscene | 3D Eggman cutscene and Skip prompt displayed. Gameplay not tested. |
+| Diablo® II: Resurrected™ | PPSA03912 | 01.039.000 | Title | Title screen with fire colors and Press X to start. Gameplay not tested. |
+| Trifox | PPSA06408 | 01.002.000 | Opening, then black | FMOD logo followed by black frames until the 90 s limit. No spontaneous crash recorded. |
+| SUPER BOMBERMAN R 2 | PPSA07190 | 01.003.001 | Initial settings | Language/region settings displayed. Navigation attempt did not advance; gameplay not verified. |
+| Tetris® Effect: Connected | PPSA07923 | 02.000.021 | Initial warning | Photosensitivity warning displayed. Menu/gameplay not verified. |
+| Alone in the Dark | PPSA08240 | 01.000.000 | Loading | Dark mansion/loading screen. No gameplay within 182 s. |
+| Double Dragon Gaiden: Rise of the Dragons | PPSA16018 | 01.000.013 | Title | Double Dragon Gaiden title and credit counter displayed. Gameplay not tested. |
+| Jurassic Park Classic Games Collection | PPSA17217 | 01.000.000 | Game selection | Jurassic Park 8-bit selection and preview video displayed. Preview is not proof that the minigame was started. |
+| TMNT: Mutants Unleashed | PPSA17245 | 01.000.000 | Opening | Last captured image was Unity. Logs show additional rendering during the final seconds; no documented gameplay in 91 s. |
+| Hello Kitty Island Adventure | PPSA18176 | 02.000.000 | Main menu | New Game / save-slot selection displayed after Cross. Window closed with exit code 0; session interrupted before starting a game. |
+| Teenage Mutant Ninja Turtles Arcade: Wrath of the Mutants | PPSA18571 | 01.000.002 | Title | Warning followed by Press X to start. Window closed with code 0; gameplay not tested. |
+| Alone in the Dark 2 (1996) | PPSA24515 | 01.000.003 | Controls / UI defect | Controller/START screen displayed with poorly legible or missing elements. Window closed with code 0 in 35 s; gameplay not tested. |
+| Ghost of Yōtei | PPSA26344 | 01.512.000 | Vulkan failure | No image presented; VK_ERROR_DEVICE_LOST while waiting for a batch fence, exit code 1 after 13 s. |
+| BUBBLE BOBBLE SUGAR DUNGEONS | PPSA26356 | 01.002.000 | Autosave notice | Autosave notice and Yes button displayed. Window closed with code 0 in 33 s; gameplay not tested. |
+| SILENT HILL: Townfall | PPSA33286 | 02.003.000 | Opening | SCREEN logo displayed after a long initial pipeline/resource load. No menu/gameplay in 152 s. |
+| Sonic Unleashed Recompiled | PPSA99902 | 01.003.000 | Guest abort | Homebrew/recompiled port. Calls abort and executes UD2 at eboot+0x33c17d9; exits with code 3 after 5 s. This is not proof of a missing host CPU instruction. |
+| SpongeBob SquarePants: Titans of the Tide | PPSA26893 | not read from image | Autosave notice / loading | Read directly from the exFAT image. Portuguese autosave notice displayed; process ended with code 0 during resource loading at 127 s. Gameplay and exact closure cause not established. |
+
+Three PKG-only folders were excluded by choice. The survey used 27 extracted game folders and one exFAT image. Sonic Unleashed Recompiled is a homebrew/recompiled port. No license agreement was accepted automatically.

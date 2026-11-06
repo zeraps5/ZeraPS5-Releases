@@ -8,13 +8,16 @@ ZeraPS5 contém arquivos GPL-2.0-or-later e adaptações GPL-2.0-only. O binári
 combinado é distribuído sob GPL versão 2. LICENSE foi preservada.
 KytyPS5 / Kyty contributors: referências e adaptações identificadas nos fontes,
 incluindo shader_bvh_spirv.h. AnyPS5 (boykopovar) contributors: adaptações de
-resampling, snapshot refresh e instruções identificadas nos fontes.
+resampling, snapshot refresh, texto do libSceFont (lib_font_text.c) e
+instruções identificadas nos fontes.
 shadPS4 contributors: referências de ABI e arquitetura indicadas no código.
 Os avisos, atribuições e cabeçalhos de origem foram mantidos.
 
 FFmpeg 7.1.2 contributors: áudio/vídeo, LGPL-2.1-or-later, ligação estática.
 Fontes exatas sem modificações e objetos para religação acompanham o pacote.
 Khronos Group / Vulkan-Headers contributors: cabeçalhos Vulkan, Apache-2.0.
+Sean Barrett / stb_truetype: leitura e desenho de fontes, MIT ou domínio
+público. The Noto Project Authors: fonte Noto Sans (data/fonts), SIL OFL 1.1.
 AMD, Copyright (c) 2007-2024 Advanced Micro Devices, Inc.: tabelas addrlib
 usadas em vk_texture_3d.h; permissão e aviso de garantia em licenses/.
 MinGW-w64 / winpthreads contributors e Lockless Inc.: runtime de compilação.

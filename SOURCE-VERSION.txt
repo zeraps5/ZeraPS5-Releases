@@ -1,4 +1,8 @@
-Pacote: 0.1.0+d7a2182 (build 553, 2026-10-27)
-Revisão dos fontes: d7a218278885f122698b4e4fe51d4df978ab3a58
-Tag proposta da distribuição: v0.1.0-b553
-A revisão dos fontes não é o commit-alvo da futura tag de distribuição.
+Public release: v0.1.0-b838
+Version: 0.1.0+71f2d42 (build 838, 2026-11-06)
+Corresponding emulator source commit: 71f2d428587d34a9e21663c405b4d348b3385a60
+Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b838/ZeraPS5-v0.1.0-b838-win64-source.zip
+
+This repository contains release documentation and packaged distributions.
+Its release tag points to this distribution repository, not the emulator source commit.
+Use the versioned source archive above instead of GitHub's automatic source archives.
