@@ -36,7 +36,9 @@ Highlights included in this release:
 
 ## Game compatibility
 
-[Game compatibility and tested builds](COMPATIBILITY.md) — see the latest recorded test for each game, the result reached, and earlier progress where relevant.
+[Game compatibility and tested builds](COMPATIBILITY.md) — updated for the b898 release, with recorded Intel and RTX results through 10 November 2026, actual tested revisions, and the preserved startup survey/history.
+
+[Technical changelog](CHANGELOG.md) · [Contribute or report a result](CONTRIBUTING.md) · [Matching source revision and checksums](SOURCE-VERSION.txt)
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 

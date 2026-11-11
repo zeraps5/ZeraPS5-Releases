@@ -1,0 +1,865 @@
+{
+  "schema": 1,
+  "reviewed": "2026-11-11",
+  "current_release": "v0.1.0-b898",
+  "source_commit": "7f993bde30200c6d1eafbaaba6afc8c96973f0b6",
+  "records": [
+    {
+      "game": "Alone in the Dark 2 — PS1 classic",
+      "title_id": "PPSA24515",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b861 · `540ebaf` · 2026-11-08",
+      "stage": "Gameplay",
+      "notes": "Character movement and combat at about 60 FPS in the tested section. Language selection, opening and text rendering work in this record.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Dolphin Spirit: Ocean Mission",
+      "title_id": "PPSA13711",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Gameplay",
+      "notes": "Underwater movement and camera respond. About 30–56 FPS during the 181-second run; 55.9 FPS over the last recorded 20 seconds. 1080p output, game internal resolution.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "The Rogue Prince of Persia",
+      "title_id": "PPSA28155",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b851 · `628cb73` · 2026-11-08",
+      "stage": "Gameplay",
+      "notes": "First level with the Prince and dialogue, about 11–12 FPS, CPU-limited. Loading takes about 15 seconds in this record.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "TMNT: Splintered Fate",
+      "title_id": "PPSA25582",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`claude/tmnt-tela` · 2026-11-08",
+      "stage": "Gameplay tutorial",
+      "notes": "Menu and movement tutorial, about 23 FPS at 720p internal resolution and 14 FPS at 1080p. Opening/terms fill the screen; lighting improved. Entering gameplay can show 8–15 seconds of shader-compilation black frames.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Return to Monkey Island",
+      "title_id": "PPSA10122",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-07; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "Prologue and first park scene with characters. Accented subtitle text is visible.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Wobbly Life",
+      "title_id": "PPSA29413",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b850 · `8ffa708` · 2026-11-07",
+      "stage": "World selection / opening story",
+      "notes": "World selection and the opening story render. The P in one continue prompt is shaded incorrectly. Interactive gameplay beyond this scene was not documented.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Ratchet & Clank: Size Matters — PSP classic",
+      "title_id": "PPSA14431",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`64f19a6` · 2026-11-03; UI follow-up `claude/font-layout` · 2026-11-03",
+      "stage": "Gameplay",
+      "notes": "Pokitaru gameplay about 17–18 FPS, with correct textures/colors. Earlier branch/merge tests were about 11–15 FPS. The later font-layout record shows text in the emulator Options menu; it is a separate UI check.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Disney's Atlantis: The Lost Empire — PS1 classic",
+      "title_id": "PPSA14421",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`claude/ratchet-psp` · 2026-11-02; UI follow-up `claude/font-layout` · 2026-11-03",
+      "stage": "Gameplay / UI follow-up",
+      "notes": "Whitmore's Mansion about 6–7 FPS; menu about 60 FPS in the gameplay run. Later UI record shows emulator menu/hint text. No new gameplay FPS measurement was recorded for that UI revision.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "New Joe & Mac: Caveman Ninja",
+      "title_id": "PPSA02801",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer record; menu correction recorded in `1eebf77`",
+      "stage": "Playable segment",
+      "notes": "About 60 FPS reported. The updated developer record says all menu-item text is visible. Full-game completion was not assessed.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Dead Cells: Return to Castlevania Edition",
+      "title_id": "PPSA15552",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "Sound present. Menu-layer flicker is reported fixed in the 1 November record.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "KAGE: Shadow of The Ninja",
+      "title_id": "PPSA20450",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer record; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "Stage 1 is reported playable and rendered correctly in the updated developer record. The older triangular-black-area note is superseded for this Intel record.",
+      "section": "gameplay",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Shadow of the Ninja",
+        "game_version": "01.000.000",
+        "stage": "Title",
+        "observation": "Opening animation and PRESS ANY BUTTON. Gameplay not tested."
+      }
+    },
+    {
+      "game": "Record of Lodoss War: Deedlit in Wonder Labyrinth",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "In-game progress recorded; no whole-game completion result.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Arkanoid: Eternal Battle",
+      "title_id": "PPSA06328",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "RETRO mode recorded.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Rugrats: Adventures in Gameland",
+      "title_id": "PPSA23396",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "In-game progress recorded.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "void tRrLM(); //Void Terrarium",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "In-game progress with sound recorded.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Dragon Ball: Sparking! ZERO",
+      "title_id": "PPSA15211",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Gameplay / combat",
+      "notes": "Combat reached; image remains dark.",
+      "section": "gameplay",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Grand Theft Auto V",
+      "title_id": "PPSA04263",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "Public b705 · 2026-11-01",
+      "stage": "Gameplay / prologue",
+      "notes": "Bank room and characters in an approximately 332-second isolated run. Wood, clothing, notice and reflections visible. Text/transitions and longer stability checks remain relevant.",
+      "section": "gameplay",
+      "evidence": "public-history"
+    },
+    {
+      "game": "Minecraft",
+      "title_id": "PPSA17221",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "Public b705 · 2026-11-01",
+      "stage": "Gameplay",
+      "notes": "Copied world with terrain, sky, shovel and HUD in an approximately 292-second isolated run. Explicit host-memory layout; original settings/saves preserved.",
+      "section": "gameplay",
+      "evidence": "public-history"
+    },
+    {
+      "game": "The Elder Scrolls V: Skyrim",
+      "title_id": "PPSA03747",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b703 · `319d150` · 2026-11-01",
+      "stage": "In-game introduction",
+      "notes": "Cart, characters and forest visible without major black cutouts in examined frames. Slow; opening segment only.",
+      "section": "gameplay",
+      "evidence": "public-history"
+    },
+    {
+      "game": "No Man's Sky",
+      "title_id": "PPSA02110",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "2026-10-28 development run; per-run build not recorded",
+      "stage": "Planet / inventory",
+      "notes": "Planet and inventory rendered at very low speed with texture/lighting defects. The Intel record covers menus, mode selection and the galaxy sequence.",
+      "section": "gameplay",
+      "evidence": "public-history"
+    },
+    {
+      "game": "BUBBLE BOBBLE Sugar Dungeons",
+      "title_id": "PPSA26356",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b756 · `1c4893f` · 2026-11-02",
+      "stage": "Gameplay tutorial",
+      "notes": "Bub responds to controls and reaches Training Room movement/bubble tutorial. FPS not measured. Later b837 startup check stopped at the autosave notice; see the startup survey.",
+      "section": "gameplay",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "BUBBLE BOBBLE SUGAR DUNGEONS",
+        "game_version": "01.002.000",
+        "stage": "Autosave notice",
+        "observation": "Autosave notice and Yes button displayed. Window closed with code 0 in 33 s; gameplay not tested."
+      }
+    },
+    {
+      "game": "Planet of Lana",
+      "title_id": "PPSA19450",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b756 · `1c4893f` · 2026-11-02",
+      "stage": "Gameplay tutorial",
+      "notes": "New Game reaches village movement; Lana crosses the walkway with analog input. FPS not measured. Later b837 startup check recorded loading/black frames within 90 seconds.",
+      "section": "gameplay",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "Planet of Lana",
+        "game_version": "01.010.000",
+        "stage": "Loading",
+        "observation": "Loading icon, then black frames during the 90 s window. Earlier gameplay record is not invalidated by this short load test."
+      }
+    },
+    {
+      "game": "Fatal Frame / Project Zero: Maiden of Black Water",
+      "title_id": "PPSA04333",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b756 · `1c4893f` · 2026-11-02",
+      "stage": "Gameplay / camera tutorial",
+      "notes": "Miu Hinasaki's prologue camera tutorial; dialogue and camera respond. Very dark scene. The later b837 survey reached the prologue tutorial but did not verify analog control in that run.",
+      "section": "gameplay",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "PROJECT ZERO: MAIDEN OF BLACK WATER",
+        "game_version": "01.000.005",
+        "stage": "In-game tutorial",
+        "observation": "3D prologue scene with Miu and a movement tutorial. Scene is dark; analog movement was not verified in this session."
+      }
+    },
+    {
+      "game": "ASTRO BOT",
+      "title_id": "PPSA21567",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b703 · `319d150` · 2026-11-01",
+      "stage": "Experimental hub scene",
+      "notes": "Ship, character and objects visible with a direct-hub experimental profile. Distant terrain, lighting/UI, very low speed and slow shutdown remain. Keep separate from the older Intel opening-only record.",
+      "section": "scene",
+      "evidence": "public-history"
+    },
+    {
+      "game": "Marvel's Wolverine",
+      "title_id": "PPSA03671",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "Development work through `a1b4e1a` · 2026-10-31",
+      "stage": "Menus / save selection / incomplete scene",
+      "notes": "Menu navigation and save handling advanced in specific development profiles. Player-controlled gameplay was not established. Keep separate from the older opening-only record.",
+      "section": "scene",
+      "evidence": "public-history"
+    },
+    {
+      "game": "Red Dead Redemption",
+      "title_id": "PPSA30528",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b703 · `319d150` · 2026-11-01",
+      "stage": "Opening 3D scenes",
+      "notes": "Boat, port and characters. Material defects and ATRAC9 warnings remain; prior device-loss incidents are not established as fixed. This entry is Red Dead Redemption.",
+      "section": "scene",
+      "evidence": "public-history"
+    },
+    {
+      "game": "TMNT: Mutants Unleashed",
+      "title_id": "PPSA17245",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b703 · `319d150` · 2026-11-01",
+      "stage": "Menus / introduction / level loading",
+      "notes": "Vulkan device loss at about 568 seconds in the first run. Later b837 startup check ended at the Unity opening; gameplay was not documented.",
+      "section": "scene",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "TMNT: Mutants Unleashed",
+        "game_version": "01.000.000",
+        "stage": "Opening",
+        "observation": "Last captured image was Unity. Logs show additional rendering during the final seconds; no documented gameplay in 91 s."
+      }
+    },
+    {
+      "game": "Sonic Frontiers",
+      "title_id": "PPSA03831",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "User confirmation · 2026-10-30; developer assessment · 2026-11-01",
+      "stage": "Playable segment",
+      "notes": "User-confirmed playable segment. The developer record notes an initial-logo video without image. Per-run build was not supplied.",
+      "section": "gameplay",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "SONIC FRONTIERS",
+        "game_version": "01.041.000",
+        "stage": "Opening cutscene",
+        "observation": "3D Eggman cutscene and Skip prompt displayed. Gameplay not tested."
+      }
+    },
+    {
+      "game": "Crash Bandicoot 4: It's About Time",
+      "title_id": "PPSA02433",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b893 · `bbecd5a` · 2026-11-10",
+      "stage": "Title",
+      "notes": "Correct PRESS START image, about 31 FPS with pauses up to 0.6 seconds.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "XIII",
+      "title_id": "PPSA02775",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b893 · `bbecd5a` · 2026-11-10",
+      "stage": "Title",
+      "notes": "Microids/PlayMagic videos and Press any button prompt, about 36 FPS.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Poppy Playtime: Chapter 2",
+      "title_id": "PPSA21631",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b893 · `bbecd5a` · 2026-11-10",
+      "stage": "Main menu",
+      "notes": "Portuguese Play/Settings menu, about 7–12 FPS.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "R-Type Delta HD Boosted",
+      "title_id": "PPSA26414",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Title / 3D demonstration",
+      "notes": "About 45 FPS near the end of the demonstration. Opening geometry/color defects; the demonstration is not a player-controlled gameplay result.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Balan Wonderworld",
+      "title_id": "PPSA02058",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Main menu",
+      "notes": "Portuguese menus and language selection. New Game produced a black image and repeated ATRAC9 errors in the 182-second run.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "The Mortuary Assistant — PS5",
+      "title_id": "PPSA16110",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`f4e3795` · 2026-11-03",
+      "stage": "Main menu",
+      "notes": "Menu about 3 FPS, improved from about 1 FPS on `1c4893f`. Earlier logos/warning about 40–60 FPS.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Little Nightmares Enhanced Edition",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "Developer record updated 2026-11-01; per-run build not recorded",
+      "stage": "Title",
+      "notes": "About 3.5–4 FPS, GPU-limited. Ray-tracing paths are experimental opt-ins. Separate from the original Little Nightmares entry.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Wizard with a Gun",
+      "title_id": "PPSA06416",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Main menu",
+      "notes": "About 42 FPS reported; first frame contains blue/red blocks.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Dying Light: The Beast",
+      "title_id": "PPSA24002",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Title / loading",
+      "notes": "Local account emulation can pass the login prompt and reach loading. This does not connect to PSN.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "LEGO Bricktales",
+      "title_id": "PPSA07430",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Menu",
+      "notes": "4K output reported for the menu; gameplay/FPS were not measured in this record.",
+      "section": "menu",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "The Smurfs: Mission Vileaf",
+      "title_id": "PPSA02876",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Menu",
+      "notes": "Developer menu record. Later RTX b837 startup survey shows opening artwork only.",
+      "section": "menu",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "The Smurfs: Mission Vileaf",
+        "game_version": "01.000.001",
+        "stage": "Opening",
+        "observation": "Splash/title artwork. Menu and gameplay not reached in this session."
+      }
+    },
+    {
+      "game": "Resident Evil 2",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "Developer assessment · 2026-11-01; earlier cinematic record · 2026-10-24",
+      "stage": "Menus / New Game / cinematic",
+      "notes": "Earlier 3D scene was black; the later assessment does not document a stronger gameplay result.",
+      "section": "menu",
+      "evidence": "public-history"
+    },
+    {
+      "game": "Peppa Pig",
+      "title_id": "PPSA03706",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b571 video change; developer assessment · 2026-11-01",
+      "stage": "Menus / opening videos",
+      "notes": "Opening videos play in the developer record; per-run build of the later assessment was not supplied.",
+      "section": "menu",
+      "evidence": "source-b898+public-history"
+    },
+    {
+      "game": "Double Dragon Gaiden: Rise of the Dragons",
+      "title_id": "PPSA16018",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Title",
+      "notes": "About 50 FPS at the title after plugin-loading fixes. Later RTX b837 survey also reached the title.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Double Dragon Gaiden: Rise of the Dragons",
+        "game_version": "01.000.013",
+        "stage": "Title",
+        "observation": "Double Dragon Gaiden title and credit counter displayed. Gameplay not tested."
+      }
+    },
+    {
+      "game": "Jurassic Park Classic Games Collection",
+      "title_id": "PPSA17217",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Title",
+      "notes": "Opening video and PRESS X TO START, about 40 FPS. RTX b837 survey separately reached game selection/preview.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Jurassic Park Classic Games Collection",
+        "game_version": "01.000.000",
+        "stage": "Game selection",
+        "observation": "Jurassic Park 8-bit selection and preview video displayed. Preview is not proof that the minigame was started."
+      }
+    },
+    {
+      "game": "TMNT Arcade: Wrath of the Mutants",
+      "title_id": "PPSA18571",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Character selection",
+      "notes": "Character selection reached after module-loading fixes. RTX b837 survey separately reached the title.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Teenage Mutant Ninja Turtles Arcade: Wrath of the Mutants",
+        "game_version": "01.000.002",
+        "stage": "Title",
+        "observation": "Warning followed by Press X to start. Window closed with code 0; gameplay not tested."
+      }
+    },
+    {
+      "game": "Diablo II: Resurrected",
+      "title_id": "PPSA03912",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Title",
+      "notes": "Press X to begin about 20 FPS after approximately 60 seconds loading. RTX b837 separately reached the title.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Diablo® II: Resurrected™",
+        "game_version": "01.039.000",
+        "stage": "Title",
+        "observation": "Title screen with fire colors and Press X to start. Gameplay not tested."
+      }
+    },
+    {
+      "game": "Alone in the Dark (2024)",
+      "title_id": "PPSA08240",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Main menu",
+      "notes": "Continue / New Game / Options visible after an Intel shader issue. RTX b837 survey separately recorded loading.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Alone in the Dark",
+        "game_version": "01.000.000",
+        "stage": "Loading",
+        "observation": "Dark mansion/loading screen. No gameplay within 182 s."
+      }
+    },
+    {
+      "game": "Hello Kitty Island Adventure",
+      "title_id": "PPSA18176",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Title",
+      "notes": "Backported game copy with a decrypted executable folder. RTX b837 separately reached New Game/save selection.",
+      "section": "menu",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Hello Kitty Island Adventure",
+        "game_version": "02.000.000",
+        "stage": "Main menu",
+        "observation": "New Game / save-slot selection displayed after Cross. Window closed with exit code 0; session interrupted before starting a game."
+      }
+    },
+    {
+      "game": "The Last of Us Part I",
+      "title_id": "PPSA07642",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b893 · `bbecd5a` · 2026-11-10",
+      "stage": "Loading / black frames",
+      "notes": "Direct .pkg v02.002.000 passes flexible-memory/PlayGo initialization, loads files and selects language; black frames at about 0.4 FPS. Longer RTX b897 tests reached rendering work but hit the memory guard.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Halloween: The Game",
+      "title_id": "PPSA29340",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Opening / guest exception",
+      "notes": "Opening logo followed by a loading-thread exception writing to address 0x28.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Age of Mythology: Retold",
+      "title_id": "PPSA18653",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Package loading stopped",
+      "notes": "Package reader reported a zero-byte eboot.bin. Cause under investigation; this does not establish the cause of the package condition.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Tetris Effect: Connected",
+      "title_id": "PPSA07923",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Initial warning",
+      "notes": "Passes the prior large-allocation failure and shows the photosensitivity warning. RTX b837 survey also reached this warning.",
+      "section": "startup",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Tetris® Effect: Connected",
+        "game_version": "02.000.021",
+        "stage": "Initial warning",
+        "observation": "Photosensitivity warning displayed. Menu/gameplay not verified."
+      }
+    },
+    {
+      "game": "Trifox",
+      "title_id": "PPSA06408",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Opening",
+      "notes": "Initial logos in a backported game copy. RTX b837 survey showed FMOD then black frames to the time limit.",
+      "section": "startup",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Trifox",
+        "game_version": "01.002.000",
+        "stage": "Opening, then black",
+        "observation": "FMOD logo followed by black frames until the 90 s limit. No spontaneous crash recorded."
+      }
+    },
+    {
+      "game": "SpongeBob SquarePants: Titans of the Tide",
+      "title_id": "PPSA26893",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Opening / warning",
+      "notes": "exFAT image: THQ Nordic/Purple Lamp logos and Portuguese epilepsy notice. RTX b837 survey separately recorded autosave/loading.",
+      "section": "startup",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "SpongeBob SquarePants: Titans of the Tide",
+        "game_version": "not read from image",
+        "stage": "Autosave notice / loading",
+        "observation": "Read directly from the exFAT image. Portuguese autosave notice displayed; process ended with code 0 during resource loading at 127 s. Gameplay and exact closure cause not established."
+      }
+    },
+    {
+      "game": "Grand Theft Auto: San Andreas — The Definitive Edition",
+      "title_id": "PPSA03524",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Opening",
+      "notes": "Initial logo advances, 751 frames in 60 seconds in this record. RTX b837 survey also reached the San Andreas logo.",
+      "section": "startup",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "Grand Theft Auto: San Andreas – The Definitive Edition",
+        "game_version": "01.003.000",
+        "stage": "Opening",
+        "observation": "San Andreas logo displayed. No gameplay in this session."
+      }
+    },
+    {
+      "game": "SILENT HILL: Townfall",
+      "title_id": "PPSA33286",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`d9d6194` · 2026-11-06",
+      "stage": "Opening / very slow rendering",
+      "notes": "About five frames in 60 seconds on Iris Xe during shader/resource work. RTX b837 survey separately reached the SCREEN logo.",
+      "section": "startup",
+      "evidence": "source-b898",
+      "rtx_startup_followup": {
+        "game": "SILENT HILL: Townfall",
+        "game_version": "02.003.000",
+        "stage": "Opening",
+        "observation": "SCREEN logo displayed after a long initial pipeline/resource load. No menu/gameplay in 152 s."
+      }
+    },
+    {
+      "game": "Little Nightmares II",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Opening / black screen",
+      "notes": "Logos about 5 FPS in the developer record, then black screen.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "God of War Sons of Sparta",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Opening",
+      "notes": "Stops at Sony presents in the developer record.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Gothic 1",
+      "title_id": "PPSA09826",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Startup blocked by game data",
+      "notes": "Tested game copy reports Global shader library missing. The incomplete-data case does not establish behavior with a complete copy.",
+      "section": "startup",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Little Nightmares — original",
+      "title_id": "—",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b484 · 2026-10-20",
+      "stage": "Opening",
+      "notes": "Unreal logo recorded. Separate title from Enhanced Edition and Little Nightmares II.",
+      "section": "startup",
+      "evidence": "public-history"
+    },
+    {
+      "game": "Super Bomberman R 2",
+      "title_id": "PPSA07190",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "b117 prompt fix; developer assessment · 2026-11-01",
+      "stage": "Opening / PSN prompt",
+      "notes": "Passed the PSN login request in the developer record. RTX b837 survey separately reached initial language/region settings.",
+      "section": "startup",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "SUPER BOMBERMAN R 2",
+        "game_version": "01.003.001",
+        "stage": "Initial settings",
+        "observation": "Language/region settings displayed. Navigation attempt did not advance; gameplay not verified."
+      }
+    },
+    {
+      "game": "Ghost of Yōtei",
+      "title_id": "PPSA26344",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-01 developer assessment; per-run build not recorded",
+      "stage": "Splash",
+      "notes": "Initial splash in the Intel assessment. RTX b837 startup survey separately ended in Vulkan device loss; older RTX b498 calibration images remain historical.",
+      "section": "startup",
+      "evidence": "source-b898+public-history",
+      "rtx_startup_followup": {
+        "game": "Ghost of Yōtei",
+        "game_version": "01.512.000",
+        "stage": "Vulkan failure",
+        "observation": "No image presented; VK_ERROR_DEVICE_LOST while waiting for a batch fence, exit code 1 after 13 s."
+      }
+    },
+    {
+      "game": "Cloudberry Kingdom — PS4",
+      "title_id": "CUSA57754",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "Developer compatibility update `ad4aeaa` · 2026-11-04; per-run build not recorded",
+      "stage": "Gameplay",
+      "notes": "Logos, video, menus and levels render in the updated record. Some PS4 2D-tiled textures remain black. This replaces the older initialization-only assessment.",
+      "section": "ps4",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "The Mortuary Assistant — PS4",
+      "title_id": "CUSA43772",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b897 · `a1e7371` · 2026-11-10",
+      "stage": "Requires user-provided keys",
+      "notes": "Package loading stops at the PS4-key requirement before loading the game executable. Separate from the PS5 version.",
+      "section": "ps4",
+      "evidence": "source-b898"
+    },
+    {
+      "game": "Atari 50: The Anniversary Celebration",
+      "title_id": "PPSA08601",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "Gallery / menu",
+      "notes": "Pong cabinet and gallery text. Minigame controls were not exercised.",
+      "section": "menu",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Atari 50: The Anniversary Celebration",
+        "game_version": "01.009.000",
+        "stage": "Gallery/menu",
+        "observation": "Pong cabinet and text rendered in the gallery. Minigame controls not tested."
+      }
+    },
+    {
+      "game": "Goosebumps: Terror in Little Creek",
+      "title_id": "PPSA27305",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "Opening / loading",
+      "notes": "Logos and street/loading screen during 182 seconds.",
+      "section": "startup",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Goosebumps: Terror in Little Creek",
+        "game_version": "01.000.002",
+        "stage": "Loading",
+        "observation": "Publisher logos and street/loading screen. No gameplay in 182 s."
+      }
+    },
+    {
+      "game": "Tomb Raider IV-VI Remastered",
+      "title_id": "PPSA18154",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "License agreement",
+      "notes": "Agreement displayed; session stopped before acceptance.",
+      "section": "menu",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Tomb Raider IV-VI Remastered",
+        "game_version": "01.000.005",
+        "stage": "License agreement",
+        "observation": "Agreement displayed; not accepted automatically. Gameplay pending user acceptance."
+      }
+    },
+    {
+      "game": "Resident Evil 4",
+      "title_id": "PPSA07411",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "Initialization exception",
+      "notes": "Memory access fault in PlayGo thread, libc+0x479b, after about seven seconds. Root cause not established.",
+      "section": "startup",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Resident Evil 4",
+        "game_version": "01.000.000",
+        "stage": "Initialization fault",
+        "observation": "Memory access fault in PlayGo thread, libc+0x479b, after about 7 s. Root cause not established."
+      }
+    },
+    {
+      "game": "Arcade Game Zone",
+      "title_id": "PPSA19015",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "Rendered air-hockey scene",
+      "notes": "Court, paddles, puck and score render. Player control was not exercised; may be attract/demo mode. Replaces the older b756 startup-failure result for this hardware.",
+      "section": "scene",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Arcade Game Zone",
+        "game_version": "01.003.000",
+        "stage": "Rendered scene",
+        "observation": "Air-hockey court, paddles, puck and score rendered. May be attract/demo mode; player control not verified."
+      }
+    },
+    {
+      "game": "Sonic Unleashed Recompiled",
+      "title_id": "PPSA99902",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+      "test": "b837 · `913a5ec` · 2026-11-06",
+      "stage": "Guest abort",
+      "notes": "Homebrew/recompiled port calls abort and UD2, ending after about five seconds. This is not evidence of a missing host CPU instruction.",
+      "section": "startup",
+      "evidence": "public-history",
+      "rtx_startup_followup": {
+        "game": "Sonic Unleashed Recompiled",
+        "game_version": "01.003.000",
+        "stage": "Guest abort",
+        "observation": "Homebrew/recompiled port. Calls abort and executes UD2 at eboot+0x33c17d9; exits with code 3 after 5 s. This is not proof of a missing host CPU instruction."
+      }
+    }
+  ],
+  "startup_survey": {
+    "build": 837,
+    "commit": "913a5ec",
+    "date": "2026-11-06",
+    "sessions": 28
+  },
+  "evidence": {
+    "source-b898": "Matching b898 source archive, COMPATIBILIDADE.md and its recorded revision history.",
+    "public-history": "Previously published compatibility records retained in docs/compatibility-history-through-b838.md.",
+    "source-b898+public-history": "Packaged source record reconciled with the earlier published test history."
+  }
+}

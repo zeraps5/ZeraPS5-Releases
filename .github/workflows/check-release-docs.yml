@@ -1,0 +1,38 @@
+name: Check public release documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'SOURCE-VERSION.txt'
+      - 'docs/compatibility-records.json'
+      - '.github/scripts/check-release-docs.py'
+      - '.github/workflows/check-release-docs.yml'
+  pull_request:
+    paths:
+      - '**.md'
+      - 'SOURCE-VERSION.txt'
+      - 'docs/compatibility-records.json'
+      - '.github/scripts/check-release-docs.py'
+      - '.github/workflows/check-release-docs.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'release' && 'main' || github.ref }}
+          persist-credentials: false
+      - name: Check latest release, source provenance and documentation links
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check-release-docs.py

@@ -1,8 +1,13 @@
-Public release: v0.1.0-b838
-Version: 0.1.0+71f2d42 (build 838, 2026-11-06)
-Corresponding emulator source commit: 71f2d428587d34a9e21663c405b4d348b3385a60
-Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b838/ZeraPS5-v0.1.0-b838-win64-source.zip
+Public release: v0.1.0-b898
+Version: 0.1.0+7f993bd (build 898, 2026-11-11)
+Corresponding emulator source commit: 7f993bde30200c6d1eafbaaba6afc8c96973f0b6
+Runtime base commit: a1e73715bf051905671d08ff809a479dd030fb95 (b897)
+Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b898/ZeraPS5-v0.1.0-b898-win64-source.zip
+Source archive SHA-256: 001083525591c02a6cf4488746d9ccb2353b5f38976c8838de85a633c2990e6e
+Windows archive SHA-256: f3cc2cb0e6bbd111d4a0e41dbb16453c49ea3be6017e25dd7cb7947fff6ac057
 
 This repository contains release documentation and packaged distributions.
-Its release tag points to this distribution repository, not the emulator source commit.
-Use the versioned source archive above instead of GitHub's automatic source archives.
+Its release tag identifies this distribution repository, not the emulator source commit.
+Use the versioned source archive above for the actual modified emulator sources.
+GitHub's automatic Source code archives contain the distribution repository snapshot.
+Contribution instructions: CONTRIBUTING.md
