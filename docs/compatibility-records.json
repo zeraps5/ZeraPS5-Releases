@@ -197,7 +197,7 @@
       "test": "b703 · `319d150` · 2026-11-01",
       "stage": "In-game introduction",
       "notes": "Cart, characters and forest visible without major black cutouts in examined frames. Slow; opening segment only.",
-      "section": "gameplay",
+      "section": "scene",
       "evidence": "public-history"
     },
     {
@@ -762,13 +762,7 @@
       "stage": "Gallery / menu",
       "notes": "Pong cabinet and gallery text. Minigame controls were not exercised.",
       "section": "menu",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Atari 50: The Anniversary Celebration",
-        "game_version": "01.009.000",
-        "stage": "Gallery/menu",
-        "observation": "Pong cabinet and text rendered in the gallery. Minigame controls not tested."
-      }
+      "evidence": "public-history"
     },
     {
       "game": "Goosebumps: Terror in Little Creek",
@@ -778,13 +772,7 @@
       "stage": "Opening / loading",
       "notes": "Logos and street/loading screen during 182 seconds.",
       "section": "startup",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Goosebumps: Terror in Little Creek",
-        "game_version": "01.000.002",
-        "stage": "Loading",
-        "observation": "Publisher logos and street/loading screen. No gameplay in 182 s."
-      }
+      "evidence": "public-history"
     },
     {
       "game": "Tomb Raider IV-VI Remastered",
@@ -794,13 +782,7 @@
       "stage": "License agreement",
       "notes": "Agreement displayed; session stopped before acceptance.",
       "section": "menu",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Tomb Raider IV-VI Remastered",
-        "game_version": "01.000.005",
-        "stage": "License agreement",
-        "observation": "Agreement displayed; not accepted automatically. Gameplay pending user acceptance."
-      }
+      "evidence": "public-history"
     },
     {
       "game": "Resident Evil 4",
@@ -810,13 +792,7 @@
       "stage": "Initialization exception",
       "notes": "Memory access fault in PlayGo thread, libc+0x479b, after about seven seconds. Root cause not established.",
       "section": "startup",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Resident Evil 4",
-        "game_version": "01.000.000",
-        "stage": "Initialization fault",
-        "observation": "Memory access fault in PlayGo thread, libc+0x479b, after about 7 s. Root cause not established."
-      }
+      "evidence": "public-history"
     },
     {
       "game": "Arcade Game Zone",
@@ -826,13 +802,7 @@
       "stage": "Rendered air-hockey scene",
       "notes": "Court, paddles, puck and score render. Player control was not exercised; may be attract/demo mode. Replaces the older b756 startup-failure result for this hardware.",
       "section": "scene",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Arcade Game Zone",
-        "game_version": "01.003.000",
-        "stage": "Rendered scene",
-        "observation": "Air-hockey court, paddles, puck and score rendered. May be attract/demo mode; player control not verified."
-      }
+      "evidence": "public-history"
     },
     {
       "game": "Sonic Unleashed Recompiled",
@@ -842,13 +812,7 @@
       "stage": "Guest abort",
       "notes": "Homebrew/recompiled port calls abort and UD2, ending after about five seconds. This is not evidence of a missing host CPU instruction.",
       "section": "startup",
-      "evidence": "public-history",
-      "rtx_startup_followup": {
-        "game": "Sonic Unleashed Recompiled",
-        "game_version": "01.003.000",
-        "stage": "Guest abort",
-        "observation": "Homebrew/recompiled port. Calls abort and executes UD2 at eboot+0x33c17d9; exits with code 3 after 5 s. This is not proof of a missing host CPU instruction."
-      }
+      "evidence": "public-history"
     }
   ],
   "startup_survey": {
