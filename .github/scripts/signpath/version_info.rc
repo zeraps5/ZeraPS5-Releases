@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Shared Windows metadata. Consumed after defining the frontend-specific fields.
+#include <winver.h>
+#include "ps5c/version.h"
+#include "ps5c/build_info.h"
+
+#define ZERA_STRING_INNER(value) #value
+#define ZERA_STRING(value) ZERA_STRING_INNER(value)
+#define ZERA_RESOURCE_VERSION PS5C_VERSION_STRING "." ZERA_STRING(PS5C_BUILD_NUMBER)
+
+#if PS5C_BUILD_NUMBER > 65535
+#error Windows version fields require a separately defined 16-bit build value
+#endif
+
+1 VERSIONINFO
+ FILEVERSION PS5C_VERSION_MAJOR,PS5C_VERSION_MINOR,PS5C_VERSION_PATCH,PS5C_BUILD_NUMBER
+ PRODUCTVERSION PS5C_VERSION_MAJOR,PS5C_VERSION_MINOR,PS5C_VERSION_PATCH,PS5C_BUILD_NUMBER
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "metallrockdev\0"
+            VALUE "FileDescription", ZERA_RESOURCE_DESCRIPTION "\0"
+            VALUE "FileVersion", ZERA_RESOURCE_VERSION "\0"
+            VALUE "InternalName", ZERA_RESOURCE_INTERNAL_NAME "\0"
+            VALUE "LegalCopyright", "See CREDITS.txt and component licenses\0"
+            VALUE "OriginalFilename", ZERA_RESOURCE_ORIGINAL_FILENAME "\0"
+            VALUE "ProductName", "ZeraPS5\0"
+            VALUE "ProductVersion", ZERA_RESOURCE_VERSION "\0"
+            VALUE "Comments", "Source revision " PS5C_GIT_COMMIT "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

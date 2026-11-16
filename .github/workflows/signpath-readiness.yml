@@ -1,0 +1,50 @@
+name: SignPath unsigned build readiness
+on:
+  push:
+    branches: [codex/signpath-readiness]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Prepare hash-pinned public source materials
+        shell: pwsh
+        run: python .github/scripts/signpath/prepare_source.py
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-make
+            mingw-w64-ucrt-x86_64-nasm
+            make
+            diffutils
+      - name: Build FFmpeg and emulator, then run CPU tests
+        shell: msys2 {0}
+        run: bash .github/scripts/signpath/build.sh
+      - name: Verify Windows metadata and collect unsigned review artifacts
+        shell: pwsh
+        run: |
+          $buildRoot = Join-Path $env:ZERA_REVIEW_DIR 'build'
+          $artifactRoot = Join-Path $env:ZERA_REVIEW_DIR 'artifacts'
+          New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+          & .github/scripts/signpath/Verify-SigningReadiness.ps1 -AppRoot $buildRoot -ExpectedVersion '0.1.1.984' -OutputJson (Join-Path $artifactRoot 'metadata.json')
+          $audit = Get-Content -LiteralPath (Join-Path $artifactRoot 'metadata.json') -Raw | ConvertFrom-Json
+          if (-not $audit.metadata_ready -or $audit.production_ready) { throw 'Unexpected metadata or production-signature status' }
+          & (Join-Path $buildRoot 'ps5c.exe') --version
+          if ($LASTEXITCODE) { throw 'Runtime version query failed' }
+          Copy-Item -LiteralPath (Join-Path $buildRoot 'ZeraPS5.exe'),(Join-Path $buildRoot 'ps5c.exe'),(Join-Path $env:ZERA_REVIEW_DIR 'ci-provenance.json'),(Join-Path $env:ZERA_REVIEW_DIR 'packages.txt') -Destination $artifactRoot
+          'UNSIGNED BUILD-ORIGIN REVIEW ONLY. Public b984 sources plus version-resource metadata; not a new release and not a replacement for published assets.' | Set-Content -LiteralPath (Join-Path $artifactRoot 'UNSIGNED-REVIEW-ONLY.txt')
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: zeraps5-unsigned-signpath-readiness
+          path: ${{ env.ZERA_REVIEW_DIR }}/artifacts
+          retention-days: 7
+          if-no-files-found: error
