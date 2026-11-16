@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "reviewed": "2026-11-11",
+  "reviewed": "2026-11-15",
   "current_release": "v0.1.0-b898",
   "source_commit": "7f993bde30200c6d1eafbaaba6afc8c96973f0b6",
   "records": [
@@ -173,32 +173,68 @@
     {
       "game": "Grand Theft Auto V",
       "title_id": "PPSA04263",
-      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
-      "test": "Public b705 · 2026-11-01",
-      "stage": "Gameplay / prologue",
-      "notes": "Bank room and characters in an approximately 332-second isolated run. Wood, clothing, notice and reflections visible. Text/transitions and longer stability checks remain relevant.",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "b974 · `675cb09` · 2026-11-15",
+      "stage": "Gameplay / bank prologue",
+      "notes": "Bank room, characters and radar render; scripted forward movement responds in the 842-second session. About 3–5 FPS in the final observation window. Longer play and transitions remain outside this run.",
       "section": "gameplay",
-      "evidence": "public-history"
+      "evidence": "candidate-011-rtx",
+      "previous_records": [
+        {
+          "game": "Grand Theft Auto V",
+          "title_id": "PPSA04263",
+          "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+          "test": "Public b705 · 2026-11-01",
+          "stage": "Gameplay / prologue",
+          "notes": "Bank room and characters in an approximately 332-second isolated run. Wood, clothing, notice and reflections visible. Text/transitions and longer stability checks remain relevant.",
+          "section": "gameplay",
+          "evidence": "public-history"
+        }
+      ]
     },
     {
       "game": "Minecraft",
       "title_id": "PPSA17221",
-      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
-      "test": "Public b705 · 2026-11-01",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "b974 · `675cb09` · 2026-11-15",
       "stage": "Gameplay",
-      "notes": "Copied world with terrain, sky, shovel and HUD in an approximately 292-second isolated run. Explicit host-memory layout; original settings/saves preserved.",
+      "notes": "World, HUD, movement/camera and day/night transition in the 601-second run. Settled windows about 9 FPS, also observed in the retested public b898; no measured percentage gain.",
       "section": "gameplay",
-      "evidence": "public-history"
+      "evidence": "candidate-011-rtx",
+      "previous_records": [
+        {
+          "game": "Minecraft",
+          "title_id": "PPSA17221",
+          "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+          "test": "Public b705 · 2026-11-01",
+          "stage": "Gameplay",
+          "notes": "Copied world with terrain, sky, shovel and HUD in an approximately 292-second isolated run. Explicit host-memory layout; original settings/saves preserved.",
+          "section": "gameplay",
+          "evidence": "public-history"
+        }
+      ]
     },
     {
       "game": "The Elder Scrolls V: Skyrim",
       "title_id": "PPSA03747",
-      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
-      "test": "b703 · `319d150` · 2026-11-01",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "b981 · `e2feb98` · 2026-11-15",
       "stage": "In-game introduction",
-      "notes": "Cart, characters and forest visible without major black cutouts in examined frames. Slow; opening segment only.",
+      "notes": "New Game reaches the 3D cart introduction; camera responds in both directions and characters are opaque. Vegetation has stippling. Median about 6 FPS in the later observation window of this 362-second session; free roaming was not tested.",
       "section": "scene",
-      "evidence": "public-history"
+      "evidence": "candidate-011-rtx",
+      "previous_records": [
+        {
+          "game": "The Elder Scrolls V: Skyrim",
+          "title_id": "PPSA03747",
+          "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+          "test": "b703 · `319d150` · 2026-11-01",
+          "stage": "In-game introduction",
+          "notes": "Cart, characters and forest visible without major black cutouts in examined frames. Slow; opening segment only.",
+          "section": "scene",
+          "evidence": "public-history"
+        }
+      ]
     },
     {
       "game": "No Man's Sky",
@@ -266,7 +302,13 @@
       "stage": "Experimental hub scene",
       "notes": "Ship, character and objects visible with a direct-hub experimental profile. Distant terrain, lighting/UI, very low speed and slow shutdown remain. Keep separate from the older Intel opening-only record.",
       "section": "scene",
-      "evidence": "public-history"
+      "evidence": "public-history",
+      "candidate_followup": {
+        "test": "b981 · `e2feb98` · 2026-11-15",
+        "stage": "Opening / incomplete image",
+        "notes": "302-second standard-profile check: dark background without a useful scene. A 302-second public b898 comparison also failed to produce a useful scene; the historical direct-hub result is a different profile.",
+        "evidence": "candidate-011-rtx"
+      }
     },
     {
       "game": "Marvel's Wolverine",
@@ -276,17 +318,35 @@
       "stage": "Menus / save selection / incomplete scene",
       "notes": "Menu navigation and save handling advanced in specific development profiles. Player-controlled gameplay was not established. Keep separate from the older opening-only record.",
       "section": "scene",
-      "evidence": "public-history"
+      "evidence": "public-history",
+      "candidate_followup": {
+        "test": "b981 · `e2feb98` · 2026-11-15",
+        "stage": "Opening / incomplete image",
+        "notes": "240-second check: animated Marvel opening/logo, then black output. The public b898 comparison repeats that limitation; no player-controlled gameplay result.",
+        "evidence": "candidate-011-rtx"
+      }
     },
     {
       "game": "Red Dead Redemption",
       "title_id": "PPSA30528",
-      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
-      "test": "b703 · `319d150` · 2026-11-01",
-      "stage": "Opening 3D scenes",
-      "notes": "Boat, port and characters. Material defects and ATRAC9 warnings remain; prior device-loss incidents are not established as fixed. This entry is Red Dead Redemption.",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "b974 · `675cb09` · 2026-11-15",
+      "stage": "Opening 3D cinematic",
+      "notes": "City, NPCs and train in the 902-second opening run. Player-controlled gameplay was not established. Translucent NPCs also occur in the retested b898 city shot; no new rendering fix is claimed for that defect.",
       "section": "scene",
-      "evidence": "public-history"
+      "evidence": "candidate-011-rtx",
+      "previous_records": [
+        {
+          "game": "Red Dead Redemption",
+          "title_id": "PPSA30528",
+          "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB",
+          "test": "b703 · `319d150` · 2026-11-01",
+          "stage": "Opening 3D scenes",
+          "notes": "Boat, port and characters. Material defects and ATRAC9 warnings remain; prior device-loss incidents are not established as fixed. This entry is Red Dead Redemption.",
+          "section": "scene",
+          "evidence": "public-history"
+        }
+      ]
     },
     {
       "game": "TMNT: Mutants Unleashed",
@@ -684,13 +744,16 @@
     },
     {
       "game": "Gothic 1",
-      "title_id": "PPSA09826",
+      "title_id": "PPSA09846",
       "hardware": "Core i5-1235U / Intel Iris Xe",
       "test": "2026-11-01 developer assessment; per-run build not recorded",
       "stage": "Startup blocked by game data",
-      "notes": "Tested game copy reports Global shader library missing. The incomplete-data case does not establish behavior with a complete copy.",
+      "notes": "Tested game copy reports Global shader library missing. The incomplete-data case does not establish behavior with a complete copy. Title ID corrected from the older catalog value in the b984 source record; no new gameplay test.",
       "section": "startup",
-      "evidence": "source-b898"
+      "evidence": "source-b898",
+      "previous_title_ids": [
+        "PPSA09826"
+      ]
     },
     {
       "game": "Little Nightmares — original",
@@ -813,6 +876,56 @@
       "notes": "Homebrew/recompiled port calls abort and UD2, ending after about five seconds. This is not evidence of a missing host CPU instruction.",
       "section": "startup",
       "evidence": "public-history"
+    },
+    {
+      "game": "Quake II",
+      "title_id": "PPSA09477",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "b981 · `e2feb98` · 2026-11-15",
+      "stage": "Gameplay / Outer Base",
+      "notes": "Loaded Outer Base save: HUD, weapon, scripted movement/camera and firing with visible recoil in 361 seconds. Final active window about 31–53 FPS, median 43; not an A/B performance-gain benchmark. The stripped b984 package separately passed a 211-second opening/demo smoke test.",
+      "section": "gameplay",
+      "evidence": "candidate-011-rtx"
+    },
+    {
+      "game": "Quake III Arena — PS5_Quake3e homebrew",
+      "title_id": "PPSA99319",
+      "hardware": "Ryzen 7 5700G / RTX 5060 Ti 16 GB / 32 GB RAM",
+      "test": "Experimental b906 · `6c44020` + local changes · 2026-11-12",
+      "stage": "Local gameplay / q3dm1",
+      "notes": "Homebrew PS5_Quake3e v1.4.0: menu and a local match with one human client; scripted movement, camera and firing. Fixes later integrated into 0.1.1. Bots, split screen, audible output, long sessions and external multiplayer were not validated.",
+      "section": "gameplay",
+      "evidence": "source-b984-developer"
+    },
+    {
+      "game": "Sonic Superstars",
+      "title_id": "PPSA06888",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "`9bb4367` · 2026-11-15",
+      "stage": "Gameplay / Bridge Island",
+      "notes": "Logos, title, menu, character selection and opening video render; Bridge Island has the HUD and scenery. About 15–16 FPS in the reported gameplay section; menu about 60 FPS. Dated development result, not a fresh b984-package benchmark.",
+      "section": "gameplay",
+      "evidence": "source-b984-developer"
+    },
+    {
+      "game": "Sonic Origins Plus",
+      "title_id": "PPSA05324",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "2026-11-15 · `71db681` (1080p); dated 720p developer follow-up",
+      "stage": "Gameplay / Green Hill Zone",
+      "notes": "Sonic 1 Anniversary Mode reaches Green Hill Zone. About 23 FPS at 1080p and 35–38 FPS with 720p internal resolution in the developer record. Display setup now follows output size instead of fixed 4K. The 720p per-run revision was not recorded; these are development observations, not a new b984 ZIP benchmark.",
+      "section": "gameplay",
+      "evidence": "source-b984-developer"
+    },
+    {
+      "game": "Commandos: Origins",
+      "title_id": "PPSA14708",
+      "hardware": "Core i5-1235U / Intel Iris Xe",
+      "test": "Development branch record · 2026-11-03",
+      "stage": "Menus / first-mission loading",
+      "notes": "Opening video with sound, language selection and main menu; New Game/difficulty reaches first-mission loading during a ten-minute test. Rendering was below 1 FPS in the recorded 4K Unreal profile. Branch fixes are integrated into 0.1.1; this is not a new packaged-gameplay result.",
+      "section": "menu",
+      "evidence": "source-b984-developer"
     }
   ],
   "startup_survey": {
@@ -824,6 +937,10 @@
   "evidence": {
     "source-b898": "Matching b898 source archive, COMPATIBILIDADE.md and its recorded revision history.",
     "public-history": "Previously published compatibility records retained in docs/compatibility-history-through-b838.md.",
-    "source-b898+public-history": "Packaged source record reconciled with the earlier published test history."
-  }
+    "source-b898+public-history": "Packaged source record reconciled with the earlier published test history.",
+    "candidate-011-rtx": "Dated RTX candidate runs on b974/b981, packaged source COMPATIBILIDADE.md and docs/colaboracao/RELEASE-CANDIDATE-0.1.1-2026-11-15.md; English summary in docs/release-candidate-b984.md. Actual tested builds retained.",
+    "source-b984-developer": "Matching b984 source archive, COMPATIBILIDADE.md: dated Intel game records and the identified earlier RTX homebrew run. No new b984-package or notebook performance measurement inferred."
+  },
+  "candidate_release": "v0.1.1-b984",
+  "candidate_source_commit": "0d269bb8de1cdc4dce31f4d689d8fef0d675d700"
 }

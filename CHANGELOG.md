@@ -1,5 +1,18 @@
 # Release changelog
 
+## Upcoming v0.1.1-b984 — candidate reviewed 15 November 2026
+
+Unpublished draft, source `0d269bb`. [Full candidate changes, dated game observations and validation](docs/release-candidate-b984.md).
+
+- Modern Vulkan paths with capability checks and fallbacks: dynamic rendering/state, push descriptors and timeline semaphores.
+- Reusable relocated shader translations, large-fill transfer optimizations and a smaller Videodec2 queue reservation.
+- Native memory/thread safety fixes and optional older-CPU guest-instruction compatibility.
+- Unified supported-game internal-resolution controls; compact host diagnostics with reliable short F10 presses.
+- Sonic Origins Plus save-slot/display fixes, optional native input and experimental Quake homebrew/LAN work.
+- New dated compatibility records for Sonic Origins Plus, Sonic Superstars, Quake II, Quake III homebrew and Commandos: Origins; seven RTX candidate checks retain b974/b981 labels.
+- 182 runtime checks, 28 fallback GPU checks and 52 distribution checks passed. The actual public b898 launcher also downloaded and installed the frozen b984 payload over isolated loopback HTTP, restarted and reported current; all 48 payload files and synthetic user data were checked, including rollback/recovery.
+- Six draft assets match their remote digests. Public GitHub download/update verification remains a post-publication step. Known game, modal-automation and experimental-COW limits are documented in the full review.
+
 ## v0.1.0-b898 — 11 November 2026
 
 Current Windows x64 release. Runtime base b897 (`a1e7371`), distribution integration `7f993bd`.

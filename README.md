@@ -36,7 +36,9 @@ Highlights included in this release:
 
 ## Game compatibility
 
-[Game compatibility and tested builds](COMPATIBILITY.md) — updated for the b898 release, with recorded Intel and RTX results through 10 November 2026, actual tested revisions, and the preserved startup survey/history.
+**Next candidate: 0.1.1 b984 (unpublished draft).** Modern Vulkan paths with fallbacks, unified internal resolution, native memory/thread fixes and older-CPU guest-instruction compatibility. New development records include Sonic Origins Plus / Green Hill Zone, Sonic Superstars / Bridge Island and Quake II / Outer Base. [Candidate changes and reviewed tests](docs/release-candidate-b984.md). The download above remains the published b898 release.
+
+[Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 15 November 2026, with dated Intel/RTX development and candidate results, each title's actual tested revision, and the preserved startup survey/history.
 
 [Technical changelog](CHANGELOG.md) · [Contribute or report a result](CONTRIBUTING.md) · [Matching source revision and checksums](SOURCE-VERSION.txt)
 
@@ -58,4 +60,3 @@ See [LICENSE](LICENSE) and [CREDITS.txt](CREDITS.txt). Packages include componen
 corresponding source code, FFmpeg sources, and object files for relinking.
 Private development is kept separate from this distribution repository.
 ZeraPS5 is not affiliated with Sony.
-
