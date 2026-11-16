@@ -4,8 +4,8 @@ Bug reports, compatibility results, focused code fixes and documentation improve
 
 ## Get the matching emulator source
 
-- [b898 source archive](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b898/ZeraPS5-v0.1.0-b898-win64-source.zip)
-- [b898 Windows package](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b898/ZeraPS5-v0.1.0-b898-win64.zip), including the same emulator source, FFmpeg source and relink materials under sources/.
+- [b984 source archive](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64-source.zip)
+- [b984 Windows package](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64.zip), including the same emulator source, FFmpeg source and relink materials under sources/.
 - [Exact revision and SHA-256](SOURCE-VERSION.txt)
 
 GitHub's automatic Source code ZIP and a clone of this repository contain distribution documentation. Use the versioned source archive above for emulator code. Pull requests here can update the public documentation, compatibility records and repository tooling.

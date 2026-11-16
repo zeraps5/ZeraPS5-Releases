@@ -12,23 +12,23 @@
 
 ## Download and run
 
-**Current release: v0.1.0-b898.**
+**Current release: v0.1.1-b984.**
 
-**Direct PKG loading, CPU/GPU optimizations, graphics fixes and more launcher options.** See the [b898 technical release notes and latest game tests](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b898).
+**Modern Vulkan paths, flexible internal resolution and stronger runtime compatibility.** See the [b984 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b984) for technical changes, dated game tests and known limitations.
 
 Highlights included in this release:
 
-- Discover and open supported PS5 fPKG games directly, with package-aware PlayGo handling.
-- Reduce CPU/GPU synchronization work, improve vertex-buffer copies and lower shader-evaluation overhead.
-- Correct DCC fast-clear colors, texture sampling and accented text rendering.
-- Add play-time tracking, screen modes, mod-folder selection, desktop shortcuts and internal-resolution settings for supported Unreal Engine games.
-- Keep startup video and fonts embedded, with the public b838-to-b898 launcher update tested after publication.
+- Use modern Vulkan rendering, state and synchronization paths when supported, with compatibility fallbacks.
+- Choose Game default, 1440p, 1080p, 900p, 720p or 540p globally or per game for supported Unreal titles, Sonic Origins Plus and TMNT: Splintered Fate.
+- Improve native memory mapping and thread/fiber ownership; add optional guest-instruction compatibility for older CPUs.
+- Reuse relocated shader translations, optimize large CPU fills and reduce the Videodec2 queue reservation.
+- Expand F10 host diagnostics, Sonic Origins save/display handling and optional native input; preserve 15 interface languages and the integrated update/reporting launcher.
 
-**Recorded gameplay highlights:** Dolphin Spirit Ocean Mission reached underwater gameplay at approximately **30–56 FPS on an RTX 5060 Ti** (tested on b897). Alone in the Dark 2, the PS1 classic, reached movement and combat at approximately **60 FPS on Intel Iris Xe** (tested on b861). These figures describe the recorded scenes and hardware. Each compatibility entry retains its actual tested build.
+**New recorded gameplay:** Sonic Origins Plus reaches Green Hill Zone on Intel Iris Xe (about 23 FPS at 1080p; 35–38 FPS in the dated 720p internal-resolution follow-up). Sonic Superstars reaches Bridge Island (about 15–16 FPS on Iris Xe). Quake II reaches Outer Base with movement and firing (31–53 FPS, median 43 in the final active window on RTX 5060 Ti, b981). These are measured development scenes, not universal performance promises; the compatibility list retains each actual tested revision and configuration.
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 898](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b898/ZeraPS5-v0.1.0-b898-win64.zip)
-- [Download source code — build 898](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.0-b898/ZeraPS5-v0.1.0-b898-win64-source.zip)
+- [Download for Windows x64 — build 984](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64.zip)
+- [Download source code — build 984](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
@@ -36,7 +36,7 @@ Highlights included in this release:
 
 ## Game compatibility
 
-**Next candidate: 0.1.1 b984 (unpublished draft).** Modern Vulkan paths with fallbacks, unified internal resolution, native memory/thread fixes and older-CPU guest-instruction compatibility. New development records include Sonic Origins Plus / Green Hill Zone, Sonic Superstars / Bridge Island and Quake II / Outer Base. [Candidate changes and reviewed tests](docs/release-candidate-b984.md). The download above remains the published b898 release.
+**b984 is published.** [Detailed changes and reviewed validation](docs/release-candidate-b984.md). The full public GitHub launcher update is being verified in an isolated installation. Pre-publication b898-to-b984 download, install, automatic restart and recovery already passed using loopback HTTP.
 
 [Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 15 November 2026, with dated Intel/RTX development and candidate results, each title's actual tested revision, and the preserved startup survey/history.
 

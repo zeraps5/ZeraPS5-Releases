@@ -1,10 +1,10 @@
-# ZeraPS5 0.1.1 b984 — candidate review, 15 November 2026
+# ZeraPS5 0.1.1 b984 — release review
 
-**Unpublished draft. The current public download remains [b898](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.0-b898).**
+**Published 16 November 2026 UTC. [Download b984](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b984). Game observations and pre-publication validation were reviewed on 15 November 2026.**
 
 **Modern Vulkan paths with fallbacks, unified internal-resolution controls, older-CPU instruction compatibility and native memory/thread safety fixes.**
 
-Experimental Windows x64 release candidate, maintained by **metallrockdev**. Build **984**, source **0d269bb8de1cdc4dce31f4d689d8fef0d675d700**. Contributors' credits and component licenses are preserved.
+Experimental Windows x64 release, maintained by **metallrockdev**. Build **984**, source **0d269bb8de1cdc4dce31f4d689d8fef0d675d700**. Contributors' credits and component licenses are preserved.
 
 ## Changes since b898
 
@@ -51,8 +51,8 @@ All seven corrected setups ended at their controlled limits with exit code zero 
 - **28/28 GPU fallback checks**, with the new paths explicitly disabled on the same RTX. This does not simulate a physical older GPU.
 - **52/52 distribution/update checks**, including 15 languages, hashes, rollback, interrupted installation and user-data preservation.
 - The **original public b898 launcher** downloaded the actual b984 ZIP from an isolated loopback HTTP server, verified SHA-256, installed it and automatically restarted as b984. A second check reported the current version. All **48 payload files**, five synthetic save/settings/game/module markers, previous executable backups and the committed journal were verified. Real-payload rollback and interrupted-install recovery also passed.
-- This is the complete local pre-publication launcher flow. A public GitHub download/update must still be checked after publication.
-- The six draft assets match GitHub's SHA-256 digests and sizes. All 528 packaged emulator source files were checked against the recorded Git content, allowing the documented Windows CRLF conversions. Source, relink objects, FFmpeg, licenses, icons and embedded font/video were checked.
+- **Public update verification:** The full public GitHub launcher update is being verified in an isolated installation. Pre-publication b898-to-b984 download, install, automatic restart and recovery already passed using loopback HTTP.
+- The six published assets match GitHub's SHA-256 digests and sizes. All 528 packaged emulator source files were checked against the recorded Git content, allowing the documented Windows CRLF conversions. Source, relink objects, FFmpeg, licenses, icons and embedded font/video were checked.
 - The internal-resolution choices are visible in the portable launcher. Saving/reopening that modal was not completed by UI automation; no successful save round-trip is claimed.
 
 ## Current limitations

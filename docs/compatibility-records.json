@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "reviewed": "2026-11-15",
-  "current_release": "v0.1.0-b898",
-  "source_commit": "7f993bde30200c6d1eafbaaba6afc8c96973f0b6",
+  "current_release": "v0.1.1-b984",
+  "source_commit": "0d269bb8de1cdc4dce31f4d689d8fef0d675d700",
   "records": [
     {
       "game": "Alone in the Dark 2 — PS1 classic",
@@ -940,7 +940,5 @@
     "source-b898+public-history": "Packaged source record reconciled with the earlier published test history.",
     "candidate-011-rtx": "Dated RTX candidate runs on b974/b981, packaged source COMPATIBILIDADE.md and docs/colaboracao/RELEASE-CANDIDATE-0.1.1-2026-11-15.md; English summary in docs/release-candidate-b984.md. Actual tested builds retained.",
     "source-b984-developer": "Matching b984 source archive, COMPATIBILIDADE.md: dated Intel game records and the identified earlier RTX homebrew run. No new b984-package or notebook performance measurement inferred."
-  },
-  "candidate_release": "v0.1.1-b984",
-  "candidate_source_commit": "0d269bb8de1cdc4dce31f4d689d8fef0d675d700"
+  }
 }
