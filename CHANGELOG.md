@@ -11,7 +11,7 @@ Published Windows x64 release, source `0d269bb`. [Full release changes, dated ga
 - Sonic Origins Plus save-slot/display fixes, optional native input and experimental Quake homebrew/LAN work.
 - New dated compatibility records for Sonic Origins Plus, Sonic Superstars, Quake II, Quake III homebrew and Commandos: Origins; seven RTX candidate checks retain b974/b981 labels.
 - 182 runtime checks, 28 fallback GPU checks and 52 distribution checks passed. The actual public b898 launcher also downloaded and installed the frozen b984 payload over isolated loopback HTTP, restarted and reported current; all 48 payload files and synthetic user data were checked, including rollback/recovery.
-- Six published assets match their reviewed digests. The full public GitHub launcher update is being verified in an isolated installation. Pre-publication b898-to-b984 download, install, automatic restart and recovery already passed using loopback HTTP. Known game, modal-automation and experimental-COW limits are documented in the full review.
+- Six published assets match their reviewed digests. The original public b898 launcher downloaded b984 directly from GitHub using its built-in production endpoint and installed the verified ZIP. The updated launcher opened normally and a second check reported the latest version. All 48 payload files, five synthetic user-data markers, previous executable backups and the committed journal were verified in an isolated installation. Known game, modal-automation and experimental-COW limits are documented in the full review.
 
 ## v0.1.0-b898 — 11 November 2026
 

@@ -36,7 +36,7 @@ Highlights included in this release:
 
 ## Game compatibility
 
-**b984 is published.** [Detailed changes and reviewed validation](docs/release-candidate-b984.md). The full public GitHub launcher update is being verified in an isolated installation. Pre-publication b898-to-b984 download, install, automatic restart and recovery already passed using loopback HTTP.
+**b984 is published.** [Detailed changes and reviewed validation](docs/release-candidate-b984.md). The original public b898 launcher downloaded b984 directly from GitHub using its built-in production endpoint and installed the verified ZIP. The updated launcher opened normally and a second check reported the latest version. All 48 payload files, five synthetic user-data markers, previous executable backups and the committed journal were verified in an isolated installation.
 
 [Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 15 November 2026, with dated Intel/RTX development and candidate results, each title's actual tested revision, and the preserved startup survey/history.
 

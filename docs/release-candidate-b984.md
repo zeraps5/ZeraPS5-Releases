@@ -51,9 +51,11 @@ All seven corrected setups ended at their controlled limits with exit code zero 
 - **28/28 GPU fallback checks**, with the new paths explicitly disabled on the same RTX. This does not simulate a physical older GPU.
 - **52/52 distribution/update checks**, including 15 languages, hashes, rollback, interrupted installation and user-data preservation.
 - The **original public b898 launcher** downloaded the actual b984 ZIP from an isolated loopback HTTP server, verified SHA-256, installed it and automatically restarted as b984. A second check reported the current version. All **48 payload files**, five synthetic save/settings/game/module markers, previous executable backups and the committed journal were verified. Real-payload rollback and interrupted-install recovery also passed.
-- **Public update verification:** The full public GitHub launcher update is being verified in an isolated installation. Pre-publication b898-to-b984 download, install, automatic restart and recovery already passed using loopback HTTP.
+- **Public update verification:** The original public b898 launcher downloaded b984 directly from GitHub using its built-in production endpoint and installed the verified ZIP. The updated launcher opened normally and a second check reported the latest version. All 48 payload files, five synthetic user-data markers, previous executable backups and the committed journal were verified in an isolated installation.
 - The six published assets match GitHub's SHA-256 digests and sizes. All 528 packaged emulator source files were checked against the recorded Git content, allowing the documented Windows CRLF conversions. Source, relink objects, FFmpeg, licenses, icons and embedded font/video were checked.
 - The internal-resolution choices are visible in the portable launcher. Saving/reopening that modal was not completed by UI automation; no successful save round-trip is claimed.
+
+A first public-update attempt encountered a Windows file-sharing violation (`0x80070020`). The updater rolled back; all 50 baseline files and five synthetic user-data markers were independently verified restored. The repeated installation passed. This records the observed interruption and recovery; the process responsible for the lock was not identified.
 
 ## Current limitations
 
