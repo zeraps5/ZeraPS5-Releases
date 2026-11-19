@@ -1,0 +1,230 @@
+
+dist/LEIA-ME-games.txt
+========================================
+게임
+=====
+
+본인의 콘솔에서 추출하고 복호화한 파일을 게임별 폴더에 다음 구조로 넣으세요:
+
+games\<pasta 게임>\eboot.bin
+games\<pasta 게임>\ sce_sys\param.json
+games\<pasta 게임>\ sce_module\ (게임이 있는 경우)
+
+게임은 절대 에뮬레이터와 함께 오지 않으며 공유 할 수 없습니다.
+
+dist/LEIA-ME-system.txt
+========================================
+컨소리 시스템 도서관
+=================================
+
+본인의 PS5에서 추출하고 복호화한 이 파일들을 system\modules\에 넣으세요
+(콘솔의 /system/common/lib/에 있습니다):
+
+  libSceAgc.sprx
+  libSceAgcDriver.sprx
+  libSceAmpr.sprx
+  libScePsml.sprx
+
+일부 게임에는 이 라이브러리가 필요합니다. 런처가 누락된 라이브러리를 표시합니다.
+그들은 절대 에뮬레이터와 함께 오지 않으며 다른 사람들과 공유해서는 안됩니다.
+사람들 (자신의 PC 사이에 복사 할 수 있습니다).
+설정에서 선택한 폴더가 우선합니다. 찾은 로컬 라이브러리는 system/modules/collections 아래의 모음에 복사됩니다. 원본 폴더의 파일을 섞거나 버전을 덮어쓰지 않고 새 모음을 추가합니다. 복사가 완료된 모음은 원래 드라이브가 없어도 사용할 수 있습니다. 라이브러리는 다운로드하지 않습니다.
+
+dist/LEIA-ME.txt
+========================================
+ZeraPS5 {VERSION} — 실험용 버전
+
+실험 에뮬레이터 PlayStation 5 Windows x86-64.
+호환성, 안정성 또는 FPS에 대한 보증이 없습니다.
+
+언어: 언어 메뉴, 또는 설정 > 언어. 15 개의 인터페이스 옵션이 있습니다,
+아랍어, 파르시, 러시아어 및 우크라이나어를 포함. docs/IDIOMAS.txt. 보기
+
+1.ZIP를 프로그램 파일 밖의 녹음 가능한 폴더에 끌어내십시오.
+읽기 system/LEIA-ME.txt; 콘솔 자체의 모듈만 추가합니다.
+ZeraPS5.exe를 열고 설정에서 게임의 폴더를 추가합니다.
+4.게임을 선택하고 플레이를 클릭합니다..exfat 폴더 및 이미지 지원을 사용
+이 패키지는 게임을 추출하거나 파일을 해독하지 않습니다.
+
+요구 사항: Windows 10/11 x64, CPU x86-64/AVX, GPU Vulkan 1.3 및 드라이버
+Python, CMake 및 MSYS2는 실행 가능한 사용에 필요하지 않습니다.
+Vulkan 드라이버는 ZIP가 아닌 GPU 제조업체에서 온다.
+DualSense USB 및 XInput는 기존 지원을 사용합니다.
+이 버전에서 유효합니다. 게임을 테스트하기 전에 docs/LIMITACOES.txt을 확인하십시오.
+
+user/은 처음 사용 하 고 저장 하 고 저장 하 고 설정, 캐시 및 로그.
+이 전체 폴더를 공유하지 마십시오. 보고서는 기본적으로 위치; 라인
+일반적인 도로, 지역 이름 및 인증서가 무시됩니다.ZIP를 검토하고
+공유하기 전에 설명: 필터는 가능한 데이터를 제거하지 않습니다.
+
+안정적인 Windows x64 업데이트는 자동으로 검색됩니다.
+https://github.com/zeraps5/ZeraPS5-Releases/releases/latest/download/latest.json
+로그인, 토큰 또는 컴퓨터 ID 없음.이 쿼리는 삭제될 수 있습니다
+새 버전을 설치하면 확인이 필요합니다.
+설치는 무결성을 확인하고
+보존 user/, games/ 및 system/. 복구: docs/ATUALIZACOES.txt.
+
+실제 출처, FFmpeg 및 링크 물건: sources/ 및 docs/RECOMPILAR.txt.
+라이센스 및 크레딧: LICENSE, CREDITS.txt 및 licenses/.
+게임, 프레임웨어, 콘솔 모듈 또는 키가 없습니다.
+자신의 콘솔에서 합법적으로 추출한 사본만 사용하세요. Sony와 제휴 관계가 없습니다.
+
+dist/docs/ATUALIZACOES.txt
+========================================
+업데이트 및 복구
+
+안정적인 윈도우 x86-64 채널: GitHub에서 zeraps5/ZeraPS5-Releases.
+개발 레지스트리 zeraps5/ZeraPS5은 사립 상태로 남아 있습니다.
+배포 목적은 여전히 허가 된 제작 및 출판에 달려 있습니다.
+런처는 HTTPS에서 releases/latest/download/latest.json을 요청하고, 토큰이 없으며,
+컴퓨터 이름 또는 설치 ID. REST API를 사용하지 않습니다.
+최신 리디렉션은 안정적인 리디렉션을 선택합니다.
+HTTP 403/429 또는 네트워크 오류는 지속적인 반복없이 설치를 유지합니다.
+
+새로운 버전은 확인을 위해 제공됩니다. 응용 프로그램은 라운터를 기다리고 있습니다.
+닫기, 프로세스를 닫지 않고 이 활성 폴더의 게임 업데이트를 거부합니다.
+내부 파일의 ZIP SHA-256, canal/arquitetura 및 hash/tamanho를 인증합니다.
+외부 경로, 링크, 충돌 및 개인 파일은 거부됩니다.
+user/, games/ 및 system/는 대체되지 않습니다.
+
+백업 및 일기 user/updates/transaction.에 남아 복구 복사 오류
+이전 프로그램. 복사 중 중 하나가 복구를 끄는 동안 중단
+다음 시작 라운처. 수동 복구를 위해,이 설치를 닫고 사용:
+powershell -NoProfile -ExecutionPolicy Bypass -File "user/updates/Recuperar-ZeraPS5.ps1" -InstallRoot "PASTA_DA_INSTALACAO" -Recover
+복구 복사본은 업데이트를 시작할 때 생성됩니다.또한 참조
+user/updates/result.txt. 새 버전이 유효할 때까지 transaction/backup을 유지합니다.
+
+SHA-256은 HTTPS에서 얻은 메뉴에 대한 완전성을 확인합니다.
+이 서명은 신뢰할 수 없습니다.이 후보는 디지털 서명이 없습니다.
+
+기본적으로 프로그램 시작 시 업데이트를 확인합니다. 메인 화면의 업데이트 확인 버튼도 사용할 수 있습니다. 시작 시 확인은 설정에서 끌 수 있습니다.
+
+dist/docs/IDIOMAS.txt
+========================================
+ZeraPS5 인터페이스 언어
+
+라운터의 상단에 있는 언어 메뉴를 열어보세요.
+설정의 언어: 선택은 확인할 때 저장되며 다음에 유효합니다.
+개방; 메뉴와 메인 화면은 게임을 다시 시작하지 않고 즉시 변경됩니다.
+
+15 개의 옵션:
+- Português (Brasil) — pt-BR
+- Português (Portugal) — pt-PT
+- Inglês — en
+- Espanhol — es
+- Francês — fr
+- Alemão — de
+- Italiano — it
+- Japonês — ja
+- Coreano — ko
+- Chinês simplificado — zh-CN
+- Chinês tradicional — zh-TW
+- Árabe — ar
+- Farsi (persa) — fa
+- Russo — ru
+- Ucraniano — uk
+
+아랍어와 파르시는 읽기와 왼쪽에서 오른쪽으로 배치를 사용합니다.
+왼쪽으로 이동하는 경로 필드 및 업데이트 주소는 계속됩니다.
+오른쪽에서 읽기를 유지합니다. 옵션은 원주민 이름을 표시합니다.
+원하는 언어로 돌아갈 수 있도록 하겠습니다.
+
+[ 인터페이스] 언어의 선호도는 user/config/zeraps5.ini이며,
+[일반] 언어에 관계없이, 게임 콘솔의 언어를 알려줍니다.
+그것은 게임에 번역, 출처 또는 언어 파일을 설치하지 않습니다.
+각 게임에서 사용할 수있는 언어와 언어는 파일에 따라 달라집니다.
+
+메뉴, 컨트롤, 알림, 오류, 보고서 필드 및 결과
+업데이트는 선택한 언어를 사용합니다. 기술 지원을 열어 도움말을 읽으십시오
+이 언어; 로그 보기 선택한 언어에 새 기록을 표시합니다, 심지어
+이행 후에 변경된 경우.
+
+코드, 파일 이름, 하드웨어 모델 및 게임 제목은 데이터
+사용자에 의해 작성된 설명은 번역되지 않습니다.
+진단을 위해 원래 기록은 user/logs에 계속됩니다.
+이전에 구조화되지 않은 등록은 다시 실행해야합니다
+번역된 시각을 생성합니다. 구조화된 복사본은 64 MiB에 제한됩니다.
+실행; 창에서는 시청의 최종 단계에서 최대 1 MiB을 표시합니다.
+라이센스 및 크레딧은 원본과 유효성을 유지합니다.
+
+카탈로그는 frontends/launcher/.에 남아 있습니다 생성기는 매개 변수를 확인합니다.
+tools/check_localization.py은 덮개 및 복제를 확인합니다.
+기술 번역은 현지 소프트웨어에 의해 지원되었으며 부분적으로 검토되었습니다.
+그들은 여전히 모든 언어의 원주민 연설자에 의해 검토해야합니다.
+
+dist/docs/LIMITACOES.txt
+========================================
+이 실험 버전의 제한 사항
+
+docs/COMPATIBILIDADE.md에는 테스트된 섹션, 하드웨어가 나열되어 있습니다.
+그리고 각 결과의 빌드. 한 섹션에서 게임 플레이에 도달하는 것은 증명되지 않습니다
+전체 게임이 작동한다는 것입니다. 성능은 게임과 컴퓨터에 따라 다릅니다.
+
+Ratchet 및 Atlantis에는 Iris Xe 노트북의 결과가 있습니다. 9개의 결과
+RTX 5060 Ti는 메인 1c4893f, 빌드 756에서 획득되었습니다.
+이번 릴리스의 합성 그래픽 테스트는 RTX 5060 Ti에서 실행되었습니다.
+Astro Bot에는 여전히 objects/characters가 누락되어 있으며 플레이 가능한 것으로 광고되지 않습니다.
+Diablo II는 아직 확인된 게임 플레이가 없습니다. 다른 타이틀에는
+그래픽 결함, 시스템 오류 또는 성능 저하.
+
+Opt-in 실험은 활성화 기본값을 유지합니다. 패키지에는 다음이 포함됩니다.
+프로그램, 문서, 라이센스 및 소스 코드만 해당됩니다. 게임 및 콘솔 모듈
+사용자가 자신의 복사본을 통해 제공해야 합니다.
+
+dist/docs/PUBLICACAO.txt
+========================================
+미래 출판 - 아직 허가되지 않은 수동 단계
+
+선택된 배포 목적지: zeraps5/ZeraPS5-Releases, 공공 및 별도의.
+개발: zeraps5/ZeraPS5, 개인. 이 마지막을 전송하거나 열지 않습니다.
+이 준비는 저장소를 만들지 않으며, 파일을 보내지 않으며, 출판물을 게시하지 않습니다.
+
+사용자의 특정 허가를 받은 후:
+Criar/conferir 분리된 배포 저장소 및 그 가시성.
+2) 현지 보고서를 검토하고, 테스트를 수행하고, 최종 ZIP를 검토합니다.
+3. SHA256SUMS와 관련된 실제 출처를 확인합니다.
+sources/ZeraPS5-source.zip, FFmpeg 및 링크를 위한 물건. 또한 보내기
+*-source.zip 버전된 자산; 자동 "소스 코드"는 그것을 대체하지 않습니다.
+-PackageDir와 함께 tools/publish-release.ps1을 수동으로 사용하고
+-AuthorizePublication. 스크립트는 확인이 필요하며 단 하나의 스크립트만 생성합니다.
+그것은 컴파일, 포장 또는 개발의 변화에 의해 실행되지 않습니다.
+Revisar/baixar 수수료 자산 및 수동으로 안정적인 출시를 게시
+latest.json은 SHA가 지정한 ZIP를 따르야 합니다.
+6.공개 리디렉션을 확인 releases/latest/download/latest.json
+그리고 고상한 스파이를 사용하여 테스트 시설을 업데이트합니다.
+
+tags/nomes 패키지를 다시 사용하지 않고 성장하는 건축 번호를 사용합니다.
+자동으로 미리 보기 버전 및 기타 아키텍처를 무시합니다.
+이전은 복구를 위해 유지되어야합니다.이 응용 프로그램에 토큰이 없습니다.
+게시자 로그인 gh는 배포에서 분리됩니다.
+
+공식적으로 상담된 자료:
+https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+https://ffmpeg.org/legal.html
+
+dist/docs/RECOMPILAR.txt
+========================================
+관련 출처 및 리리케이션
+
+sources/ZeraPS5-source.zip 실제 출처, 테스트, 헤드, CMake,
+스크립트, dist/ 자료 및 선언서에 표시된 검토 라이센스.
+GitHub의 자동 "소스 코드"파일은 이러한 소스를 대체하지 않습니다.
+Git 관리, 개인 기록 또는 기계 설정이 없습니다.
+
+요구 사항: Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake >= 3.21 및 nasm
+재건하기 위해 FFmpeg. ZeraPS5의 출처를 추출; ffmpeg-7.1.2.tar.xz를 넣어
+third_party/ffmpeg/에서 실행 MSYS2 UCRT64: sh tools/build_ffmpeg.sh
+다음은, UCRT64/bin에서 PATH:
+cmake -S . -B build/distribution -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/distribution --parallel 2
+ctest --test-dir build/distribution --output-on-failure
+
+FFmpeg, altere/recompile의 출처를 교환하고 ZeraPS5를 재건하려면
+새로운 include/lib. ZeraPS5-relink-objects.zip 또한 물건을 제공합니다
+응용 프로그램 및 link.txt 도서관의 순서로 복제하지 않고 종교를 수행합니다.
+<Source>/<BUILD>을 폴더로 대체하고 libav*.a를 재건된 버전으로 대체합니다.
+건설 디렉토리에 명령을 실행합니다. MinGW 도서관은 MSYS2에서 온다.
+
+SOURCE-VERSION.txt.git 없이 ID를 유지합니다.바이트-바이트 평등
+다른 도구 체인 사이에 인증되지 않았습니다. 추가 제한이 없습니다
+사용, 수정, 청소 또는 적용 가능한 라이센스를 넘어 재분배.

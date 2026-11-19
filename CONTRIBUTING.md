@@ -8,15 +8,13 @@ Bug reports, compatibility results, focused code fixes and documentation improve
 - [b984 Windows package](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64.zip), including the same emulator source, FFmpeg source and relink materials under sources/.
 - [Exact revision and SHA-256](SOURCE-VERSION.txt)
 
-GitHub's automatic Source code ZIP and a clone of this repository contain distribution documentation. Use the versioned source archive above for emulator code. Pull requests here can update the public documentation, compatibility records and repository tooling.
-
-For an emulator-code change, extract the matching source, prepare a focused patch and [open an issue](https://github.com/zeraps5/ZeraPS5-Releases/issues/new) with the patch, affected revision, problem, proposed fix and validation. Preserve upstream credits and component licenses. Do not upload full game or console files.
+Fork or clone this repository to work on the emulator source, tests, or documentation. Create a branch from `main` and open a focused pull request with the affected revision, steps to reproduce, and tests you ran. Preserve upstream credits and component licenses. Do not upload full game or console files.
 
 ## Build from source
 
-The included dist/docs/RECOMPILAR.txt is the build/relink reference. It specifies Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake 3.21 or newer, and NASM for FFmpeg. FFmpeg's matching source is included in the Windows package.
+The [rebuild and relink instructions](dist/docs/RECOMPILAR.txt) specify Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake 3.21 or newer, and NASM for FFmpeg. FFmpeg's matching source is included in the Windows package.
 
-1. Extract the versioned emulator source archive.
+1. Clone this repository. For the original build identity, extract the versioned emulator source archive outside any Git checkout.
 2. Place the supplied ffmpeg-7.1.2.tar.xz under third_party/ffmpeg/ and run `sh tools/build_ffmpeg.sh` from MSYS2 UCRT64.
 3. With UCRT64/bin on PATH, configure, build and run the relevant checks:
 
@@ -27,6 +25,8 @@ ctest --test-dir build/distribution --output-on-failure
 ```
 
 These commands are the packaged instructions. Identical output bytes across different toolchains have not been certified.
+
+The launcher compares the published build number to the installed build number. The public Git history differs from the original build history, so its commit count must not be used as a release sequence. Verify that a future stable package has a build number higher than the current public manifest before publishing it.
 
 ## Compatibility reports
 

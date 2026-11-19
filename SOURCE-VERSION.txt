@@ -5,8 +5,8 @@ Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releas
 Source archive SHA-256: 814bbadf56ab3064d279076df90d69823e5730ff8b43aa24dc66c6675ed7ec81
 Windows archive SHA-256: 46b513f07ddb78c3def09a3e80038f50468968ee122db2b1922b7ed2c8171eb0
 
-This repository contains release documentation and packaged distributions.
-Its release tag identifies this distribution repository, not the emulator source commit.
-Use the versioned source archive above for the actual modified emulator sources.
-GitHub's automatic Source code archives contain the distribution repository snapshot.
+The default branch contains the reviewed b984 emulator source import.
+The existing b984 release tag still identifies the original distribution snapshot.
+Use the versioned source archive above for the exact packaged emulator sources
+and the metadata needed to reproduce the original build identity.
 Contribution instructions: CONTRIBUTING.md

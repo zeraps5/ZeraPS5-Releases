@@ -1,0 +1,24 @@
+Fontes correspondentes e religação
+
+sources/ZeraPS5-source.zip contém fontes reais, testes, cabeçalhos, CMake,
+scripts, materiais dist/ e licenças da revisão indicada no manifesto.
+O arquivo automático "Source code" do GitHub não substitui esses fontes.
+Não há administração Git, histórico pessoal ou configurações da máquina.
+
+Requisitos: Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake >= 3.21 e nasm
+para reconstruir FFmpeg. Extraia os fontes ZeraPS5; coloque ffmpeg-7.1.2.tar.xz
+em third_party/ffmpeg/ e execute no MSYS2 UCRT64: sh tools/build_ffmpeg.sh
+Depois, com UCRT64/bin no PATH:
+cmake -S . -B build/distribution -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/distribution --parallel 2
+ctest --test-dir build/distribution --output-on-failure
+
+Para trocar FFmpeg, altere/recompile seus fontes e reconstrua ZeraPS5 contra
+os novos include/lib. ZeraPS5-relink-objects.zip fornece também objetos do
+aplicativo e link.txt com a ordem das bibliotecas para religar sem recompilar.
+Substitua <SOURCE>/<BUILD> pelas suas pastas e libav*.a pela versão reconstruída;
+execute o comando no diretório de build. Bibliotecas MinGW vêm do MSYS2.
+
+SOURCE-VERSION.txt preserva a identificação sem .git. Igualdade byte a byte
+entre toolchains diferentes não foi certificada. Não há restrições adicionais
+de uso, modificação, depuração ou redistribuição além das licenças aplicáveis.

@@ -1,0 +1,28 @@
+Publicação — processo manual com revisão
+
+Destino de distribuição escolhido: zeraps5/ZeraPS5-Releases, público e separado.
+Fontes públicos: zeraps5/ZeraPS5.
+Compilar e empacotar não cria repositórios, envia arquivos ou publica releases.
+
+Após autorização específica do usuário:
+1. Conferir o repositório separado de distribuição já existente e sua visibilidade.
+2. Revisar o relatório local, executar os testes e revisar o ZIP final.
+3. Conferir SHA256SUMS e os fontes reais correspondentes. O ZIP binário inclui
+   sources/ZeraPS5-source.zip, FFmpeg e objetos para religação. Enviar também
+   o asset versionado *-source.zip; "Source code" automático não o substitui.
+4. Usar tools/publish-release.ps1 manualmente com -PackageDir e
+   -AuthorizePublication. O script exige confirmação e cria somente um rascunho.
+   Não é executado por compilação, empacotamento ou mudanças no desenvolvimento.
+5. Revisar/baixar os assets do rascunho e publicar a release estável manualmente
+   só após aprovação. latest.json deve acompanhar o ZIP cujo SHA indica.
+6. Verificar o redirecionamento público releases/latest/download/latest.json
+   e realizar uma atualização de uma instalação de teste com saves fictícios.
+
+Use números de build crescentes, sem reutilizar tags/nomes de pacotes. O canal
+automático ignora versões preview e outras arquiteturas. Releases estáveis
+anteriores devem ser mantidas para recuperação. Não há token no aplicativo.
+O login gh do responsável pela publicação é separado da distribuição.
+
+Fontes oficiais consultadas:
+https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+https://ffmpeg.org/legal.html

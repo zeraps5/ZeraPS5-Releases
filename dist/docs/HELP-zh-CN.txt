@@ -1,0 +1,230 @@
+
+dist/LEIA-ME-games.txt
+========================================
+游戏
+=====
+
+每个游戏使用一个文件夹，包含从您自己的主机提取并解密的文件，结构如下：
+
+games\<pasta 遊戲>\eboot.bin
+games\<pasta 遊戲>\ sce_sys\param.json
+games\<pasta 遊戲>\ sce_module\ (如果遊戲有)
+
+游戏永远不会与模拟器一起,不应该分享。
+
+dist/LEIA-ME-system.txt
+========================================
+控制台系统图书馆
+=================================
+
+将从您自己的PS5提取并解密的这些文件放入 system\modules\
+（在主机上位于 /system/common/lib/）：
+
+  libSceAgc.sprx
+  libSceAgcDriver.sprx
+  libSceAmpr.sprx
+  libScePsml.sprx
+
+部分游戏需要这些库；启动器会列出缺少的库。
+他们从来没有与模拟器一起来,也不应该与其他人分享。
+个人(复制在自己的PC可以)。
+优先使用设置中选择的文件夹。找到的本地库会复制到 system/modules/collections 中的集合。添加新集合时不会混合不同源文件夹的文件，也不会覆盖已有版本。完整副本在原磁盘断开后仍可使用。不会下载库。
+
+dist/LEIA-ME.txt
+========================================
+ZeraPS5 {VERSION} — 实验版本
+
+实验式模拟器 PlayStation 5 为 Windows x86-64。
+没有兼容性、稳定性或FPS的保证。
+
+语言: 语言菜单, 或 设置 > 语言. 有 15 个界面选项,
+包括阿拉伯语,法西斯语,俄语和乌克兰语。 查看 docs/IDIOMAS.txt.
+
+将 ZIP 提取到一个可录制的文件夹,在 Program Files 之外。
+阅读 system/LEIA-ME.txt; 只添加控制台的模块。
+打开 ZeraPS5.exe 并在设置中添加游戏的文件夹。
+4. 选择游戏,然后单击 玩. 文件夹和图像.exfat 使用支持
+此包不会提取游戏,也不会解密文件。
+
+要求: Windows 10/11 x64, CPU x86-64/AVX, GPU Vulkan 1.3 和驱动程序
+Python、CMake 和 MSYS2 不需要使用可行。
+Vulkan 驱动程序来自 GPU 制造商,而不是 ZIP 制造商。
+DualSense USB 和 XInput 使用现有支持。
+此版已验证. 在测试游戏之前,请查看 docs/LIMITACOES.txt。
+
+user/ 创建在第一次使用,并保存存储器,设置,密码和存储记录。
+不要分享这个完整的文件夹. 报告是默认位置; 线条
+路径,地方名称和常见的身份证被忽略。 查看ZIP和
+分享前的描述:过滤器不会删除任何可能的数据。
+
+稳定 Windows x64 更新自动查看
+https://github.com/zeraps5/ZeraPS5-Releases/releases/latest/download/latest.json
+没有登录、代币或计算机识别。 请求可以被关闭
+安装新版本需要确认。
+安装检查完整性并
+保留 user/, games/ 和 system/. 恢复: docs/ATUALIZACOES.txt.
+
+真实的来源,FFmpeg和相关物品:sources/和docs/RECOMPILAR.txt.
+许可证和信用:LICENSE,CREDITS.txt 和 licenses/.
+包中没有游戏、固件、控制台模块或密钥。
+从您自己的主机合法提取的副本。ZeraPS5 与 Sony 没有任何隶属或合作关系。
+
+dist/docs/ATUALIZACOES.txt
+========================================
+更新和恢复
+
+稳定频道 Windows x86-64: zeraps5/ZeraPS5-Releases 在 GitHub 上。
+zeraps5/ZeraPS5 开发仓库仍然是私人。
+其分发的目的地仍然依赖于授权的创建和出版。
+启动器查询 releases/latest/download/latest.json 通过 HTTPS,没有代币,
+计算机名称或安装标识符. 不使用 REST API。
+最新转向选出稳定发布。 缺少发布,
+HTTP 403/429 或网络故障保持安装,没有不断重复。
+
+新的版本提供确认。 应用程序等待启动器
+关闭,不关闭过程,拒绝更新游戏这个活跃文件夹。
+将 SHA-256 ZIP, canal/arquitetura 和 hash/tamanho 输入内部文件。
+外部路径、链接、冲突和个人文件被拒绝。
+user/、games/和system/ 未被替换。
+
+备份和日记留在user/updates/transaction. 复制复制故障
+此前的程序:在复制期间的中断,将恢复到
+要手动恢复,关闭此安装,并使用:
+powershell -NoProfile -ExecutionPolicy Bypass -File "user/updates/Recuperar-ZeraPS5.ps1" -InstallRoot "PASTA_DA_INSTALACAO" -Recover
+恢复复复制在启动更新时创建。 查看更多
+user/updates/result.txt. 保持 transaction/backup 直到新版本有效。
+
+SHA-256 对 HTTPS 所获得的显明的完整性进行检查;
+此申请人没有数字签名,此申请人没有数字签名。
+
+默认在程序启动时检查更新。也可以使用主界面的“检查更新”按钮。可在设置中关闭启动时检查。
+
+dist/docs/IDIOMAS.txt
+========================================
+接口语言 ZeraPS5
+
+打开启动器顶部的语言菜单,还有一个按钮
+语言在设置中 选项在确认时保存,并在下一个选项中有效
+打开;菜单和主屏幕立即改变,没有重新启动游戏。
+
+15 選擇:
+- Português (Brasil) — pt-BR
+- Português (Portugal) — pt-PT
+- Inglês — en
+- Espanhol — es
+- Francês — fr
+- Alemão — de
+- Italiano — it
+- Japonês — ja
+- Coreano — ko
+- Chinês simplificado — zh-CN
+- Chinês tradicional — zh-TW
+- Árabe — ar
+- Farsi (persa) — fa
+- Russo — ru
+- Ucraniano — uk
+
+阿拉伯人和法西人使用阅读和安排从右向左。
+路径和更新地址继续从左到
+右边保存您的阅读. 选项显示您的原住民名称
+让您能够轻松地回到所需的语言。
+
+以此为主,以此为主。 user/config/zeraps5.ini 是是
+无论是语言,它将游戏控制台的语言传达给游戏。
+它不会在游戏中安装翻译、来源或语言文件。
+每个游戏中可用的语言和语言都取决于您的文件。
+
+菜单、控制、通知、错误、报告领域和结果
+更新使用所选择的语言. 打开技术帮助阅读帮助
+在此语言; 查看日志显示新记录在所选择的语言,甚至
+假如在执行后更改。
+
+代码、文件名、硬件模型和游戏标题是数据的
+用户的文章不被翻译,用户的文章没有被翻译。
+原始记录仍在user/logs诊断。
+未经结构化记录的旧必须重新执行
+创建翻译视图 结构化复制限为 64 MiB 个
+执行; 窗口显示到 1 MiB 的最后步骤的视图。
+许可证和信用保留其原始文本和其有效性。
+
+目录在frontends/launcher/. 发电机检查参数
+tools/check_localization.py 检查覆盖和复制。
+技术翻译由本地软件支持,并部分审查。
+他们仍然需要对所有语言的原住民讲话者的审查。
+
+dist/docs/LIMITACOES.txt
+========================================
+此实验版本的局限性
+
+docs/COMPATIBILIDADE.md 列出了测试的部分、硬件
+以及每个结果的构建。在某一部分达到游戏玩法并不能证明
+整个游戏都有效。性能因游戏和计算机而异。
+
+Ratchet 和 Atlantis 具有来自 Iris Xe 笔记本的结果。九个结果
+RTX 5060 Ti 是在主 1c4893f（版本 756）上获得的。
+此版本的合成图形测试在 RTX 5060 Ti 上运行。
+Astro Bot 仍然缺少 objects/characters，并且未宣传为可玩。
+Diablo II 仍然没有确认的游戏玩法。其他标题有
+图形缺陷、系统故障或性能缓慢。
+
+Opt-in 实验保留其激活默认值。套餐包括
+仅包含程序、文档、许可证和源代码。游戏和控制台模块
+必须由用户从自己的副本中提供。
+
+dist/docs/PUBLICACAO.txt
+========================================
+未来的出版物 - 手动阶段,尚未授权
+
+选择的分销目的地: zeraps5/ZeraPS5-Releases, 公共和单独。
+开发: zeraps5/ZeraPS5,私人. 不要转移或打开后者。
+此编制不创建存储,不发送文件,也不发布发布。
+
+根据用户的具体许可:
+Criar/conferir 分配的分配库及其可见性。
+审查本地报告,进行测试,并审查最终的ZIP。
+3. 提供 SHA256SUMS 和相关的真实来源. 二进制 ZIP 包括
+sources/ZeraPS5-source.zip, FFmpeg 和 交换物品。
+已版本的资产 *-source.zip;自动“源代码”不会取代它。
+使用 tools/publish-release.ps1 手动 -PackageDir 和
+AuthorizePublication. 脚本需要确认,并创建一个单一的图标。
+它不是由编辑、包装或开发变更进行的。
+5Revisar/baixar 资产的折扣和发布稳定发布手动
+只有经过批准后, latest.json 必须跟踪 SHA 指定的 ZIP。
+6、检查公共转向releases/latest/download/latest.json
+并进行一个测试设施的更新,使用虚构的存储器。
+
+使用增長的建築數字,不再使用tags/nomes包。
+自动忽略预览版本和其他架构。
+以前的需要保持恢复. 应用程序中没有代币。
+出版商的Login GH是与分发分开的。
+
+官方消息来源:
+https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+https://ffmpeg.org/legal.html
+
+dist/docs/RECOMPILAR.txt
+========================================
+相应的来源和相关
+
+sources/ZeraPS5-source.zip 包含真实的来源,测试,头条,CMake,
+脚本,材料dist/和修订许可证,如在宣言中所述。
+GitHub 的自动“源代码”文件不会取代这些源。
+没有 Git 管理、个人历史或机器设置。
+
+要求: Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake >= 3.21 和 nasm
+要重建 FFmpeg. 提取 ZeraPS5 源; 放置 ffmpeg-7.1.2.tar.xz
+在 third_party/ffmpeg/ 和运行在 MSYS2 UCRT64: sh tools/build_ffmpeg.sh
+接下来,与UCRT64/bin在PATH:
+cmake -S . -B build/distribution -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/distribution --parallel 2
+ctest --test-dir build/distribution --output-on-failure
+
+换FFmpeg,altere/recompile 你的源,并重建ZeraPS5 对
+新 include/lib. ZeraPS5-relink-objects.zip 还提供物品
+应用程序和 link.txt 与图书馆的顺序,以便在没有收集的信仰。
+用其文件夹取代 <Source>/<BUILD> 和 libav*.a 以重新构建的版本;
+执行命令在构建目录. MinGW 图书馆来自 MSYS2。
+
+SOURCE-VERSION.txt 保留未.git 身份 平等 byte 每 byte
+不同工具链之间没有认证. 没有额外的限制
+使用、修改、清理或重新分配,除适用的许可证外。

@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Icon 1: the game window (pal_win32) and Explorer use it.
+1 ICON "../assets/zeraps5.ico"

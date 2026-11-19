@@ -1,0 +1,15 @@
+{
+  "Não foi possível salvar user\\config\\zeraps5.ini.": "Falha ao salvar configurações.",
+  "Não foi possível salvar a configuração do jogo.": "Falha ao salvar configurações.",
+  "Não foi possível baixar a atualização.": "Falha ao baixar a atualização.",
+  "A atualização não passou na verificação SHA-256.": "A verificação de integridade falhou.",
+  "Não foi possível preparar a recuperação da atualização.": "Falha ao preparar a atualização. A versão atual foi mantida.",
+  "Não foi possível iniciar a instalação. A versão atual foi preservada.": "Falha ao preparar a atualização. A versão atual foi mantida.",
+  "Nenhuma release acessível no momento.\nO repositório pode estar privado, vazio ou sem conexão. A versão instalada foi mantida.": "Nenhuma atualização está acessível. A versão atual foi mantida.",
+  "Este jogo ainda não tem log: rode-o uma vez e depois reporte.": "Este jogo ainda não tem log. Execute-o uma vez.",
+  "Não foi possível iniciar ps5c.exe (ele deve estar na mesma pasta do launcher).": "Não foi possível iniciar o emulador.",
+  "Não foi possível criar o arquivo do relatório.": "Falha ao criar o relatório.",
+  "Não foi possível enviar ao servidor (ele está ligado?). O arquivo foi salvo: envie-o de outro jeito.": "Falha ao enviar. O relatório foi salvo localmente.",
+  "Relatório criado (a pasta foi aberta com o arquivo selecionado).\n\nEnvie o .zip junto com uma descrição curta: o que você fez e o que aconteceu.": "Relatório criado. Revise o arquivo antes de compartilhar.",
+  "Não foi possível enviar o log (o servidor está ligado?).": "Falha ao enviar. O relatório foi salvo localmente."
+}

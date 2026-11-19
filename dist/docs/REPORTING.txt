@@ -1,0 +1,41 @@
+ZeraPS5 — optional private problem reports
+
+Automatic report upload remains disabled. Sending a report is a manual choice;
+you can save a local draft instead. Update downloads do not send a report.
+
+After a game session has ended, select Report a problem and describe what you
+did and what appeared. Empty or placeholder descriptions cannot be submitted
+as a normal report. The launcher checks the sanitized diagnostic content and
+warns if it is absent, partial or from an unverified legacy session.
+
+New sessions have separate current/previous records. Process and guest exit
+codes remain separate, and unknown values are not reported as successful exits.
+Collection is blocked while a session is running or its end is unconfirmed.
+The ZIP includes filtered logs, a description, game/build and hardware/OS
+information, report-quality.txt and session-info.txt. Session IDs link the
+diagnostic files; they are not persistent computer or account identifiers.
+
+Known private patterns are omitted; filtering cannot recognize every personal
+detail. Review your description before sending. Raw logs, environment variables,
+command lines and structured .records files are not uploaded as a fallback.
+Computer-name and persistent installation-ID headers are not sent.
+
+ZIP contents and integrity are checked before finalization. Each exported
+sanitized log is limited to 4 MiB; cuts are marked as partial. Original logs are
+not truncated by export. ZIPs use stored entries without compression and are
+limited to 10 MiB. Historical local session directories are retained and may
+grow; there is no new automatic cleanup of your previous session data.
+
+The private receiver allows up to 500 daily upload reservations globally and
+10 per source address, using UTC day boundaries. Failed uploads after a slot
+reservation count toward that limit. Reports expire after 14 days; deletion is
+asynchronous. Reports are not publicly listed or downloadable. A network/server
+failure preserves the local ZIP in user/reports.
+
+To disable report uploads entirely in user/config/zeraps5.ini:
+[relatorios]
+servidor=
+enviar_ao_fechar=0
+
+Sources and relink objects are supplied under sources/. Credits and licenses
+are preserved. Games, firmware, keys and console modules are not distributed.

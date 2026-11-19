@@ -1,0 +1,12 @@
+/build/
+/build-*/
+/out/
+/third_party/ffmpeg/
+/games/
+/system/
+/user/
+/.vs/
+/CMakeUserPresets.json
+__pycache__/
+*.log
+*.dmp

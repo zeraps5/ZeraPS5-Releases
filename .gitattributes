@@ -1,0 +1,5 @@
+*.sh text eol=lf
+/frontends/launcher/translations.inc text eol=lf
+/frontends/launcher/log_translations.inc text eol=lf
+/tools/apply-update.ps1 text eol=lf
+/dist/docs/HELP-*.txt text eol=lf

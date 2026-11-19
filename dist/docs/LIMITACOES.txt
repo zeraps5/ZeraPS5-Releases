@@ -1,0 +1,27 @@
+Limitações desta versão experimental
+
+A lista docs/COMPATIBILIDADE.md identifica os trechos testados, o hardware
+e o build de cada resultado. Chegar ao gameplay em um trecho não comprova
+que o jogo inteiro funciona. Desempenho varia conforme jogo e computador.
+
+Ratchet e Atlantis conservam seus resultados históricos do notebook Iris Xe.
+Os nove jogos da rodada build 756 também conservam seu contexto original.
+A regressão 0.1.1 e os testes gráficos sintéticos desta candidata foram feitos
+na RTX 5060 Ti; consulte VALIDACAO.txt para builds e trechos desta rodada.
+Esta preparação não inclui novo teste físico do pacote no notebook.
+Astro Bot ainda tem objetos/personagens ausentes e não é anunciado como jogável.
+Diablo II e The Last of Us Part I ainda não têm gameplay comprovado. Outros títulos apresentam
+defeitos gráficos, falhas de sistema ou lentidão.
+
+O rastreamento de páginas COW volta a ser explicitamente experimental e
+desligado por padrão: o teste concorrente detectou perda de escritas quando
+era ativado automaticamente. Não ative experimentos para medir estabilidade.
+A base Vulkan preserva caminhos anteriores quando os recursos não existem.
+
+Resolução interna é aplicada somente onde há suporte. Uma seleção 720p já
+gravada passa a valer também nos Unreal compatíveis quando a escala Unreal
+avançada está em Do jogo. Para manter o tamanho original, deixe Resolução
+interna em Do jogo; uma escala Unreal avançada explícita tem prioridade.
+
+O pacote inclui apenas programa, documentação, licenças e fontes. Jogos e módulos do console
+devem ser fornecidos pelo usuário a partir de suas próprias cópias.

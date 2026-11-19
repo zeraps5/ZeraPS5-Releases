@@ -1,0 +1,44 @@
+Validação da candidata 0.1.1 build 984
+
+Hardware: Ryzen 7 5700G, RTX 5060 Ti 16 GB, 32 GB RAM, Windows 11.
+Driver informa Vulkan 1.4.351. Compilação Release -O3 -DNDEBUG,
+PS5C_MARCH_V3=OFF, sem AVX2 obrigatório no executável host.
+
+Rodada de jogos em b974/b981. Após ela, main 5a5b994 unificou a seleção de
+resolução interna, integrado em 0f2fa05 (código build 983). O padrão Do jogo
+continua no mesmo caminho usado nos sete testes. Após essa integração foram repetidos CTest e distribuição com sucesso, sobre
+o código b983 (documentação ainda em edição). O build 984 fecha somente
+documentação/metadados sobre esse código final.
+Os builds exatos dos testes de jogos constam de COMPATIBILIDADE.md.
+
+CTest completo: 182/182, incluindo 28 GPU, camada de validação realmente
+carregada, 72,53 s. Sem mensagens VUID ou falha de camada ausente.
+Fallback: 28/28 GPU, 40,79 s, solicitando Vulkan 1.1 e desligando renderização
+/estados dinâmicos, push descriptors e timeline; camada ativa, sem VUID.
+Isso testa caminhos de software na RTX, não simula uma GPU antiga física.
+Distribuição/atualização: 52/52 novamente após a integração de resolução,
+incluindo os 15 idiomas, hashes, rollback, cópia interrompida, rejeição de
+caminhos perigosos e preservação de saves/configurações/jogos/módulos.
+
+F10: teste de mensagens atrasadas falhava antes da correção e passa depois;
+10/10 casos PAL passam. Janela do Skyrim confirmou abrir/fechar com aperto
+curto e dados de CPU/GPU/SO/RAM/commit/Vulkan/saída. Ícone Z visível na janela.
+Testes nativos cobrem escritas concorrentes durante split privado, teardown
+da janela física e migração de fibers entre threads nos dois sentidos.
+O algoritmo COW ainda não está corrigido: o rastreamento fica opt-in.
+
+Regressão em sete jogos, uma instância por vez, perfis/caches isolados e saves
+originais conferidos por SHA-256: Minecraft (601 s), GTA (842 s), Red Dead
+(902 s), Skyrim (362 s), Quake II (361 s), Wolverine (240 s), Astro (302 s).
+As sessões corretas encerraram controladas com código zero, sem ERROR/FATAL.
+Minecraft e Quake II tiveram gameplay/movimento; GTA chegou ao banco com
+controle; Skyrim à carroça com câmera; Red Dead apenas à abertura 3D.
+Wolverine e Astro continuam sem gameplay, assim como nos retestes da b898.
+Astro não tem imagem útil aprovada. TLOU continua em investigação separada.
+
+Não há promessa de ganho universal de FPS nem de campanha completa.
+O pacote não teve novo teste físico no notebook/Iris ou i5 antigo.
+Compatibilidade, trechos e limitações constam de COMPATIBILIDADE.md.
+A conferência final dos ZIPs, fontes, hashes e interface portátil será registrada
+junto aos artefatos/rascunho; não é substituída pelos testes sintéticos.
+Versão exata e commit constam no manifesto externo e em SOURCE-VERSION.txt.

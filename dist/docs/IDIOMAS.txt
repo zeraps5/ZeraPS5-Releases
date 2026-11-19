@@ -1,0 +1,50 @@
+Idiomas da interface do ZeraPS5
+
+Abra o menu Idiomas na parte superior do launcher. Também há um botão
+Idiomas em Configurações. A escolha é salva ao confirmar e vale na próxima
+abertura; os menus e a tela principal mudam imediatamente, sem reiniciar jogos.
+
+15 opções:
+- Português (Brasil) — pt-BR
+- Português (Portugal) — pt-PT
+- Inglês — en
+- Espanhol — es
+- Francês — fr
+- Alemão — de
+- Italiano — it
+- Japonês — ja
+- Coreano — ko
+- Chinês simplificado — zh-CN
+- Chinês tradicional — zh-TW
+- Árabe — ar
+- Farsi (persa) — fa
+- Russo — ru
+- Ucraniano — uk
+
+Árabe e farsi usam leitura e disposição da direita para a esquerda. Os
+campos de caminhos e do endereço de atualização continuam da esquerda para
+a direita para preservar sua leitura. As opções exibem seus nomes nativos
+para facilitar voltar ao idioma desejado.
+
+A preferência fica em [interface] idioma de user/config/zeraps5.ini e é
+independente de [geral] idioma, que informa a língua do console ao jogo.
+Ela não instala traduções, fontes ou arquivos de idioma nos jogos.
+O idioma e os idiomas disponíveis em cada jogo dependem dos seus arquivos.
+
+Menus, controles, avisos, erros, campos dos relatórios e resultados das
+atualizações usam o idioma escolhido. Abra Ajuda técnica para ler a ajuda
+nesse idioma; Ver log mostra os registros novos no idioma escolhido, mesmo
+se a preferência mudar depois da execução.
+
+Códigos, nomes de arquivos, modelos de hardware e títulos dos jogos são dados
+e permanecem intactos. A descrição escrita pelo usuário não é traduzida.
+Os registros originais continuam em user/logs para diagnóstico. Sessões
+anteriores sem registro estruturado precisam ser executadas novamente para
+gerar a visualização traduzida. A cópia estruturada é limitada a 64 MiB por
+execução; a janela mostra até 1 MiB do trecho final da visualização.
+Licenças e créditos mantêm seus textos originais e sua validade.
+
+Os catálogos ficam em frontends/launcher/. Os geradores verificam os parâmetros
+de formatação; tools/check_localization.py verifica a cobertura e reprodução.
+As traduções técnicas foram assistidas por software local e revisadas em parte.
+Ainda precisam de revisão por falantes nativos de todos os idiomas.

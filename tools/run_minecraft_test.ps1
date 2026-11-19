@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Uses the emulator's controller script, never the Windows keyboard/mouse.
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)][string]$Executable,
+    [Parameter(Mandatory=$true)][string]$GameExe,
+    [Parameter(Mandatory=$true)][string]$Modules,
+    [Parameter(Mandatory=$true)][string]$NidDb,
+    [Parameter(Mandatory=$true)][string]$ProfileTemplate,
+    [Parameter(Mandatory=$true)][string]$OutputDirectory,
+    [ValidateSet(128,256,512)][int]$ArenaMiB=128,
+    [ValidateSet(0,1)][int]$HoldReleases=1,
+    [ValidateSet(0,1)][int]$MemoryReaders=0,
+    [switch]$VertexRanges,
+    [switch]$ReadOnlyCache,
+    [switch]$ScriptOnly,
+    [switch]$NoTraffic,
+    [ValidateRange(0,3600)][int]$SampleSeconds=0,
+    [ValidateRange(0,1000000)][int]$CaptureEvery=0,
+    [string]$PadScript='35:cross,55:down,60:down,70:cross'
+)
+$ErrorActionPreference='Stop'
+foreach ($taskPath in @($Executable,$GameExe,$Modules,$NidDb,$ProfileTemplate)) {
+    if (-not (Test-Path -LiteralPath $taskPath)) { throw "Missing test input: $taskPath" }
+    if ($taskPath.Contains('"')) { throw 'Input paths must not contain quotation marks' }
+}
+$Executable=(Resolve-Path -LiteralPath $Executable).Path
+$GameExe=(Resolve-Path -LiteralPath $GameExe).Path
+$Modules=(Resolve-Path -LiteralPath $Modules).Path
+$NidDb=(Resolve-Path -LiteralPath $NidDb).Path
+$ProfileTemplate=(Resolve-Path -LiteralPath $ProfileTemplate).Path
+$OutputDirectory=[System.IO.Path]::GetFullPath($OutputDirectory)
+if (Test-Path -LiteralPath $OutputDirectory) { throw 'Choose a fresh output directory; existing runs are preserved' }
+if ($OutputDirectory.StartsWith($ProfileTemplate.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Output directory must be outside the profile template'
+}
+if (-not (Get-Item -LiteralPath $ProfileTemplate).PSIsContainer) { throw 'ProfileTemplate must be a directory' }
+New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
+Copy-Item -LiteralPath $ProfileTemplate -Destination (Join-Path $OutputDirectory 'user') -Recurse
+if ($CaptureEvery) { New-Item -ItemType Directory -Path (Join-Path $OutputDirectory 'user\frames') -Force | Out-Null }
+$taskExe=Join-Path $OutputDirectory 'ps5c-minecraft-test.exe'
+Copy-Item -LiteralPath $Executable -Destination $taskExe
+$taskFlags=@('PS5C_VERTEX_RANGES','PS5C_READONLY_CACHE','PS5C_GPU_PROFILE','PS5C_DEVICE_ARENA',
+    'PS5C_DEVICE_UNIFORMS','PS5C_SAVE_FRAMES','PS5C_SAVE_TARGETS','PS5C_LOG_SUBMITS',
+    'PS5C_WB_LOG','PS5C_FAULT_DUMP_AT','PS5C_SAMPLE','PS5C_DUMP','PS5C_LOG_MAPS',
+    'PS5C_LOG_BUFFERS','PS5C_PAD_SCRIPT','PS5C_PAD_SCRIPT_ONLY','PS5C_ARENA_MIB','PS5C_GPU_STATS',
+    'PS5C_BUFFER_TRAFFIC','PS5C_FAULT_MAPS','PS5C_FAULT_CODE','PS5C_HOLD_RELEASES',
+    'PS5C_MEMORY_READERS','PS5C_GPU_SAMPLE','PS5C_STORE_WINDOWS','PS5C_NO_SPAN_CACHE','PS5C_NO_EVAL_CACHE')
+$taskOldEnv=@{}
+foreach ($taskFlag in $taskFlags) {
+    $taskOldEnv[$taskFlag]=[Environment]::GetEnvironmentVariable($taskFlag,'Process')
+}
+$taskHash=[System.Security.Cryptography.SHA256]::Create()
+$taskStream=[System.IO.File]::OpenRead($taskExe)
+try { $taskSha256=[BitConverter]::ToString($taskHash.ComputeHash($taskStream)).Replace('-','') }
+finally { $taskStream.Dispose(); $taskHash.Dispose() }
+$taskState=[ordered]@{
+    executable_sha256=$taskSha256
+    pad_script=$PadScript; script_only=[bool]$ScriptOnly; arena_mib=$ArenaMiB; vertex_ranges=[bool]$VertexRanges
+    readonly_cache=[bool]$ReadOnlyCache
+    sample_seconds=$SampleSeconds; captures_every=$CaptureEvery
+    traffic_enabled=(-not [bool]$NoTraffic)
+    hold_releases=$HoldReleases
+    memory_readers=$MemoryReaders
+    inicio=(Get-Date).ToString('o'); pid=$null; fim=$null; codigo_saida=$null; erro=$null
+}
+try {
+    foreach ($taskFlag in $taskFlags) { [Environment]::SetEnvironmentVariable($taskFlag,$null,'Process') }
+    $env:PS5C_PAD_SCRIPT=$PadScript
+    if ($ScriptOnly) { $env:PS5C_PAD_SCRIPT_ONLY='1' }
+    $env:PS5C_ARENA_MIB=[string]$ArenaMiB
+    $env:PS5C_HOLD_RELEASES=[string]$HoldReleases
+    $env:PS5C_MEMORY_READERS=[string]$MemoryReaders
+    $env:PS5C_VERTEX_RANGES=if ($VertexRanges) { '1' } else { '0' }
+    if ($ReadOnlyCache) { $env:PS5C_READONLY_CACHE='1' }
+    if ($SampleSeconds) { $env:PS5C_SAMPLE=[string]$SampleSeconds }
+    if ($CaptureEvery) { $env:PS5C_SAVE_FRAMES=[string]$CaptureEvery }
+    $env:PS5C_GPU_STATS='1'
+    if (-not $NoTraffic) { $env:PS5C_BUFFER_TRAFFIC='1' }
+    $env:PS5C_FAULT_MAPS='1'
+    $env:PS5C_FAULT_CODE='1'
+    $taskArgs=@('run',('"'+$GameExe+'"'),'--modules',('"'+$Modules+'"'),'--nid-db',('"'+$NidDb+'"'))
+    $taskProcess=Start-Process -FilePath $taskExe -ArgumentList $taskArgs -WorkingDirectory $OutputDirectory -WindowStyle Normal -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'minecraft.log') -PassThru
+    $taskHandle=$taskProcess.Handle
+    $taskState.pid=$taskProcess.Id
+    $taskState | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'processo.json') -Encoding utf8
+    $taskProcess.WaitForExit()
+    $taskProcess.Refresh()
+    $taskState.codigo_saida=$taskProcess.ExitCode
+} catch {
+    $taskState.erro=$_.Exception.Message
+    throw
+} finally {
+    $taskState.fim=(Get-Date).ToString('o')
+    $taskState | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'processo.json') -Encoding utf8
+    foreach ($taskFlag in $taskFlags) { [Environment]::SetEnvironmentVariable($taskFlag,$taskOldEnv[$taskFlag],'Process') }
+}

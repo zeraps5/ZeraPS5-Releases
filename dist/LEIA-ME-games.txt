@@ -1,0 +1,10 @@
+Jogos
+=====
+
+Uma pasta por jogo, extraída e decriptada do SEU console, com a estrutura:
+
+  games\<pasta do jogo>\eboot.bin
+  games\<pasta do jogo>\sce_sys\param.json
+  games\<pasta do jogo>\sce_module\   (se o jogo tiver)
+
+Os jogos NUNCA vêm com o emulador e não devem ser compartilhados.

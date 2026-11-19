@@ -1,4 +1,4 @@
-# ZeraPS5 — experimental releases
+# ZeraPS5
 
 <p>
   <img src="docs/zeraps5-logo.png" alt="ZeraPS5" width="240" align="middle" />
@@ -9,6 +9,8 @@
 [![Windows application downloads (latest release)](docs/downloads.svg)](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
 
 *Windows application ZIP downloads for the latest release, including updates and tests; not unique users. Updated automatically on an hourly schedule and after a release. GitHub may delay refreshes or cache the image.*
+
+**[Download the latest Windows build](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)** · **[Browse source](src/)** · **[Build and contribute](CONTRIBUTING.md)** · **[Game compatibility](COMPATIBILITY.md)**
 
 ## Download and run
 
@@ -44,9 +46,7 @@ Highlights included in this release:
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 
-This repository hosts packaged releases and their corresponding source code.
-GitHub’s automatically generated “Source code” archives do not replace the versioned
-`*-source.zip` asset or the `sources/` materials included in the application package.
+This repository hosts the emulator source, tests and packaged releases. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
 
 ## Experimental software
 

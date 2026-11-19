@@ -1,0 +1,15 @@
+Bibliotecas de sistema do console
+=================================
+
+Coloque em system\modules\ estes arquivos, extraídos e decriptados do SEU PS5
+(ficam em /system/common/lib/ no console):
+
+  libSceAgc.sprx
+  libSceAgcDriver.sprx
+  libSceAmpr.sprx
+  libScePsml.sprx
+
+Alguns jogos exigem estas bibliotecas; o launcher avisa quais estão faltando.
+Eles NUNCA vêm com o emulador e não devem ser compartilhados com outras
+pessoas (copiar entre os seus próprios PCs pode).
+A pasta escolhida em Configurações tem prioridade. Bibliotecas locais encontradas são copiadas para coleções em system/modules/collections. Novos conjuntos são acrescentados sem misturar pastas de origem nem sobrescrever versões. As cópias completas continuam disponíveis sem o disco original. Não há download de bibliotecas.

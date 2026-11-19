@@ -1,0 +1,13 @@
+ZeraPS5 inclui o FFmpeg 7.1.2 (https://ffmpeg.org), licenciado sob a
+GNU Lesser General Public License 2.1 ou posterior (texto em
+FFmpeg-LGPL-2.1.txt), para decodificar vídeos e o som dos jogos.
+
+Código-fonte usado: https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz
+(sha256 089bc60fb59d6aecc5d994ff530fd0dcb3ee39aa55867849a2bbc4e555f9c304),
+sem modificações, compilado estaticamente por tools/build_ffmpeg.sh do
+repositório do ZeraPS5 (só decodificadores: H.264, HEVC, VP9, AAC, ATRAC9,
+MP3, Opus, Vorbis).
+
+ZeraPS5 includes FFmpeg 7.1.2 (https://ffmpeg.org) under the GNU LGPL 2.1
+or later, unmodified, built statically by tools/build_ffmpeg.sh; source at
+the address above.

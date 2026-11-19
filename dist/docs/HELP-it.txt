@@ -1,0 +1,230 @@
+
+dist/LEIA-ME-games.txt
+========================================
+Giochi
+=====
+
+Una cartella per gioco, con file estratti e decifrati dalla TUA console, con questa struttura:
+
+games\<pasta del gioco>\eboot.bin
+games\<pasta del gioco>\ sce_sys\param.json
+games\<pasta del gioco>\ sce_module\ (se il gioco ha)
+
+I giochi NON vengono mai con l'emulatore e non devono essere condivisi.
+
+dist/LEIA-ME-system.txt
+========================================
+Libreria di sistema della console
+=================================
+
+Inserisci in system\modules\ questi file già estratti e decifrati dalla TUA PS5
+(sulla console si trovano in /system/common/lib/):
+
+  libSceAgc.sprx
+  libSceAgcDriver.sprx
+  libSceAmpr.sprx
+  libScePsml.sprx
+
+Alcuni giochi richiedono queste librerie; il programma indica quelle mancanti.
+Non vengono mai con l'emulatore e non devono essere condivisi con altri
+persone (copie tra i propri PC può).
+La cartella scelta nelle Impostazioni ha la precedenza. Le librerie locali trovate vengono copiate in raccolte in system/modules/collections. I nuovi gruppi vengono aggiunti senza mescolare le cartelle di origine né sovrascrivere le versioni. Le copie complete restano disponibili senza il disco originale. Non vengono scaricate librerie.
+
+dist/LEIA-ME.txt
+========================================
+ZeraPS5 {VERSION} — versione sperimentale
+
+Emulatore sperimentale PlayStation 5 per Windows x86-64.
+Non ci sono garanzie di compatibilità, stabilità o FPS.
+
+Lingue: menu Lingue, o Impostazioni > Lingue. Ci sono 15 opzioni di interfaccia,
+compresi arabo, farsi, russo e ucraino. Vedi docs/IDIOMAS.txt.
+
+1.Risciacquare ZIP in una cartella registrabile, fuori Program Files.
+Leggi system/LEIA-ME.txt; aggiungere solo i moduli della console stessa.
+Apri ZeraPS5.exe e aggiungi le cartelle dei tuoi giochi in Impostazioni.
+Selezionare il gioco e fare clic su Gioca. cartelle e immagini.exfat utilizzano il supporto
+Questo pacchetto non extrage giochi né descriptografo i file.
+
+Requisiti: Windows 10/11 x64, CPU x86-64/AVX, GPU Vulkan 1.3 e driver
+Python, CMake e MSYS2 non sono necessari per utilizzare i funzionabili.
+Il driver Vulkan proviene dal produttore GPU, non da questo ZIP.
+DualSense USB e XInput utilizzano il supporto esistente.
+Consultare docs/LIMITACOES.txt prima di testare i giochi.
+
+user/ è creato per la prima volta e guarda i file di salvataggio, le impostazioni, i cache e i log.
+Non condividere l'intero cartella. i rapporti sono localizzati per standard; linee
+con i percorsi, i nomi locali e i credenziali comuni sono esclusi.
+la descrizione prima di condividere: il filtro non rimuove alcun dato possibile.
+
+Le aggiornamenti Windows x64 stabili vengono consultate automaticamente in
+https://github.com/zeraps5/ZeraPS5-Releases/releases/latest/download/latest.json
+senza login, token o identificazione del computer. la domanda può essere disattivata
+Inserisci una nuova versione richiede conferma.
+L'installazione verifica l'integrità e
+conservare user/, games/ e system/. Ristrutturazione: docs/ATUALIZACOES.txt.
+
+Fonti reali, FFmpeg e oggetti di relicazione: sources/ e docs/RECOMPILAR.txt.
+Licenze e crediti: LICENSE, CREDITS.txt e licenses/.
+Non ci sono giochi, firmware, moduli di console o chiavi nel pacchetto.
+copie estratte legalmente dalla propria console. Non esiste alcuna affiliazione con Sony.
+
+dist/docs/ATUALIZACOES.txt
+========================================
+Aggiornamento e recupero
+
+Windows x86-64 stabile canale: zeraps5/ZeraPS5-Releases su GitHub.
+Il deposito di sviluppo zeraps5/ZeraPS5 rimane privato.
+Il destino della distribuzione dipende ancora dalla creazione e pubblicazione autorizzate.
+Il lanciatore chiede releases/latest/download/latest.json per HTTPS, senza token,
+nome del computer o identificatore dell'installazione. non utilizza l'API REST.
+Il reindirizzamento più recente seleziona la rilascio stabile.
+HTTP 403/429 o fallimento di rete preservano l'installazione, senza ripetizione continua.
+
+La nuova versione è offerta per la conferma. l'applicazione aspetta il lanciatore
+chiudere, non chiudere i processi e rifiutare l'aggiornamento con gioco di questa cartella attiva.
+Conferire SHA-256 ZIP, canal/arquitetura e hash/tamanho dei file interni.
+I percorsi esterni, i link, le collisioni e i file personali sono rifiutati.
+user/, games/ e system/ non sono sostituiti.
+
+Backups e giornali rimangono a user/updates/transaction. Un fallimento di copia ripristina
+un programma precedente. un interruzione durante la copia dispara la ripresa nel
+per la ripresa manuale, chiudere questa installazione e utilizzare:
+powershell -NoProfile -ExecutionPolicy Bypass -File "user/updates/Recuperar-ZeraPS5.ps1" -InstallRoot "PASTA_DA_INSTALACAO" -Recover
+La copia di recupero viene creata all'inizio di un aggiornamento.Consulta anche
+user/updates/result.txt. Mantenere transaction/backup fino a quando la nuova versione non è valida.
+
+SHA-256 verifica l'integrità del manifesto ottenuto da HTTPS;
+Non è un codice di firma autentica.Questo candidato non ha una firma digitale.
+
+Per impostazione predefinita, il programma cerca aggiornamenti all’avvio. Puoi anche usare Cerca aggiornamenti nella schermata principale. La ricerca all’avvio può essere disattivata nelle Impostazioni.
+
+dist/docs/IDIOMAS.txt
+========================================
+Lingue di interfaccia ZeraPS5
+
+Apri il menu Lingue nella parte superiore del lanciatore. c'è anche un pulsante
+Lingue in Impostazioni. la scelta viene salvata al confermare e vale nella prossima
+aperto; i menu e lo schermo principale cambiano immediatamente, senza riavviare i giochi.
+
+15 opzioni di scelta:
+- Português (Brasil) — pt-BR
+- Português (Portugal) — pt-PT
+- Inglês — en
+- Espanhol — es
+- Francês — fr
+- Alemão — de
+- Italiano — it
+- Japonês — ja
+- Coreano — ko
+- Chinês simplificado — zh-CN
+- Chinês tradicional — zh-TW
+- Árabe — ar
+- Farsi (persa) — fa
+- Russo — ru
+- Ucraniano — uk
+
+Arabo e farsi usano la lettura e la disposizione da destra a sinistra.
+I campi di rotte e l'indirizzo di aggiornamento continuano da sinistra a sinistra
+la destra per conservare la lettura. le opzioni mostrano i nomi nativi
+Per facilitare il ritorno alla lingua desiderata.
+
+La preferenza è in [interfaccia] lingua di user/config/zeraps5.ini e è
+indipendente [generale] lingua, che informa la lingua della console al gioco.
+Non installa traduzioni, fonti o file di lingua nei giochi.
+Il linguaggio e le lingue disponibili in ogni gioco dipendono dai tuoi file.
+
+Menù, controlli, avvisi, errori, campi di report e risultati delle
+aggiornamenti utilizzano la lingua scelta. Apri aiuto tecnico per leggere l'aiuto
+in quella lingua; visualizzare il log mostra i nuovi registri nella lingua scelta, anche
+se la preferenza cambia dopo l'esecuzione.
+
+I codici, i nomi dei file, i modelli hardware e i titoli dei giochi sono dati
+La descrizione scritta dall'utente non è tradotta.
+I registri originali continuano a user/logs per la diagnosi.
+precedente senza registrazione strutturata devono essere ripristinati per
+generare la visualizzazione tradotta. La copia strutturata è limitata a 64 MiB per
+esecuzione; la finestra mostra fino a 1 MiB della fase finale della visualizzazione.
+Le licenze e i crediti mantengono i loro testi originali e la loro validità.
+
+I cataloghi sono a frontends/launcher/. I generatori controllano i parametri
+tools/check_localization.py verifica la copertura e la riproduzione.
+Le traduzioni tecniche sono state assistite da software locale e sono state parzialmente riviste.
+Hanno ancora bisogno di revisione da parte di parlanti nativi di tutte le lingue.
+
+dist/docs/LIMITACOES.txt
+========================================
+Limitazioni di questa versione sperimentale
+
+docs/COMPATIBILIDADE.md elenca le sezioni testate, l'hardware
+e la build di ciascun risultato. Raggiungere il gameplay in una sezione non dimostra
+che tutto il gioco funzioni. Le prestazioni variano in base al gioco e al computer.
+
+Ratchet e Atlantis contengono risultati dal notebook Iris Xe. I nove risultati
+sullo RTX 5060 Ti sono stati ottenuti sul principale 1c4893f, build 756.
+I test grafici sintetici per questa versione vengono eseguiti sullo RTX 5060 Ti.
+A Astro Bot manca ancora objects/characters e non è pubblicizzato come riproducibile.
+Diablo II non ha ancora un gameplay confermato. Altri titoli hanno
+difetti grafici, errori di sistema o prestazioni lente.
+
+Gli esperimenti Opt-in mantengono le impostazioni predefinite di attivazione. Il pacchetto include
+solo il programma, la documentazione, le licenze e il codice sorgente. Giochi e moduli console
+devono essere forniti dall'utente dalle proprie copie.
+
+dist/docs/PUBLICACAO.txt
+========================================
+Pubblicazione futura - fase manuale, ancora non autorizzata
+
+Destinazione di distribuzione selezionata: zeraps5/ZeraPS5-Releases, pubblico e separato.
+Sviluppo: zeraps5/ZeraPS5, privato. non trasferire né aprire quest'ultimo.
+Questo preparato non crea archivi, non invia file e non pubblica rilasciamenti.
+
+Dopo l’autorizzazione specifica dell’utente:
+Criar/conferir il deposito separato di distribuzione e la sua visibilità.
+2. rivedere il rapporto locale, eseguire i test e rivedere il ZIP finale.
+3. confermare SHA256SUMS e le rispettive fonti reali. il ZIP binario include
+sources/ZeraPS5-source.zip, FFmpeg e oggetti per relegazione. Invia anche
+l'attività versata *-source.zip; il "codice sorgente" automatico non lo sostituisce.
+4. utilizzare tools/publish-release.ps1 manualmente con -PackageDir e
+-AuthorizePublication. lo script richiede conferma e crea solo un rascone.
+Non viene eseguito per compilazione, imballaggio o cambiamenti nello sviluppo.
+Revisar/baixar i beni di scatto e pubblicare la rilascio stabile manualmente
+solo dopo l'approvazione. latest.json deve seguire il ZIP il cui SHA indica.
+Verificare il riindirizzamento pubblico releases/latest/download/latest.json
+e fare un aggiornamento di un'installazione di prova con fictional saves.
+
+Utilizzare numeri di costruzione crescenti senza ricorrere a tags/nomes pacchetti.
+automatico ignora le versioni pre-visione e altre architetture. rilasciate stabili
+I precedenti devono essere mantenuti per la ripresa. non c'è token nell'applicazione.
+Il login gh del responsabile della pubblicazione è separato dalla distribuzione.
+
+Fonti ufficiali consultate:
+https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+https://ffmpeg.org/legal.html
+
+dist/docs/RECOMPILAR.txt
+========================================
+Fonti corrispondenti e relegazione
+
+sources/ZeraPS5-source.zip contiene fonti reali, test, capi, CMake,
+scripts, materiali dist/ e licenze di revisione indicate nel manifesto.
+Il file automatico "Source code" di GitHub non sostituisce queste fonti.
+Non ci sono amministrazione Git, storio personale o impostazioni della macchina.
+
+Requisiti: Windows x64, MSYS2 UCRT64 GCC/binutils/make, CMake >= 3.21 e nasm
+per ricostruire FFmpeg. estrarre le fonti ZeraPS5; mettere ffmpeg-7.1.2.tar.xz
+su third_party/ffmpeg/ e esegue su MSYS2 UCRT64: sh tools/build_ffmpeg.sh
+Poi con UCRT64/bin nel PATH:
+cmake -S . -B build/distribution -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/distribution --parallel 2
+ctest --test-dir build/distribution --output-on-failure
+
+Per scambiare FFmpeg, altere/recompile le sue fonti e ricostruire ZeraPS5 contro
+i nuovi include/lib. ZeraPS5-relink-objects.zip forniscono anche oggetti di
+applicativo e link.txt con l'ordine delle biblioteche per religare senza ricompilarne.
+sostituisce <SURCE>/<BUILD> con le sue cartelle e libav*.a con la versione ricostruita;
+eseguire il comando nel directory di build. biblioteche MinGW provengono da MSYS2.
+
+SOURCE-VERSION.txt conserva l'identificazione senza.git. uguaglianza byte a byte
+tra le diverse catene di strumenti non è stato certificato. non ci sono restrizioni aggiuntive
+di utilizzo, modifica, pulizia o redistribuzione al di là delle licenze applicabili.

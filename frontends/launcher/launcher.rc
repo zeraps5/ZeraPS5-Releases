@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <winuser.h>
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "launcher.manifest"
+1 ICON "../assets/zeraps5.ico"

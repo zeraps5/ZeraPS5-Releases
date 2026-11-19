@@ -1,0 +1,36 @@
+ZeraPS5 {VERSION} — versão experimental
+
+Emulador experimental de PlayStation 5 para Windows x86-64.
+Não há garantia de compatibilidade, estabilidade ou FPS.
+
+Idiomas: menu Idiomas, ou Configurações > Idiomas. Há 15 opções de interface,
+incluindo árabe, farsi, russo e ucraniano. Veja docs/IDIOMAS.txt.
+
+1. Extraia o ZIP em uma pasta gravável, fora de Program Files.
+2. Leia system/LEIA-ME.txt; adicione apenas módulos do próprio console.
+3. Abra ZeraPS5.exe e adicione as pastas dos seus jogos em Configurações.
+4. Selecione o jogo e clique em Jogar. Pastas e imagens .exfat usam o suporte
+   existente. Este pacote não extrai jogos nem descriptografa arquivos.
+
+Requisitos: Windows 10/11 x64, CPU x86-64/AVX, GPU Vulkan 1.3 e driver
+atualizado. Python, CMake e MSYS2 não são necessários para usar os executáveis.
+O driver Vulkan vem do fabricante da GPU, não deste ZIP.
+DualSense USB e XInput usam o suporte existente. Nenhum novo controle foi
+validado nesta edição. Consulte docs/LIMITACOES.txt antes de testar jogos.
+
+user/ é criado no primeiro uso e guarda saves, configurações, caches e logs.
+Não compartilhe essa pasta inteira. Relatórios são locais por padrão; linhas
+com caminhos, nomes locais e credenciais comuns são omitidas. Revise o ZIP e
+a descrição antes de compartilhar: o filtro não remove qualquer dado possível.
+
+Atualizações estáveis Windows x64 são consultadas automaticamente em
+https://github.com/zeraps5/ZeraPS5-Releases/releases/latest/download/latest.json
+sem login, token ou identificação do computador. A consulta pode ser desligada
+nas Configurações. Instalar uma nova versão pede confirmação.
+A instalação verifica integridade e
+preserva user/, games/ e system/. Recuperação: docs/ATUALIZACOES.txt.
+
+Fontes reais, FFmpeg e objetos de religação: sources/ e docs/RECOMPILAR.txt.
+Licenças e créditos: LICENSE, CREDITS.txt e licenses/.
+Não há jogos, firmware, módulos do console ou chaves no pacote. Use somente
+cópias extraídas legalmente do próprio console. Não há afiliação com a Sony.

@@ -1,0 +1,28 @@
+Atualização e recuperação
+
+Canal estável Windows x86-64: zeraps5/ZeraPS5-Releases no GitHub.
+Os fontes públicos estão em zeraps5/ZeraPS5 no GitHub.
+A distribuição usa o repositório público separado já existente; publicar uma
+nova release estável continua sendo uma etapa manual autorizada pelo usuário.
+O launcher consulta releases/latest/download/latest.json por HTTPS, sem token,
+nome do computador ou identificador da instalação. Não utiliza a API REST.
+O redirecionamento latest seleciona a release estável. Falta de release,
+HTTP 403/429 ou falha de rede preservam a instalação, sem repetição contínua.
+
+A nova versão é oferecida para confirmação. A aplicação espera o launcher
+fechar, não encerra processos e recusa atualização com jogo desta pasta ativo.
+Confere SHA-256 do ZIP, canal/arquitetura e hash/tamanho dos arquivos internos.
+Caminhos externos, links, colisões e arquivos pessoais são recusados.
+user/, games/ e system/ não são substituídos.
+
+Backups e diário ficam em user/updates/transaction. Uma falha de cópia restaura
+o programa anterior. Uma interrupção durante a cópia dispara recuperação no
+próximo início do launcher. Para recuperação manual, feche esta instalação e use:
+powershell -NoProfile -ExecutionPolicy Bypass -File "user/updates/Recuperar-ZeraPS5.ps1" -InstallRoot "PASTA_DA_INSTALACAO" -Recover
+A cópia de recuperação é criada ao iniciar uma atualização. Consulte também
+user/updates/result.txt. Mantenha transaction/backup até validar a nova versão.
+
+SHA-256 verifica integridade em relação ao manifesto obtido por HTTPS;
+não é assinatura Authenticode. Esta candidata não tem assinatura digital.
+
+Por padrão, o programa verifica atualizações ao abrir. Você também pode usar o botão Verificar atualizações na tela principal. A consulta ao iniciar pode ser desligada nas Configurações.

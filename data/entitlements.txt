@@ -1,0 +1,7 @@
+# Entitlements (unified entitlement labels) included with a purchased game.
+# One line per game: <title id> <label> [<label> ...]. A game's settings may add
+# more with [jogo] licencas=LABEL1,LABEL2.
+#
+# GTA V (PS5) full game: the Story Mode is an entitlement the game looks for at
+# its landing page (otherwise it offers to buy it).
+PPSA04263 GTAVSTORYMODE001
