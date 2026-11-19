@@ -92,6 +92,9 @@ ps5c_err hle_registry_init(void) {
     hle_register_ampr();
     hle_register_png_enc();
     hle_register_png_dec();
+    hle_register_jpeg_dec();
+    hle_register_audiodec();
+    hle_register_compat_stubs();
     hle_register_ajm();
     hle_register_acm();
     hle_register_ngs2();

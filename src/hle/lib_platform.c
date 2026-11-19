@@ -27,6 +27,19 @@ static bool clear_arg(hle_call *c, uint32_t arg, uint32_t size) {
     return p != NULL;
 }
 
+/* int sceGameLiveStreamingGetCurrentStatus2(SceGameLiveStreamingStatus2 *status): 72 bytes
+ * {int32 userId; bool isOnAir; u32 spectators, textMessages, commandMessages; u8 reserved[52]}.
+ * Nobody broadcasts: all zero, userId -1 (layout from KytyPS5) */
+static void live_streaming_status2(hle_call *c) {
+    if (!clear_arg(c, 0, 72)) {
+        hle_ret_s32(c, (int32_t)0x80A00002); /* SCE_GAME_LIVE_STREAMING_ERROR_INVALID_PARAM */
+        return;
+    }
+    int32_t *user = (int32_t *)hle_mem(c, hle_arg_ptr(c, 0), 4);
+    *user = -1;
+    hle_ret_s32(c, 0);
+}
+
 /* ---- libSceNpWebApi2: contexts, users, push-event handles and filters are ids ---- */
 
 #define WEBAPI2_ERR_INVALID_ARGUMENT ((int32_t)0x80553402)
@@ -257,6 +270,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Cancel", tts_silent),
     HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingInitialize", ok),
     HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingTerminate", ok),
+    HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingGetCurrentStatus2", live_streaming_status2),
     HLE_FUNC_ENTRY("libSceGameUpdate", "sceGameUpdateInitialize", ok),
     HLE_FUNC_ENTRY("libSceGameUpdate", "sceGameUpdateTerminate", ok),
     HLE_FUNC_ENTRY("libSceCoredump", "sceCoredumpRegisterCoredumpHandler", ok),
@@ -271,8 +285,6 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogTerminate", ok),
     HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportInit2", ok),
     HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportTerm", ok),
-    HLE_FUNC_ENTRY("libSceAudiodec", "sceAudiodecInitLibrary", ok),
-    HLE_FUNC_ENTRY("libSceAudiodec", "sceAudiodecTermLibrary", ok),
     HLE_FUNC_ENTRY("libSceVoiceQoS", "sceVoiceQoSInit", ok),
     HLE_FUNC_ENTRY("libSceVoiceQoS", "sceVoiceQoSEnd", ok),
     HLE_FUNC_ENTRY("libSceIpmi", "_ZN4IPMI6Client6ConfigC1Ev", ok),

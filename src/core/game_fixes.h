@@ -11,6 +11,10 @@
 #include "mem/gmem.h"
 #include "core/compat_catalog.h"
 
+#define LONGSHOT_WINDOW_START 0x1000000000ull
+#define LONGSHOT_WINDOW_END   0x2000000000ull
+guest_addr game_longshot_allocator_rva(const loaded_module *m);
+
 /* Applies the fixes of the running title that belong to module m. */
 void game_fixes_apply(gmem *mem, const loaded_module *m);
 

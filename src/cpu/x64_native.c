@@ -323,6 +323,41 @@ uint32_t x64_native_patch_tls(x64_native *cpu, guest_addr code, uint64_t size) {
     return count;
 }
 
+uint32_t x64_native_count_fs(x64_native *cpu, guest_addr code, uint64_t size, guest_addr *first) {
+    const uint8_t *p = (const uint8_t *)gmem_host(cpu->mem, code, size);
+    if (!p || size < 9) {
+        return 0;
+    }
+    uint32_t count = 0;
+    /* 64 [REX] op modrm(mod=00, rm=100) 25 disp32, disp32 != 0: an absolute
+     * fs:[disp] load, store or ALU access, left as it is by x64_native_patch_tls */
+    for (uint64_t i = 0; i + 9 <= size; i++) {
+        if (p[i] != 0x64) {
+            continue;
+        }
+        uint64_t j = i + 1;
+        if ((p[j] & 0xF0) == 0x40) {
+            j++;
+        }
+        if (j + 6 > size) {
+            break;
+        }
+        uint8_t op = p[j];
+        bool access = op == 0x8B || op == 0x89 || op == 0x8A || op == 0x88 || op == 0x03 || op == 0x2B ||
+                      op == 0x3B || op == 0x39 || op == 0x33 || op == 0x0B || op == 0x23 || op == 0x01;
+        if (!access || (p[j + 1] & 0xC7) != 0x04 || p[j + 2] != 0x25 ||
+            !(p[j + 3] | p[j + 4] | p[j + 5] | p[j + 6])) {
+            continue;
+        }
+        if (!count && first) {
+            *first = code + i;
+        }
+        count++;
+        i = j + 6;
+    }
+    return count;
+}
+
 uint64_t x64_native_enter(x64_native *cpu, x64_enter_ctx *ctx) {
     uint64_t (*fn)(x64_enter_ctx *);
     void *addr = gmem_host(cpu->mem, cpu->enter_addr, 1);

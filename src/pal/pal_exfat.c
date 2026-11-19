@@ -24,6 +24,7 @@ typedef struct node {
     uint64_t size, valid;
     uint64_t pkg_offset; /* .pkg: start in the inner image, or in the .pkg file for an entry */
     bool pkg_entry;      /* .pkg: a metadata entry (param.json, ...) read from the file itself */
+    uint32_t pkg_file;   /* .pkg: inner node + 1 of a file read through its block list (PS4), 0 = at pkg_offset */
     extent *runs;
     uint32_t nruns, run_cap;
 } node;
@@ -61,11 +62,21 @@ static size_t ext_at(const char *q) {
     }
     return 0;
 }
+/* a host folder named like an image (the user folder of a game run from a
+ * .pkg is named after the package) holds host files, not an image */
+static bool host_dir(const char *p, size_t len) {
+    char dir[1024];
+    if (len >= sizeof dir) return false;
+    memcpy(dir, p, len);
+    dir[len] = 0;
+    pal_path_info info;
+    return pal_path_stat(dir, &info) == PS5C_OK && info.is_dir;
+}
 static const char *boundary(const char *p) {
     for (const char *q = p; *q; q++) {
         if (*q != '.') continue;
         size_t k = ext_at(q);
-        if (k && sep(q[k])) return q + k;
+        if (k && sep(q[k]) && !host_dir(p, (size_t)(q + k - p))) return q + k;
     }
     return NULL;
 }
@@ -149,7 +160,8 @@ static ps5c_err read_node(volume *v, const node *n, void *buf, uint64_t bytes, u
     if (bytes > SIZE_MAX) return PS5C_ERR_OUT_OF_RANGE;
     if (v->pkg) {
         ps5c_err err = n->pkg_entry ? raw(v, n->pkg_offset + off, buf, bytes)
-                                    : pkg_inner_read(v->pkg, buf, bytes, n->pkg_offset + off);
+                       : n->pkg_file ? pkg_inner_read_file(v->pkg, &v->pkg->nodes[n->pkg_file - 1], buf, bytes, off)
+                                     : pkg_inner_read(v->pkg, buf, bytes, n->pkg_offset + off);
         if (!err && got) *got = bytes;
         return err;
     }
@@ -394,6 +406,7 @@ static ps5c_err load_pkg(volume *v) {
         n.parent = p->parent; n.child = p->child; n.sibling = p->sibling; n.dir = p->dir;
         n.size = n.valid = p->dir ? 0 : p->size;
         n.pkg_offset = p->offset;
+        n.pkg_file = p->pfs ? i + 1 : 0;
         if (i && !wide_name(n.wide, p->name)) n.wide[0] = 0xfffe; /* unmatchable */
         size_t len = strlen(p->name);
         n.name = (char *)malloc(len + 1);

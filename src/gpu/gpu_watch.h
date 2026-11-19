@@ -92,6 +92,9 @@ void gpu_watch_prepare_write(guest_addr addr, uint64_t size);
  * (what the sweeper thread does over and over). */
 void gpu_watch_sweep(void);
 
+/* No thread holds or waits for a lock of the tracker (checked with guest threads suspended). */
+bool gpu_watch_locks_free(void);
+
 /* Statistics since the last call (faults handled, pages protected). */
 /* Logs the tracker state and the mapping of the page at addr (diagnostics). */
 void gpu_watch_log_page(guest_addr addr);

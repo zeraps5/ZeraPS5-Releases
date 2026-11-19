@@ -28,6 +28,9 @@ PFN_vkDestroyPipeline vkDestroyPipeline=destroy_pipe;
 PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout=destroy_layout;
 PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout=destroy_dsl;
 const char *vk_shader_cache_dir(void) {return dir;}
+/* no translator change in these tests */
+bool vk_shader_cache_migrating(void) { return false; }
+bool vk_pipeline_recipe_migrate(void *recipe) { (void)recipe; return false; }
 size_t vk_pipeline_recipe_size(void) {return sizeof(uint32_t);}
 bool vk_pipeline_prewarm_size(const void *recipe,uint64_t *bytes) {(void)recipe;*bytes=4;return true;}
 bool vk_pipeline_build(renderer*r,const void*recipe,const uint32_t*const words[2],const size_t n[2],vk_built_pipeline*out) {

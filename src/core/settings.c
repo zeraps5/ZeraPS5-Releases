@@ -198,6 +198,10 @@ int settings_internal_height(void) {
     return height;
 }
 
+static volatile bool g_internal_native;
+void settings_internal_height_native(void) { g_internal_native = true; }
+bool settings_internal_height_is_native(void) { return g_internal_native; }
+
 void settings_apply_keyboard(void) {
     native_input_configure(settings_get_int("entrada", "teclado_nativo", 0) == 1,
                            settings_get_int("entrada", "mouse_nativo", 0) == 1);

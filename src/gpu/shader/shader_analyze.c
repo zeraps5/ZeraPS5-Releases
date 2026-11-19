@@ -753,9 +753,77 @@ static uint32_t smem_dwords(uint32_t op) {
     }
 }
 
+/* Whether instruction i may write VGPR v (overestimated where unsure). */
+static bool mip_writes_vgpr(const sh_program *p, uint32_t i, uint32_t v) {
+    const rdna2_inst *in = &p->insts[i];
+    uint32_t op = p->ops[i], d = in->dst, n;
+    if (in->enc == RDNA2_ENC_SOP1 || in->enc == RDNA2_ENC_SOP2 || in->enc == RDNA2_ENC_SOPK ||
+        in->enc == RDNA2_ENC_SOPC || in->enc == RDNA2_ENC_SOPP || in->enc == RDNA2_ENC_SMEM ||
+        in->enc == RDNA2_ENC_VOPC || in->enc == RDNA2_ENC_EXP || (in->enc == RDNA2_ENC_VOP3 && in->valu < 0x100) ||
+        op == SH_OP_V_READLANE_B32 || op == SH_OP_V_READFIRSTLANE_B32) return false;
+    if (in->enc == RDNA2_ENC_MUBUF || in->enc == RDNA2_ENC_MTBUF || in->enc == RDNA2_ENC_MIMG ||
+        in->enc == RDNA2_ENC_FLAT) {
+        int s = p->site_of[i];
+        if (s >= 0 && p->sites[s].store && (!in->name || !strstr(in->name, "atomic"))) return false;
+        d = RDNA2_OP_VGPR + in->vdata;
+        n = p->vmem_width[i] + 1; /* tfe/lwe status included */
+    } else if (in->enc == RDNA2_ENC_DS) {
+        n = 16; /* LDS result widths overestimated */
+    } else {
+        n = (p->iflags[i] & SH_IF_64) ? 2 : 1;
+    }
+    return d >= RDNA2_OP_VGPR && v + RDNA2_OP_VGPR >= d && v + RDNA2_OP_VGPR - d < n;
+}
+
+static bool mip_branch(uint32_t op) { return op >= SH_OP_S_BRANCH && op <= SH_OP_S_CBRANCH_EXECNZ; }
+
+/* With branches: the mip register's last write before the image instruction
+ * is v_mov_b32 of a constant, every lane reaching the instruction ran it (no
+ * branch lands between them except forward from between, EXEC only narrowed
+ * by v_cmpx after it). The mip-chain shaders of Demon's Souls write
+ * levels 1 and 2 this way after branching on the lane's position. */
+static bool mip_flow_literal(const sh_program *p, uint32_t end, uint32_t mip, uint32_t *literal) {
+    for (uint32_t i = 0; i < p->count; i++) {
+        const char *n = p->insts[i].name;
+        if (n && (!strncmp(n, "s_setpc", 7) || !strncmp(n, "s_swappc", 8) || !strncmp(n, "v_movrel", 8) ||
+                  !strncmp(n, "s_movrel", 8) || !strncmp(n, "s_set_gpr_idx", 13))) return false;
+    }
+    uint32_t j = end;
+    while (j-- > 0)
+        if (mip_writes_vgpr(p, j, mip)) break;
+    if (j >= end) return false;
+    const rdna2_inst *mov = &p->insts[j];
+    uint32_t v;
+    if (p->ops[j] != SH_OP_V_MOV_B32 || mov->enc != RDNA2_ENC_VOP1 || mov->abs || mov->neg || mov->opsel ||
+        mov->omod || mov->clamp || mov->dst != RDNA2_OP_VGPR + mip || !sh_inline_const(mov->src[0], mov->literal, &v))
+        return false;
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (!mip_branch(p->ops[i])) continue;
+        /* Into (write, instruction]: only forward from inside it. From before,
+         * it skips the write; from after (a loop), the register may have changed. */
+        uint32_t t = p->target[i];
+        if (t > j && t <= end && !(i > j && i < t)) return false;
+    }
+    for (uint32_t i = j + 1; i < end; i++) {
+        const rdna2_inst *in = &p->insts[i];
+        if (p->ops[i] == SH_OP_V_CMPX) continue;
+        bool salu = in->enc == RDNA2_ENC_SOP1 || in->enc == RDNA2_ENC_SOP2 || in->enc == RDNA2_ENC_SOPK;
+        uint32_t w = salu ? ((p->iflags[i] & SH_IF_64) ? 2 : 1) : 0;
+        if (salu && in->dst <= RDNA2_OP_EXEC_LO + 1 && in->dst + w > RDNA2_OP_EXEC_LO) return false;
+        if (salu && in->name && (strstr(in->name, "saveexec") || strstr(in->name, "wrexec"))) return false;
+        if ((in->enc == RDNA2_ENC_VOP3 && (p->iflags[i] & SH_IF_CARRY) && in->sdst <= RDNA2_OP_EXEC_LO + 1 &&
+             in->sdst + 2 > RDNA2_OP_EXEC_LO) ||
+            ((p->ops[i] == SH_OP_V_READLANE_B32 || p->ops[i] == SH_OP_V_READFIRSTLANE_B32) &&
+             (in->dst & 127) >= RDNA2_OP_EXEC_LO && (in->dst & 127) <= RDNA2_OP_EXEC_LO + 1))
+            return false;
+    }
+    *literal = v;
+    return true;
+}
+
 bool sh_image_mip_source(const sh_program *p, const sh_stage_info *info, uint32_t site,
                          uint32_t *source, uint32_t *literal) {
-    if (info->stage != SH_STAGE_CS || p->has_flow || site >= p->site_count ||
+    if (info->stage != SH_STAGE_CS || site >= p->site_count ||
         p->sites[site].kind != SH_SITE_IMAGE) return false;
     uint32_t end = p->sites[site].inst;
     const rdna2_inst *image = &p->insts[end];
@@ -764,6 +832,11 @@ bool sh_image_mip_source(const sh_program *p, const sh_stage_info *info, uint32_
         (image->nsa_count && image->nsa_count < 2)) return false;
     uint32_t mip = image->nsa_count ? image->nsa_addr[1] : image->vaddr + 2;
     if (mip >= 256) return false;
+    if (p->has_flow) {
+        if (!mip_flow_literal(p, end, mip, literal)) return false;
+        *source = RDNA2_OP_LITERAL;
+        return true;
+    }
     bool changed[SH_SGPRS] = {0}, known[256] = {0};
     uint32_t src[256] = {0}, val[256] = {0};
     for (uint32_t i = 0; i < end; i++) {
@@ -834,6 +907,15 @@ static bool grow(sh_eval *e, uint32_t words) {
     return true;
 }
 
+/* A deferred evaluation (sh_eval.defer) follows the fall-through side of a forward branch whose
+ * condition came from a deferred load, where the GPU may take the other side. Every forward
+ * branch forks (the other side fills its sites too, first path wins), so the guess only matters
+ * when the paths disagree about a site: g_dfr_branch marks the guess, g_fork_conflict a forked
+ * path that found a site with other descriptor words, another scalar base or other loaded data.
+ * sh_evaluate sets sh_eval.guessed from both at its end. PS5C_EVAL_GUESS_BRANCHES=1: every
+ * deferred branch counts as a guess, as before. */
+static _Thread_local bool g_dfr_branch, g_fork_conflict;
+
 static void eval_smem(const sh_program *p, uint32_t i, gmem *mem, eval_state *st, sh_eval *e) {
     const rdna2_inst *in = &p->insts[i];
     uint32_t n = smem_dwords(p->ops[i]);
@@ -874,9 +956,13 @@ static void eval_smem(const sh_program *p, uint32_t i, gmem *mem, eval_state *st
      * threads); dword by dword only across the end of a mapping */
     bool address_dfr = false;
     for (uint32_t k = 0; k < (buffer ? 4u : 2u) && sb + k < SH_SGPRS; k++) address_dfr |= st->dfr[sb + k];
+    /* S_BUFFER_LOAD: the translation reads the bound buffer (all of NUM_RECORDS) at the offset the
+     * shader computes, so a deferred offset alone is no guess; its values stay deferred */
+    if (address_dfr || !buffer) e->guessed |= address_dfr || (in->soffset < SH_SGPRS && st->dfr[in->soffset]);
     if (in->soffset < SH_SGPRS) address_dfr |= st->dfr[in->soffset];
-    e->guessed |= address_dfr;
-    bool later = buffer && !unknown && e->defer && e->defer(e->host_user, base + off, (uint64_t)n * 4);
+    /* an offset or base from a deferred load: its values are deferred anyway, so memory the GPU
+     * still writes is not waited for just to read a stand-in (KAGE: ~5 ms per evaluation) */
+    bool later = buffer && (!unknown || address_dfr) && e->defer && e->defer(e->host_user, base + off, (uint64_t)n * 4);
     if (later) e->deferred = unknown = true; /* the GPU still writes it: values unknown here */
     e->host_sbase = (uint8_t)sb;
     const uint32_t *all = !later && off + (uint64_t)n * 4 <= limit ? (const uint32_t *)eval_host(e, mem, base + off, (uint64_t)n * 4) : NULL;
@@ -891,12 +977,18 @@ static void eval_smem(const sh_program *p, uint32_t i, gmem *mem, eval_state *st
             if (src) v = *src;
         }
         if (dst) dst[k] = v;
+        if (!record && site >= 0 && !buffer && !later && e->site[site].smem_offset + k < e->smem_words &&
+            e->smem_data[e->site[site].smem_offset + k] != v)
+            g_fork_conflict = true; /* another path loads other data at this site */
         wr32(st, in->dst + k, v);
         if (in->dst + k < SH_SGPRS && in->dst + k != RDNA2_OP_NULL)
             st->unk[in->dst + k] = unknown, st->dfr[in->dst + k] = later || address_dfr;
     }
     e->host_sbase = 0xFF; /* later reads (descriptor or global loads) are not relative to this base */
-    if (!record) return;
+    if (!record) {
+        if (site >= 0 && buffer && memcmp(e->site[site].desc, desc, sizeof(desc))) g_fork_conflict = true;
+        return;
+    }
     if (site >= 0) {
         e->site[site].valid = true;
         if (buffer) memcpy(e->site[site].desc, desc, sizeof(desc));
@@ -942,7 +1034,15 @@ static bool vgpr_scalar_source(const sh_program *p, uint32_t i, uint32_t vgpr, u
 static void eval_global_site(const sh_program *p, uint32_t i, const eval_state *st, gmem *mem, sh_eval *e) {
     const rdna2_inst *in = &p->insts[i];
     int site = p->site_of[i];
-    if (site < 0 || (st->fork && e->site[site].valid)) return;
+    if (site < 0) return;
+    if (st->fork && e->site[site].valid) {
+        uint32_t lo = in->sbase, hi = in->sbase + 1u;
+        if ((in->sbase != RDNA2_OP_NULL ||
+             (vgpr_scalar_source(p, i, in->vaddr, &lo) && vgpr_scalar_source(p, i, in->vaddr + 1u, &hi))) &&
+            lo < SH_SGPRS && hi < SH_SGPRS && (st->s[lo] != e->site[site].desc[0] || (st->s[hi] & 0xFFFF) != e->site[site].desc[1]))
+            g_fork_conflict = true;
+        return;
+    }
     sh_site_value *v = &e->site[site];
     memset(v->desc, 0, sizeof(v->desc));
     guest_addr base = 0;
@@ -995,6 +1095,7 @@ static void eval_vmem_site(const sh_program *p, uint32_t i, const eval_state *st
             e->guessed |= st->dfr[in->srsrc + k];
         }
         if (v->valid) {
+            g_fork_conflict |= memcmp(v->desc, desc, sizeof(desc)) != 0;
             v->desc_unknown |= unknown || memcmp(v->desc, desc, sizeof(desc)) != 0;
             return;
         }
@@ -1024,12 +1125,20 @@ static void eval_vmem_site(const sh_program *p, uint32_t i, const eval_state *st
                   in->srsrc, in->srsrc + 3, st->unk[in->srsrc], st->unk[in->srsrc + 1], st->unk[in->srsrc + 2],
                   st->unk[in->srsrc + 3], st->fork ? " (fork)" : "");
     }
-    /* descriptor words or the offset from a deferred load (sh_eval.guessed) */
-    for (uint32_t k = 0; k < 8; k++)
-        e->guessed |= (in->srsrc + k < SH_SGPRS && st->dfr[in->srsrc + k]) ||
+    /* descriptor words or the offset from a deferred load (sh_eval.guessed): a V# has 4 words,
+     * a T# 8 (4 with r128) */
+    uint32_t desc_words = p->sites[site].kind == SH_SITE_IMAGE ? (in->r128 ? 4u : 8u) : 4u;
+    for (uint32_t k = 0; k < desc_words || (p->sites[site].kind == SH_SITE_IMAGE && k < 4); k++)
+        e->guessed |= (k < desc_words && in->srsrc + k < SH_SGPRS && st->dfr[in->srsrc + k]) ||
                       (k < 4 && p->sites[site].kind == SH_SITE_IMAGE && in->ssamp + k < SH_SGPRS && st->dfr[in->ssamp + k]);
-    e->guessed |= in->soffset < SH_SGPRS && st->dfr[in->soffset];
+    /* only buffer instructions have an SOFFSET (an image instruction's field reads 0, s0) */
+    if (in->enc == RDNA2_ENC_MUBUF || in->enc == RDNA2_ENC_MTBUF)
+        e->guessed |= in->soffset < SH_SGPRS && st->dfr[in->soffset];
     if (st->fork && v->valid) { /* another path: the offset stays known only if it agrees */
+        uint32_t n = p->sites[site].kind == SH_SITE_IMAGE ? (in->r128 ? 4u : 8u) : 4u;
+        for (uint32_t k = 0; k < n && in->srsrc + k < SH_SGPRS; k++) g_fork_conflict |= v->desc[k] != st->s[in->srsrc + k];
+        for (uint32_t k = 0; p->sites[site].kind == SH_SITE_IMAGE && k < 4 && in->ssamp + k < SH_SGPRS; k++)
+            g_fork_conflict |= v->sampler[k] != st->s[in->ssamp + k];
         if (!soff_known || soff != v->soffset) v->soffset_known = false;
         v->desc_unknown |= desc_unknown;
         v->records_unknown |= records_unknown;
@@ -1861,6 +1970,7 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
      * not clear the capacity reserved for large material programs per draw. */
     memset(e->site, 0, sizeof(e->site[0]) * p->site_count);
     e->deferred = e->guessed = false;
+    g_dfr_branch = g_fork_conflict = false;
     e->call_pending = e->call_known = false;
     e->call_target = 0;
     e->smem_words = 0;
@@ -1965,11 +2075,17 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
                 }
                 }
                 if (unknown) {
-                    /* a deferred value decides it: the dispatch may take the other path */
-                    if (op == SH_OP_S_CBRANCH_SCC0 || op == SH_OP_S_CBRANCH_SCC1) e->guessed |= st.scc_dfr;
+                    /* a deferred value decides it: the dispatch may take the other path. Forward:
+                     * both sides run here (g_dfr_branch); backward (a loop): a guess */
+                    bool dfr_cond;
+                    if (op == SH_OP_S_CBRANCH_SCC0 || op == SH_OP_S_CBRANCH_SCC1) dfr_cond = st.scc_dfr;
                     else if (op == SH_OP_S_CBRANCH_VCCZ || op == SH_OP_S_CBRANCH_VCCNZ)
-                        e->guessed |= st.dfr[RDNA2_OP_VCC_LO] || (!p->wave32 && st.dfr[RDNA2_OP_VCC_LO + 1]);
-                    else e->guessed |= st.dfr[RDNA2_OP_EXEC_LO] || (!p->wave32 && st.dfr[RDNA2_OP_EXEC_LO + 1]);
+                        dfr_cond = st.dfr[RDNA2_OP_VCC_LO] || (!p->wave32 && st.dfr[RDNA2_OP_VCC_LO + 1]);
+                    else dfr_cond = st.dfr[RDNA2_OP_EXEC_LO] || (!p->wave32 && st.dfr[RDNA2_OP_EXEC_LO + 1]);
+                    static int guess_all = -1;
+                    if (guess_all < 0) { const char *g = getenv("PS5C_EVAL_GUESS_BRANCHES"); guess_all = g && !strcmp(g, "1"); }
+                    if (in->simm16 > 0 && !guess_all) g_dfr_branch |= dfr_cond;
+                    else e->guessed |= dfr_cond;
                     /* A loop can exit on an unknown VCC/SCC while EXEC remains
                      * known. Repeating its representative CPU path 1024 times
                      * cannot resolve that condition. Mark only backedges that
@@ -2120,6 +2236,7 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
      * already been evaluated. Only a real END with an active call is invalid. */
     result=!calls || steps<1000000;
 eval_done:
+    e->guessed |= g_dfr_branch && g_fork_conflict;
     if(forks!=small_forks)free(forks);
     return result;
 }

@@ -192,6 +192,7 @@ static void signin_terminate(hle_call *c) {
 }
 
 #define SDD "libSceSaveDataDialog.native"
+#define SDD4 "libSceSaveDataDialog"
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceCommonDialog", "sceCommonDialogInitialize", dialog_ok),
     HLE_FUNC_ENTRY(SDD, "sceSaveDataDialogInitialize", sdd_initialize),
@@ -204,6 +205,17 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(SDD, "sceSaveDataDialogIsReadyToDisplay", ready_to_display),
     HLE_FUNC_ENTRY(SDD, "sceSaveDataDialogProgressBarSetValue", dialog_ok),
     HLE_FUNC_ENTRY(SDD, "sceSaveDataDialogProgressBarInc", dialog_ok),
+    /* PS4 games import the same functions from libSceSaveDataDialog (LEGO City Undercover) */
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogInitialize", sdd_initialize),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogOpen", sdd_open),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogUpdateStatus", sdd_status),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogGetStatus", sdd_status),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogGetResult", sdd_get_result),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogClose", sdd_close),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogTerminate", sdd_terminate),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogIsReadyToDisplay", ready_to_display),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogProgressBarSetValue", dialog_ok),
+    HLE_FUNC_ENTRY(SDD4, "sceSaveDataDialogProgressBarInc", dialog_ok),
     HLE_FUNC_ENTRY("libSceMsgDialog", "sceMsgDialogInitialize", msg_initialize),
     HLE_FUNC_ENTRY("libSceMsgDialog", "sceMsgDialogOpen", msg_open),
     HLE_FUNC_ENTRY("libSceMsgDialog", "sceMsgDialogUpdateStatus", msg_status),
@@ -222,6 +234,10 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceMsgDialog.native", "sceMsgDialogTerminate", msg_terminate),
     HLE_FUNC_ENTRY("libSceMsgDialog.native", "sceMsgDialogProgressBarSetValue", dialog_ok),
     HLE_FUNC_ENTRY("libSceMsgDialog.native", "sceMsgDialogProgressBarInc", dialog_ok),
+    HLE_FUNC_ENTRY("libSceMsgDialog", "sceMsgDialogProgressBarSetMsg", dialog_ok),
+    HLE_FUNC_ENTRY("libSceMsgDialog.native", "sceMsgDialogProgressBarSetMsg", dialog_ok),
+    /* bool sceCommonDialogIsUsed(void): false, no system dialog is ever on screen */
+    HLE_FUNC_ENTRY("libSceCommonDialog", "sceCommonDialogIsUsed", dialog_ok),
     HLE_FUNC_ENTRY("libSceErrorDialog", "sceErrorDialogInitialize", err_initialize),
     HLE_FUNC_ENTRY("libSceErrorDialog", "sceErrorDialogOpen", err_open),
     HLE_FUNC_ENTRY("libSceErrorDialog", "sceErrorDialogUpdateStatus", err_status),
@@ -235,9 +251,6 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceSigninDialog", "sceSigninDialogGetResult", signin_get_result),
     HLE_FUNC_ENTRY("libSceSigninDialog", "sceSigninDialogClose", dialog_ok),
     HLE_FUNC_ENTRY("libSceSigninDialog", "sceSigninDialogTerminate", signin_terminate),
-    /* the web browser dialog never opens: status NONE */
-    HLE_FUNC_ENTRY("libSceWebBrowserDialog", "sceWebBrowserDialogGetStatus", dialog_ok),
-    HLE_FUNC_ENTRY("libSceWebBrowserDialog", "sceWebBrowserDialogUpdateStatus", dialog_ok),
 };
 
 void hle_register_dialogs(void) { hle_register_table(k_exports, PS5C_ARRAY_COUNT(k_exports)); }

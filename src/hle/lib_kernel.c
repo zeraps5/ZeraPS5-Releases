@@ -241,7 +241,8 @@ static void convert_localtime_to_utc(hle_call *c) {
 
 /* int scePthreadOnce(pthread_once_t *once, void (*init)(void)): once is
  * { int state; ... }, state 0 never run, 1 done, 2 running. The first caller
- * runs init; the others wait until it is done. */
+ * runs init; the others wait until it is done. If init could not run, the
+ * state goes back to 0 so a later caller tries again: it is never marked done. */
 static void pthread_once_(hle_call *c) {
     volatile int32_t *state = (volatile int32_t *)hle_mem(c, hle_arg_ptr(c, 0), 4);
     guest_addr init = hle_arg_ptr(c, 1);
@@ -249,13 +250,21 @@ static void pthread_once_(hle_call *c) {
         hle_ret_s32(c, 22); /* EINVAL */
         return;
     }
-    int32_t expected = 0;
-    if (__atomic_compare_exchange_n(state, &expected, 2, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        uint64_t rax = 0;
-        runtime_call_nested(c->rt, init, 0, 0, 0, &rax);
-        __atomic_store_n(state, 1, __ATOMIC_RELEASE);
-    } else {
-        while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 1) pal_sleep_ns(100000);
+    for (;;) {
+        int32_t expected = 0;
+        if (__atomic_compare_exchange_n(state, &expected, 2, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            uint64_t rax = 0;
+            if (!runtime_call_nested(c->rt, init, 0, 0, 0, &rax)) {
+                __atomic_store_n(state, 0, __ATOMIC_RELEASE);
+                hle_ret_s32(c, 11); /* EAGAIN */
+                return;
+            }
+            __atomic_store_n(state, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        if (expected == 1) break;
+        while ((expected = __atomic_load_n(state, __ATOMIC_ACQUIRE)) == 2) pal_sleep_ns(100000);
+        if (expected == 1) break;
     }
     hle_ret_s32(c, 0);
 }

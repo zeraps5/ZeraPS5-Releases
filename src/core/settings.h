@@ -28,6 +28,10 @@ bool settings_output_4k(void);
 /* The height a game renders at when it can be set (game fixes, Unreal games): [geral] resolucao_interna
  * or PS5C_INTERNAL_RES = 1440, 1080, 900, 720 or 540 (16:9), else 0: the game's own size */
 int settings_internal_height(void);
+/* The game itself renders at that height (a game fix, an Unreal scale): the renderer's
+ * generic scaling of render targets stays off */
+void settings_internal_height_native(void);
+bool settings_internal_height_is_native(void);
 /* The [teclado] bindings to the host keyboard input */
 void settings_apply_keyboard(void);
 

@@ -8,19 +8,26 @@
  *               are indexed by disk offset, with a bounded resident LRU.
  *   pipelines-<vendor>-<device>.bin  the driver's VkPipelineCache data, saved once
  *               new pipelines have settled and before exiting.
+ *   sources.bin  each translation's inputs (shader_corpus.h encoding, code included).
  * SPIR-V starts over when translator sources change (PS5C_SHADER_TRANSLATOR_HASH,
- * computed at build time). Opaque Vulkan data is compatible by its device/UUID,
+ * computed at build time); the shaders in sources.bin are then translated again at
+ * start and vk_pipeline_async.c carries the pipeline list over to the new keys, so
+ * an update does not turn every pipeline into a draw-time driver compile
+ * (PS5C_NO_SHADER_MIGRATION=1 starts over as before; PS5C_SHADER_SOURCES_MB caps the file). Opaque Vulkan data is compatible by its device/UUID,
  * independently of the translator: the driver keys complete pipeline inputs.
  * PS5C_NO_SHADER_CACHE=1 turns both caches off. */
 #include "gpu/vk/vk_shader_cache.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "base/hashmap.h"
 #include "base/log.h"
+#include "gpu/shader/shader_corpus.h"
 #include "gpu/shader/shader_ops.h"
+#include "gpu/vk/vk_pipeline_async.h"
 #include "gpu/vk/vk_cache_budget.h"
 #include "pal/pal.h"
 #include "ps5c/shader_cache_version.h"
@@ -28,6 +35,10 @@
 #define FILE_MAGIC 0x31565053355A5350ull /* "PSZ5SPV1" */
 #define PIPE_MAGIC 0x31455049505A5350ull /* "PSZPIPE1" */
 #define REC_MAGIC 0x52565053u            /* "SPVR" */
+#define SRC_MAGIC 0x31435253355A5350ull /* "PSZ5SRC1" */
+#define SRC_REC_MAGIC 0x52435253u        /* "SRCR" */
+#define SRC_MAX_BYTES (64u << 20)
+#define SRC_WAVE32 1u
 #define MAX_WORDS (1u << 22)
 #define SETTLE_NS 2000000000ull  /* save the pipeline cache 2 s after the last new pipeline */
 #define MAX_UNSAVED_NS 60000000000ull /* or at least once a minute while they keep coming */
@@ -43,6 +54,20 @@ typedef struct rec_head {
     uint32_t magic, words;
     uint64_t key, check; /* check: hash of the code (seeded with the key) */
 } rec_head;
+
+/* sources.bin record: translation inputs (u32 flags + shader_corpus.h encoding)
+ * under the key their translation had when stored; check: hash of the payload. */
+typedef struct src_head {
+    uint32_t magic, bytes;
+    uint64_t key, check;
+} src_head;
+
+/* After a translator change: a shader translated again from its sources. */
+typedef struct mig_entry {
+    uint64_t key;    /* its key now */
+    uint8_t *types;  /* binding types (vk_pipeline_binding_types) */
+    uint32_t n;
+} mig_entry;
 
 typedef struct entry {
     uint64_t key, offset, check;
@@ -71,6 +96,16 @@ static struct {
     uint32_t loaded, hits, misses, pipelines;
     bool unsaved;
     uint64_t translate_ns, pipeline_ns, last_pipeline, last_save, retry_after;
+    /* sources.bin: what each translation was made from, kept across translator
+     * changes so a new translator can translate the game's shaders again at start */
+    pal_file *src;
+    bool src_writable;
+    uint64_t src_end, src_limit;
+    hmap64 src_keys;
+    hmap64 mig_index; /* old key -> mig[] */
+    mig_entry *mig;
+    uint32_t mig_count, mig_cap;
+    bool mig_on;
 } g;
 
 static uint64_t mix(uint64_t h, uint64_t v) {
@@ -345,6 +380,213 @@ no_initial:
     return c;
 }
 
+/* ---- Sources ---- */
+
+static bool src_append(pal_file *f, uint64_t *end, uint64_t key, uint32_t flags, const sh_corpus_entry *e) {
+    size_t enc = sh_corpus_encoded_size(e), bytes = 4 + enc;
+    if (bytes > SRC_MAX_BYTES || *end > g.src_limit || sizeof(src_head) + bytes > g.src_limit - *end) return false;
+    uint8_t *payload = (uint8_t *)malloc(bytes);
+    if (!payload) return false;
+    memcpy(payload, &flags, 4);
+    bool ok = sh_corpus_encode(e, payload + 4, enc);
+    src_head h = {SRC_REC_MAGIC, (uint32_t)bytes, key, ok ? hash_bytes(payload, bytes, key) : 0};
+    uint64_t done = 0;
+    ok = ok && pal_file_pwrite(f, &h, sizeof(h), *end, &done) == PS5C_OK && done == sizeof(h) &&
+         pal_file_pwrite(f, payload, bytes, *end + sizeof(h), &done) == PS5C_OK && done == bytes;
+    if (ok) *end += sizeof(h) + bytes;
+    free(payload);
+    return ok;
+}
+
+/* Reads the record at *at (advanced past it); NULL at the end or on damage. */
+static uint8_t *src_read(pal_file *f, uint64_t size, uint64_t *at, src_head *h) {
+    if (size - *at < sizeof(*h) || !read_exact(f, h, sizeof(*h), *at)) return NULL;
+    if (h->magic != SRC_REC_MAGIC || h->bytes < 4 || h->bytes > SRC_MAX_BYTES || h->bytes > size - *at - sizeof(*h))
+        return NULL;
+    uint8_t *payload = (uint8_t *)malloc(h->bytes);
+    if (!payload || !read_exact(f, payload, h->bytes, *at + sizeof(*h)) || hash_bytes(payload, h->bytes, h->key) != h->check) {
+        free(payload);
+        return NULL;
+    }
+    *at += sizeof(*h) + h->bytes;
+    return payload;
+}
+
+static void mig_add(uint64_t old_key, uint64_t key, const uint8_t *types, uint32_t n) {
+    if (hmap64_get(&g.mig_index, old_key, &(uint64_t){0})) return;
+    if (g.mig_count == g.mig_cap) {
+        uint32_t cap = g.mig_cap ? g.mig_cap * 2 : 256;
+        mig_entry *m = (mig_entry *)realloc(g.mig, sizeof(*m) * cap);
+        if (!m) return;
+        g.mig = m;
+        g.mig_cap = cap;
+    }
+    uint8_t *copy = (uint8_t *)malloc(n ? n : 1);
+    if (!copy) return;
+    memcpy(copy, types, n);
+    if (!hmap64_put(&g.mig_index, old_key, g.mig_count)) {
+        free(copy);
+        return;
+    }
+    g.mig[g.mig_count++] = (mig_entry){key, copy, n};
+}
+
+/* The translator changed: translate the recorded shaders again (their SPIR-V
+ * goes to spirv.bin under their new keys), note old key -> new key for the
+ * pipeline list (vk_pipeline_async.c), and rewrite sources.bin with new keys.
+ * Code that no longer analyzes or translates is dropped. */
+static void migrate_sources(pal_file *old, uint64_t size, const char *path) {
+    char tmp[420];
+    snprintf(tmp, sizeof(tmp), "%s.new", path);
+    pal_file *nf = NULL;
+    file_head want = {SRC_MAGIC, PS5C_SHADER_TRANSLATOR_HASH};
+    uint64_t done = 0, end = sizeof(want), t0 = pal_time_ns();
+    bool fresh = pal_file_open(tmp, PAL_FILE_READ | PAL_FILE_WRITE | PAL_FILE_CREATE, &nf) == PS5C_OK &&
+                 pal_file_truncate(nf, 0) == PS5C_OK && pal_file_pwrite(nf, &want, sizeof(want), 0, &done) == PS5C_OK &&
+                 done == sizeof(want);
+    sh_program *p = (sh_program *)malloc(sizeof(sh_program));
+    uint8_t *types = (uint8_t *)malloc(SH_MAX_SITES + 1);
+    sh_corpus_entry *ep = (sh_corpus_entry *)malloc(sizeof(sh_corpus_entry)); /* shapes[]: too big for a stack */
+    uint32_t total = 0, kept = 0, translated = 0;
+    hmap64_init(&g.mig_index);
+    g.mig_on = true;
+    for (uint64_t at = sizeof(file_head); p && types && ep;) {
+        src_head h;
+        uint8_t *payload = src_read(old, size, &at, &h);
+        if (!payload) break;
+        total++;
+        uint32_t flags;
+        memcpy(&flags, payload, 4);
+        if (sh_corpus_decode(payload + 4, h.bytes - 4, ep)) {
+            sh_corpus_entry *e = ep;
+            bool ok = e->kind == SH_CORPUS_TRANSLATION && sh_corpus_analyze(e, p);
+            if (ok) {
+                p->wave32 = (flags & SRC_WAVE32) != 0;
+                ok = sh_aperture_allowed(p);
+                for (uint32_t i = 0; ok && i < p->site_count; i++)
+                    if (e->shapes[i].buf_format == SH_IMG_ATOMIC_UINT64 && !sh_image_atomic64_supported()) ok = false;
+            }
+            uint64_t key = ok ? vk_shader_cache_key(p, &e->info, e->shapes, e->binding_base) : 0;
+            if (ok && !vk_shader_cache_size(key)) {
+                uint32_t *spv = NULL;
+                size_t words = 0;
+                ok = sh_translate(p, &e->info, e->shapes, e->binding_base, &spv, &words);
+                if (ok) {
+                    vk_shader_cache_store(key, spv, words);
+                    translated++;
+                }
+                free(spv);
+                ok = ok && vk_shader_cache_size(key);
+            }
+            if (ok) {
+                kept++;
+                mig_add(h.key, key, types, vk_pipeline_binding_types(p, e->shapes, types));
+                if (fresh && !hmap64_get(&g.src_keys, key, &(uint64_t){0}) && src_append(nf, &end, key, flags, e))
+                    hmap64_put(&g.src_keys, key, 1);
+            }
+            sh_corpus_free(e);
+        }
+        free(payload);
+    }
+    free(p);
+    free(types);
+    free(ep);
+    pal_file_close(old);
+    if (nf) pal_file_close(nf);
+    bool replaced = fresh && pal_file_rename(tmp, path) == PS5C_OK;
+    if (!replaced) {
+        pal_file_remove(tmp);
+        hmap64_free(&g.src_keys);
+        hmap64_init(&g.src_keys);
+    }
+    if (pal_file_open(path, PAL_FILE_READ | PAL_FILE_WRITE, &g.src) == PS5C_OK) {
+        g.src_writable = replaced;
+        g.src_end = replaced ? end : 0;
+    }
+    LOG_I(GPU, "shader cache: the translator changed; %u of %u recorded shaders translated again (%u new) in %.0f ms",
+          kept, total, translated, (pal_time_ns() - t0) / 1e6);
+}
+
+/* sources.bin of this translator: index its keys (records are appended once each). */
+static void open_sources(const char *dir) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s/sources.bin", dir);
+    hmap64_init(&g.src_keys);
+    g.src_limit = vk_cache_budget_mb("PS5C_SHADER_SOURCES_MB", 256);
+    pal_file *f = NULL;
+    if (pal_file_open(path, PAL_FILE_READ | PAL_FILE_WRITE | PAL_FILE_CREATE, &f) != PS5C_OK) return;
+    uint64_t size = 0, done = 0;
+    file_head fh = {0}, want = {SRC_MAGIC, PS5C_SHADER_TRANSLATOR_HASH};
+    if (pal_file_size(f, &size) != PS5C_OK) size = 0;
+    bool head = size >= sizeof(fh) && read_exact(f, &fh, sizeof(fh), 0) && fh.magic == SRC_MAGIC;
+    if (head && fh.translator != want.translator && !getenv("PS5C_NO_SHADER_MIGRATION")) {
+        migrate_sources(f, size, path);
+        return;
+    }
+    g.src = f;
+    if (!head || fh.translator != want.translator) {
+        g.src_writable = pal_file_truncate(f, 0) == PS5C_OK && pal_file_pwrite(f, &want, sizeof(want), 0, &done) == PS5C_OK &&
+                         done == sizeof(want);
+        g.src_end = sizeof(want);
+        return;
+    }
+    uint64_t at = sizeof(fh);
+    for (;;) {
+        src_head h;
+        uint64_t before = at;
+        uint8_t *payload = src_read(f, size, &at, &h);
+        if (!payload) { at = before; break; }
+        free(payload);
+        if (!hmap64_put(&g.src_keys, h.key, 1)) break;
+    }
+    g.src_end = at;
+    g.src_writable = at == size || pal_file_truncate(f, at) == PS5C_OK;
+}
+
+void vk_shader_cache_note_source(uint64_t key, const sh_program *p, const sh_stage_info *info, const sh_site_shape *shapes,
+                                 uint32_t binding_base) {
+    if (g.off || !g.lock || !p || !p->code || p->function_count > 1) return;
+    pal_mutex_lock(g.lock);
+    bool known = !g.src || !g.src_writable || hmap64_get(&g.src_keys, key, &(uint64_t){0});
+    sh_corpus_entry *e = known ? NULL : (sh_corpus_entry *)malloc(sizeof(sh_corpus_entry));
+    if (e) {
+        memset(e, 0, offsetof(sh_corpus_entry, shapes)); /* no compound literal: it would be a stack copy */
+        e->kind = SH_CORPUS_TRANSLATION;
+        e->base = p->base;
+        e->info = *info;
+        e->binding_base = binding_base;
+        e->site_count = p->site_count;
+        e->dwords = p->dwords;
+        e->code = (uint32_t *)p->code;
+        memcpy(e->shapes, shapes, sizeof(sh_site_shape) * p->site_count);
+        if (src_append(g.src, &g.src_end, key, p->wave32 ? SRC_WAVE32 : 0, e)) hmap64_put(&g.src_keys, key, 1);
+        else g.src_writable = false; /* full or failing: stop trying */
+        free(e);
+    }
+    pal_mutex_unlock(g.lock);
+}
+
+bool vk_shader_cache_migrating(void) { return !g.off && g.mig_on; }
+
+bool vk_shader_cache_migrated(uint64_t old_key, uint64_t *key, const uint8_t **types, uint32_t *n) {
+    uint64_t i = 0;
+    if (!g.mig_on || !hmap64_get(&g.mig_index, old_key, &i)) return false;
+    *key = g.mig[i].key;
+    *types = g.mig[i].types;
+    *n = g.mig[i].n;
+    return true;
+}
+
+void vk_shader_cache_migration_end(void) {
+    if (!g.mig_on) return;
+    for (uint32_t i = 0; i < g.mig_count; i++) free(g.mig[i].types);
+    free(g.mig);
+    g.mig = NULL;
+    g.mig_count = g.mig_cap = 0;
+    hmap64_free(&g.mig_index);
+    g.mig_on = false;
+}
+
 void vk_shader_cache_open(renderer *r) {
     /* The previous session has closed. Preserve only its selected directory
      * and the device's translation capabilities; off/dirty/statistics are local. */
@@ -385,6 +627,7 @@ void vk_shader_cache_open(renderer *r) {
     pal_mkdir(dir);
     snprintf(path, sizeof(path), "%s/spirv.bin", dir);
     load_spirv(path);
+    open_sources(dir);
     snprintf(g.pipe_path, sizeof(g.pipe_path), "%s/pipelines-%04x-%04x.bin", dir, r->props.vendorID, r->props.deviceID);
     /* Without the guard, retain only SPIR-V caching. Driver snapshots must
      * never race a pipeline creation when synchronization allocation failed. */
@@ -588,6 +831,11 @@ void vk_shader_cache_close(renderer *r) {
     g.pipes = VK_NULL_HANDLE;
     if (g.file) pal_file_close(g.file);
     g.file = NULL;
+    vk_shader_cache_migration_end();
+    if (g.src) pal_file_close(g.src);
+    g.src = NULL;
+    g.src_writable = false;
+    hmap64_free(&g.src_keys);
     for (uint32_t i = 0; i < g.count; i++) free(g.entries[i].code);
     free(g.entries);
     g.entries = NULL;

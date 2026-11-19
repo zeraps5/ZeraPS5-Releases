@@ -120,6 +120,7 @@
 /* ---- UConfig ---- */
 #define mmVGT_PRIMITIVE_TYPE 0xC242u
 #define mmVGT_INDEX_TYPE 0xC243u
+#define mmVGT_MULTI_PRIM_IB_RESET_EN 0xC24Bu
 #define mmGE_INDX_OFFSET 0xC24Au
 #define mmGE_CNTL 0xC25Bu
 #define mmGE_MAX_OUTPUT_PER_SUBGROUP 0xA1FFu

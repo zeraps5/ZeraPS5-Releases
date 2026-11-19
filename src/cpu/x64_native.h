@@ -66,6 +66,9 @@ bool x64_native_install_thunk(x64_native *cpu, guest_addr stub, uint32_t id);
 
 /* Rewrites `mov reg, fs:[0]` in [code, code + size). Returns the patch count. */
 uint32_t x64_native_patch_tls(x64_native *cpu, guest_addr code, uint64_t size);
+/* Absolute fs:[disp] accesses (disp != 0) that patch_tls leaves alone; they
+ * would read the host's fs. first: address of the first one. Diagnostic only. */
+uint32_t x64_native_count_fs(x64_native *cpu, guest_addr code, uint64_t size, guest_addr *first);
 
 /* Calls ctx->fn(arg0, arg1, arg2) on the guest stack; returns the guest's rax.
  * Returns early with the value passed to x64_native_bail. */

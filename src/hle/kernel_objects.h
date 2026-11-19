@@ -35,4 +35,10 @@ void *kobj_check(uint64_t handle, obj_kind kind);
 void kobj_lock(void);
 void kobj_unlock(void);
 
+/* Thread exit: the next pthread key of `t`, from *cursor on, holding a value
+ * and a destructor. Clears the value (as POSIX does before the call) and
+ * advances *cursor. False when none is left. */
+struct guest_thread;
+bool kernel_thread_take_specific(struct guest_thread *t, uint32_t *cursor, uint64_t *destructor, uint64_t *value);
+
 #endif

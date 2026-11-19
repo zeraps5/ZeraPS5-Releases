@@ -5,6 +5,7 @@
 #ifndef PS5C_VK_PIPELINE_ASYNC_H
 #define PS5C_VK_PIPELINE_ASYNC_H
 
+#include "gpu/shader/shader.h"
 #include "gpu/vk/vk_internal.h"
 
 typedef struct vk_built_pipeline {
@@ -23,6 +24,11 @@ size_t vk_pipeline_recipe_size(void);
 bool vk_pipeline_prewarm_size(const void *recipe, uint64_t *bytes);
 bool vk_pipeline_build(renderer *r, const void *recipe, const uint32_t *const words[2], const size_t n[2],
                        vk_built_pipeline *out);
+/* Binding types of a stage, as a recipe lists them (types: SH_MAX_SITES + 1 bytes). */
+uint32_t vk_pipeline_binding_types(const sh_program *p, const sh_site_shape *shapes, uint8_t *types);
+/* An earlier translator's recipe with its shaders' new keys (vk_shader_cache_migrated);
+ * false when it cannot be carried over. */
+bool vk_pipeline_recipe_migrate(void *recipe);
 
 /* After vk_shader_cache_open: loads the game's pipeline list and starts the
  * workers (unless PS5C_PIPELINES_ASYNC=0 or the shader cache is off). */

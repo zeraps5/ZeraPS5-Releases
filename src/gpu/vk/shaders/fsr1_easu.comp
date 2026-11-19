@@ -1,0 +1,99 @@
+#version 450
+// FSR 1 EASU (edge adaptive spatial upsampling), after AMD FidelityFX Super Resolution 1.
+// The algorithm and its constants: Copyright (c) 2021 Advanced Micro Devices, Inc., MIT license
+// (see fsr1_LICENSE.txt). This port: one output pixel per invocation, 32-bit floats.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform Con { uvec4 con0, con1, con2, con3; uvec4 out_size; } pc;
+
+void set_dir(inout vec2 dir, inout float len, vec2 pp, int which, float lA, float lB, float lC, float lD, float lE) {
+    // which: 0 = s (f), 1 = t (g), 2 = u (j), 3 = v (k); A above, B left, C center, D right, E below
+    float w = which == 0 ? (1.0 - pp.x) * (1.0 - pp.y) : which == 1 ? pp.x * (1.0 - pp.y)
+            : which == 2 ? (1.0 - pp.x) * pp.y : pp.x * pp.y;
+    float dc = lD - lC, cb = lC - lB;
+    float lenX = 1.0 / max(max(abs(dc), abs(cb)), 1.0 / 32768.0);
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    len += lenX * lenX * w;
+    float ec = lE - lC, ca = lC - lA;
+    float lenY = 1.0 / max(max(abs(ec), abs(ca)), 1.0 / 32768.0);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    len += lenY * lenY * w;
+}
+
+void tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len2, float lob, float clp, vec3 c) {
+    vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len2;
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    float wB = 2.0 / 5.0 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+void main() {
+    uvec2 ip = gl_GlobalInvocationID.xy;
+    if (ip.x >= pc.out_size.x || ip.y >= pc.out_size.y) return;
+    vec4 c0 = uintBitsToFloat(pc.con0), c1 = uintBitsToFloat(pc.con1), c2 = uintBitsToFloat(pc.con2), c3 = uintBitsToFloat(pc.con3);
+    vec2 pp = vec2(ip) * c0.xy + c0.zw;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    // 12 taps around the 2x2 f g / j k:   b c / e f g h / i j k l / n o
+    vec2 p0 = fp * c1.xy + c1.zw;
+    vec2 p1 = p0 + c2.xy, p2 = p0 + c2.zw, p3 = p0 + c3.xy;
+    vec4 bczzR = textureGather(src, p0, 0), bczzG = textureGather(src, p0, 1), bczzB = textureGather(src, p0, 2);
+    vec4 ijfeR = textureGather(src, p1, 0), ijfeG = textureGather(src, p1, 1), ijfeB = textureGather(src, p1, 2);
+    vec4 klhgR = textureGather(src, p2, 0), klhgG = textureGather(src, p2, 1), klhgB = textureGather(src, p2, 2);
+    vec4 zzonR = textureGather(src, p3, 0), zzonG = textureGather(src, p3, 1), zzonB = textureGather(src, p3, 2);
+    vec4 bczzL = bczzB * 0.5 + (bczzR * 0.5 + bczzG);
+    vec4 ijfeL = ijfeB * 0.5 + (ijfeR * 0.5 + ijfeG);
+    vec4 klhgL = klhgB * 0.5 + (klhgR * 0.5 + klhgG);
+    vec4 zzonL = zzonB * 0.5 + (zzonR * 0.5 + zzonG);
+    float bL = bczzL.x, cL = bczzL.y, iL = ijfeL.x, jL = ijfeL.y, fL = ijfeL.z, eL = ijfeL.w;
+    float kL = klhgL.x, lL = klhgL.y, hL = klhgL.z, gL = klhgL.w, oL = zzonL.z, nL = zzonL.w;
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    set_dir(dir, len, pp, 0, bL, eL, fL, gL, jL);
+    set_dir(dir, len, pp, 1, cL, fL, gL, hL, kL);
+    set_dir(dir, len, pp, 2, fL, iL, jL, kL, nL);
+    set_dir(dir, len, pp, 3, gL, jL, kL, lL, oL);
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < 1.0 / 32768.0;
+    dirR = zro ? 1.0 : inversesqrt(dirR);
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= dirR;
+    len = len * 0.5;
+    len *= len;
+    float stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = 1.0 / lob;
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    tap(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, vec3(bczzR.x, bczzG.x, bczzB.x)); // b
+    tap(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, vec3(bczzR.y, bczzG.y, bczzB.y)); // c
+    tap(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, vec3(ijfeR.x, ijfeG.x, ijfeB.x)); // i
+    tap(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, vec3(ijfeR.y, ijfeG.y, ijfeB.y)); // j
+    tap(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, vec3(ijfeR.z, ijfeG.z, ijfeB.z)); // f
+    tap(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, vec3(ijfeR.w, ijfeG.w, ijfeB.w)); // e
+    tap(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, vec3(klhgR.x, klhgG.x, klhgB.x)); // k
+    tap(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, vec3(klhgR.y, klhgG.y, klhgB.y)); // l
+    tap(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, vec3(klhgR.z, klhgG.z, klhgB.z)); // h
+    tap(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, vec3(klhgR.w, klhgG.w, klhgB.w)); // g
+    tap(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, vec3(zzonR.z, zzonG.z, zzonB.z)); // o
+    tap(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, vec3(zzonR.w, zzonG.w, zzonB.w)); // n
+    // no ringing: within the 2x2 around the sample
+    vec3 f = vec3(ijfeR.z, ijfeG.z, ijfeB.z), g = vec3(klhgR.w, klhgG.w, klhgB.w);
+    vec3 j = vec3(ijfeR.y, ijfeG.y, ijfeB.y), k = vec3(klhgR.x, klhgG.x, klhgB.x);
+    vec3 mn = min(min(f, g), min(j, k)), mx = max(max(f, g), max(j, k));
+    vec3 pix = min(mx, max(mn, aC / aW));
+    imageStore(dst, ivec2(ip), vec4(pix, 1.0));
+}

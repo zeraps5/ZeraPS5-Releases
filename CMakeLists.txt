@@ -189,6 +189,8 @@ add_library(ps5c_core STATIC
     src/hle/lib_ampr.c
     src/hle/lib_png_enc.c
     src/hle/lib_png_dec.c
+    src/hle/lib_audiodec.c
+    src/hle/lib_compat_stubs.c
     src/hle/png_decode.c
     src/hle/lib_ajm.c
     src/hle/lib_acm.c
@@ -210,6 +212,7 @@ add_library(ps5c_core STATIC
     src/hle/lib_save_data.c
     src/hle/lib_save_data_dir.c
     src/hle/lib_dialogs.c
+    src/hle/lib_jpeg_dec.c
     src/hle/lib_services_offline.c
     src/hle/lib_kernel.c
     src/hle/kernel_objects.c
@@ -426,13 +429,28 @@ if(PS5C_BUILD_TESTS)
             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/fixtures/bundled-assets" TIMEOUT 45)
     endif()
 
-    foreach(t writeback_merge uniform_layout spv_prologue spv_intern descriptor_plan avplayer_timing base pal loader mem mem_access exfat vertex_ranges texture_layout texture_tiling texture_3d resident_mips sparse_plan ngg_group image_views color_target dcc_sample fill_clear htile_clear shader_resinfo shader_options shader_corpus shader_gaps shader_inputs shader_lod shader_mip shader_half shader_half_sdwa shader_masks shader_dpp8 shader_gds shader_gather_compare compute_dispatch buffer_pairs shader_resources store_range sbuffer audio_out ajm_resample agc_suspend agc_queues gpu_waits kernel_memory resource_limits runtime_faults thread_start thread_cancel kernel_pipe libc_internal libc_callbacks process_params pad_script pad_motion mesh_indices program_storage playgo apr_events net_loopback acm snapshot_refresh shader_fp16_overflow shader_isa shader_isa_coverage json2 crypto png_decode rtc stencil_state overlay packed_formats shader_structured font_raster gcn ue_scale)
+    foreach(t writeback_merge uniform_layout spv_prologue spv_intern descriptor_plan avplayer_timing base pal loader mem mem_access exfat vertex_ranges texture_layout texture_tiling texture_3d resident_mips sparse_plan ngg_group image_views color_target dcc_sample fill_clear htile_clear shader_resinfo shader_options shader_corpus shader_gaps shader_inputs shader_lod shader_mip shader_half shader_half_sdwa shader_masks shader_dpp8 shader_gds shader_gather_compare compute_dispatch buffer_pairs shader_resources store_range sbuffer audio_out ajm_resample agc_suspend agc_queues gpu_waits kernel_memory resource_limits runtime_faults thread_start thread_cancel kernel_pipe kernel_cwd libc_internal libc_callbacks process_params pad_script pad_motion mesh_indices program_storage playgo apr_events net_loopback acm snapshot_refresh shader_fp16_overflow shader_isa shader_isa_coverage json2 crypto png_decode rtc stencil_state overlay packed_formats shader_structured font_raster gcn ue_scale)
         add_executable(test_${t} tests/unit/test_${t}.c)
         target_link_libraries(test_${t} PRIVATE ps5c_test_support)
         ps5c_target_defaults(test_${t})
         ps5c_guest_host(test_${t})
         add_test(NAME ${t} COMMAND test_${t})
     endforeach()
+    add_executable(test_kernel_readv tests/unit/test_kernel_readv.c)
+    target_link_libraries(test_kernel_readv PRIVATE ps5c_test_support)
+    ps5c_target_defaults(test_kernel_readv)
+    ps5c_guest_host(test_kernel_readv)
+    add_test(NAME kernel_readv COMMAND test_kernel_readv)
+    add_executable(test_kernel_pwritev tests/unit/test_kernel_pwritev.c)
+    target_link_libraries(test_kernel_pwritev PRIVATE ps5c_test_support)
+    ps5c_target_defaults(test_kernel_pwritev)
+    ps5c_guest_host(test_kernel_pwritev)
+    add_test(NAME kernel_pwritev COMMAND test_kernel_pwritev)
+    add_executable(test_hrtimer tests/unit/test_hrtimer.c)
+    target_link_libraries(test_hrtimer PRIVATE ps5c_test_support)
+    ps5c_target_defaults(test_hrtimer)
+    ps5c_guest_host(test_hrtimer)
+    add_test(NAME hrtimer COMMAND test_hrtimer)
     add_executable(test_cpu_compat tests/unit/test_cpu_compat.c)
     if(PS5C_RUN_GPU_TESTS)
         add_test(NAME sbuffer_local_gpu COMMAND test_sbuffer)
@@ -595,6 +613,14 @@ if(PS5C_BUILD_TESTS)
             ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_RESIDENT_MIPS=1;PS5C_TEST_SAMPLER_MIP_MODE=1")
         add_test(NAME image_views_gpu COMMAND test_image_views)
         set_tests_properties(image_views_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS GPU ENVIRONMENT "PS5C_TEST_GPU=1")
+        foreach(mode serial retired legacy no_timeline)
+            add_test(NAME scalar_writeback_${mode} COMMAND test_image_views --scalar-writeback)
+            set_tests_properties(scalar_writeback_${mode} PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS GPU)
+        endforeach()
+        set_tests_properties(scalar_writeback_serial PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_WORK_OVERLAP=0")
+        set_tests_properties(scalar_writeback_retired PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_WORK_OVERLAP=1;PS5C_VK_RETIRE=1")
+        set_tests_properties(scalar_writeback_legacy PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_WORK_OVERLAP=1;PS5C_VK_RETIRE=0")
+        set_tests_properties(scalar_writeback_no_timeline PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_WORK_OVERLAP=1;PS5C_VK_TIMELINE=0")
     endif()
     if(WIN32)
         add_executable(test_shader_opcode_threads tests/unit/test_shader_opcode_threads.c)

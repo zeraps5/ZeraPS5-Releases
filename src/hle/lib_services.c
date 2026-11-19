@@ -28,6 +28,7 @@ void hle_register_table(const hle_export *table, size_t count);
 #define US_ERR_NO_EVENT ((int32_t)0x80960007)
 #define PAD_ERR_INVALID_ARG ((int32_t)0x80920001)
 #define PAD_ERR_INVALID_HANDLE ((int32_t)0x80920003)
+#define PAD_ERR_DEVICE_NOT_CONNECTED ((int32_t)0x80920007)
 #define NP_ERR_INVALID_ARGUMENT ((int32_t)0x80550003)
 #define NP_ERR_SIGNED_OUT ((int32_t)0x80550006)
 #define NP_AUTH_ERR_SERVICE_DOWN ((int32_t)0x80550401)
@@ -412,14 +413,35 @@ static void np_ent_not_found(hle_call *c) { hle_ret_s32(c, NP_ENT_ERR_NOT_FOUND)
 
 static void pad_init(hle_call *c) { hle_ret_s32(c, 0); }
 
+/* Only the standard port (type 0) has a controller. The special (2) and
+ * remote-control (16) ports report "not connected", as on a console without
+ * such a device, instead of handing out the standard controller's handle. */
+static bool pad_port_connected(hle_call *c, const char *fn) {
+    int32_t type = hle_arg_s32(c, 1);
+    if (type == 0) return true;
+    static uint32_t logged;
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
+        LOG_I(HLE, "%s: port type %d has no device (not connected)", fn, type);
+    return false;
+}
+
 /* int scePadOpen(int user_id, int type, int index, const void *param) */
 static void pad_open(hle_call *c) {
     int32_t p = player_of_user(hle_arg_s32(c, 0));
+    if (p >= 0 && !pad_port_connected(c, "scePadOpen")) {
+        hle_ret_s32(c, PAD_ERR_DEVICE_NOT_CONNECTED);
+        return;
+    }
     hle_ret_s32(c, p >= 0 && hle_arg_s32(c, 2) == 0 ? PAD_HANDLE + p : PAD_ERR_INVALID_ARG);
 }
 
+/* int scePadGetHandle(int user_id, int type, int index) */
 static void pad_get_handle(hle_call *c) {
     int32_t p = player_of_user(hle_arg_s32(c, 0));
+    if (p >= 0 && !pad_port_connected(c, "scePadGetHandle")) {
+        hle_ret_s32(c, PAD_ERR_DEVICE_NOT_CONNECTED);
+        return;
+    }
     hle_ret_s32(c, p >= 0 ? PAD_HANDLE + p : PAD_ERR_INVALID_ARG);
 }
 
@@ -936,6 +958,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceNpAuth", "sceNpAuthGetIdTokenV3", np_auth_unavailable),
     HLE_FUNC_ENTRY("libSceNpAuth", "sceNpAuthWaitAsync", np_auth_wait_async),
     HLE_FUNC_ENTRY("libSceNpAuth", "sceNpAuthPollAsync", np_auth_wait_async),
+    HLE_FUNC_ENTRY("libSceNpAuthAuthorizedApp", "sceNpAuthGetAuthorizedAppCode", np_auth_unavailable),
     HLE_FUNC_ENTRY("libScePad", "scePadInit", pad_init),
     HLE_FUNC_ENTRY("libScePad", "scePadOpen", pad_open),
     HLE_FUNC_ENTRY("libScePad", "scePadClose", pad_ok),

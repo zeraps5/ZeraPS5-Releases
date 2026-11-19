@@ -270,6 +270,7 @@ uint32_t renderer_list_gpus(renderer_gpu *out, uint32_t max) {
 }
 
 static bool create_device(renderer *r) {
+    bool push_core = false; /* push descriptors from Vulkan 1.4 core (no VK_KHR_push_descriptor listed) */
     float prio = 1.0f;
     VkDeviceQueueCreateInfo q = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     q.queueFamilyIndex = r->queue_family;
@@ -362,6 +363,16 @@ static bool create_device(renderer *r) {
             r->caps.extended_dynamic_state2 |= r->api >= VK_API_VERSION_1_3;
             r->caps.push_descriptor |= v14.pushDescriptor != 0;
             r->caps.maintenance5 |= v14.maintenance5 != 0;
+            const char *e = getenv("PS5C_VK_PUSH");
+            if (!r->push_max && v14.pushDescriptor && !(e && !strcmp(e, "0"))) {
+                VkPhysicalDevicePushDescriptorPropertiesKHR pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+                VkPhysicalDeviceProperties2 pq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pp};
+                PFN_vkGetPhysicalDeviceProperties2 gp =
+                    (PFN_vkGetPhysicalDeviceProperties2)vk_api_instance_proc(r->instance, "vkGetPhysicalDeviceProperties2");
+                if (gp) gp(r->phys, &pq);
+                r->push_max = pp.maxPushDescriptors;
+                push_core = r->push_max != 0;
+            }
         }
         LOG_I(GPU, "Vulkan %u.%u (instance %u.%u): dynamic rendering %d, sync2 %d, dynamic state %d/%d/%d, "
               "push descriptors %d, pipeline library %d, timeline %d, buffer address %d, maintenance4/5 %d/%d",
@@ -412,7 +423,9 @@ static bool create_device(renderer *r) {
     const char *dynamic_buffers = getenv("PS5C_DYNAMIC_BUFFERS");
     const char *large_reads = getenv("PS5C_NGG_LARGE_READS");
     const char *compute_large=getenv("PS5C_COMPUTE_LARGE_BUFFERS");
+    const char *phys_import=getenv("PS5C_PHYS_IMPORT");
     if (host_import_extension && (address_wanted || (dynamic_buffers && !strcmp(dynamic_buffers, "1")) ||
+                                 (phys_import && !strcmp(phys_import, "1")) ||
                                  (large_reads && (large_reads[0]=='@' || !strcmp(large_reads,"1"))) ||
                                  (compute_large && (compute_large[0]=='@' || strtoull(compute_large,NULL,16)!=0)))) {
         PFN_vkGetPhysicalDeviceExternalBufferProperties external_properties =
@@ -677,6 +690,10 @@ static bool create_device(renderer *r) {
         want_timeline = r->api >= VK_API_VERSION_1_2 && r->caps.timeline_semaphore && !(e && !strcmp(e, "0"));
         if (want_timeline) { timeline.pNext = (void *)ci.pNext; ci.pNext = &timeline; }
     }
+    /* the 1.4 feature is enabled on its own: no other 1.4-covered feature struct is in the chain */
+    VkPhysicalDeviceVulkan14Features push14 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+                                               .pushDescriptor = VK_TRUE};
+    if (push_core) { push14.pNext = (void *)ci.pNext; ci.pNext = &push14; }
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &q;
     ci.enabledExtensionCount = ext_count;
@@ -718,6 +735,8 @@ static bool create_device(renderer *r) {
     LOG_I(GPU, "work timeline semaphore: %s", r->work_timeline ? "on" : "off");
     if (r->push_max) {
         r->push_descriptor_set = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(r->device, "vkCmdPushDescriptorSetKHR");
+        if (!r->push_descriptor_set) /* the core name (Vulkan 1.4), same signature */
+            r->push_descriptor_set = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(r->device, "vkCmdPushDescriptorSet");
         if (!r->push_descriptor_set) r->push_max = 0;
     }
     LOG_I(GPU, "push descriptors: %s (up to %u per set)", r->push_max ? "on" : "off", r->push_max);
@@ -1010,6 +1029,8 @@ static uint64_t g_recording_seq;
 void vk_barrier(VkCommandBuffer cmd, vk_image *img, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
     if (g_recording_seq && img->last_use < g_recording_seq) img->last_use = g_recording_seq;
+    if (dst_access & (VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT))
+        img->rect_valid = false; /* written by other than a draw: the next feedback copy is whole */
     if (img->layout == to && to != VK_IMAGE_LAYOUT_GENERAL && to != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
         /* Read-only users may move between compute, vertex and fragment
          * without a transition. Keep every consumer in the source scope of
@@ -1350,6 +1371,7 @@ static bool backing_transfer(renderer *r, vk_image *img, vk_buffer *buf, bool re
 }
 
 static bool backing_save(renderer *r, vk_image *img) {
+    if (img->ext_w) return false; /* PS5C_RT_SCALE targets have no RAM copy */
     uint64_t bytes = (uint64_t)img->width * img->height * (img->depth ? img->depth : img->layers) * vk_format_bytes(img->format);
     if (!bytes || bytes > SIZE_MAX - sizeof(vk_image_backing) ||
         bytes > r->image_backing_limit || r->image_backing_bytes > r->image_backing_limit - bytes) return false;
@@ -1461,6 +1483,23 @@ vk_image *vk_image_get_resident_levels(renderer *r,guest_addr addr,uint32_t widt
                                       uint32_t levels,uint32_t first) {
     return get_levels(r,addr,width,height,format,1,levels,first);
 }
+/* The smaller size a large target is drawn at: PS5C_RT_SCALE's share of 960x540 and up,
+ * or resolucao_interna's height for one taller than it (a game that renders at that height
+ * itself keeps its size). False: full size. */
+static bool rt_scaled_size(renderer *r, uint32_t w, uint32_t h, uint32_t *cw, uint32_t *ch) {
+    *cw = w, *ch = h;
+    if (!r->rt_scale || w < 960 || h < 540) return false;
+    if (r->rt_cap) {
+        if (h <= r->rt_cap || settings_internal_height_is_native()) return false;
+        *ch = r->rt_cap;
+        *cw = (uint32_t)(((uint64_t)w * r->rt_cap + h / 2) / h);
+    } else {
+        *cw = (w * r->rt_scale + 50) / 100;
+        *ch = (h * r->rt_scale + 50) / 100;
+    }
+    return *cw != w || *ch != h;
+}
+
 
 static vk_image *get_image(renderer *r, guest_addr addr, uint32_t width, uint32_t height, VkFormat format, uint32_t layers,
                            uint32_t depth, uint32_t levels,uint32_t first) {
@@ -1539,7 +1578,21 @@ static vk_image *get_image(renderer *r, guest_addr addr, uint32_t width, uint32_
     img->addr = addr;
     img->phys = vk_phys_of(r, addr);
     img->levels = levels ? levels : 1;
-    if (!create_objects(r, img, format, width, height, layers, false, first)) return NULL;
+    /* PS5C_RT_SCALE: a large single-layer target created for a draw is drawn smaller, and so is
+     * another format of a smaller one's memory (its bits reinterpreted: depth as R32, ...) */
+    uint32_t cw = width, ch = height;
+    bool scale = r->scale_new;
+    for (uint32_t i = 0; r->rt_scale && !scale && i < r->image_count; i++) {
+        const vk_image *o = &r->images[i];
+        scale = o != img && o->image && o->ext_w && o->addr == addr && o->width == width && o->height == height;
+    }
+    if (scale && !depth && layers == 1 && img->levels == 1) rt_scaled_size(r, width, height, &cw, &ch);
+    if (!create_objects(r, img, format, cw, ch, layers, false, first)) return NULL;
+    if (cw != width || ch != height) {
+        img->ext_w = cw;
+        img->ext_h = ch;
+        LOG_I(GPU, "render target 0x%llx %ux%u drawn at %ux%u (PS5C_RT_SCALE)", (unsigned long long)addr, width, height, cw, ch);
+    }
     img->layers = layers;
     img->width = width;
     img->height = height;
@@ -1734,6 +1787,27 @@ bool vk_capture_defer(renderer *r,vk_image *source,const char *path) {
     return true;
 }
 
+uint64_t g_vk_feedback_copies, g_vk_feedback_bytes;
+
+void vk_image_note_draw(vk_image *img, uint64_t prev_seq, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    if (!img->rect_valid || img->rect_seq != prev_seq) { /* something else wrote since */
+        img->rect_valid = false;
+        return;
+    }
+    int32_t *q = img->rect;
+    if (x1 > x0 && y1 > y0) {
+        if (q[2] <= q[0] || q[3] <= q[1]) {
+            q[0] = x0, q[1] = y0, q[2] = x1, q[3] = y1;
+        } else {
+            if (x0 < q[0]) q[0] = x0;
+            if (y0 < q[1]) q[1] = y0;
+            if (x1 > q[2]) q[2] = x1;
+            if (y1 > q[3]) q[3] = y1;
+        }
+    }
+    img->rect_seq = img->written_seq;
+}
+
 vk_image *vk_image_feedback(renderer *r, vk_image *source) {
     if (!source || source->depth || source->levels > 16) return NULL;
     vk_image *copy = source->feedback;
@@ -1744,34 +1818,59 @@ vk_image *vk_image_feedback(renderer *r, vk_image *source) {
         copy->addr = source->addr; /* diagnostic identity only; never inserted into r->images */
         copy->phys = VK_NO_PHYS;
         copy->width = source->width; copy->height = source->height;
+        copy->ext_w = source->ext_w; copy->ext_h = source->ext_h;
         copy->layers = source->layers; copy->levels = source->levels;
         copy->format = source->format;
         copy->stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        if (!create_objects(r, copy, copy->format, copy->width, copy->height, copy->layers, source->mutable_fmt, 0)) {
+        if (!create_objects(r, copy, copy->format, vk_img_w(copy), vk_img_h(copy), copy->layers, source->mutable_fmt, 0)) {
             free_feedback(r, source);
             return NULL;
         }
     }
     if (source->gpu_written && copy->gpu_written && copy->written_seq == source->written_seq) return copy;
+    /* Only draws wrote since this copy was made: their rectangle is what changed */
+    bool partial = source->rect_valid && source->gpu_written && copy->gpu_written &&
+                   source->rect_seq == source->written_seq && copy->written_seq == source->rect_base;
+    int32_t x0 = source->rect[0] > 0 ? source->rect[0] : 0, y0 = source->rect[1] > 0 ? source->rect[1] : 0;
+    int32_t x1 = source->rect[2] < (int32_t)source->width ? source->rect[2] : (int32_t)source->width;
+    int32_t y1 = source->rect[3] < (int32_t)source->height ? source->rect[3] : (int32_t)source->height;
+    bool single = source->aspect == VK_IMAGE_ASPECT_COLOR_BIT && source->levels <= 1 && source->layers <= 1 && !source->depth;
+    if (partial && (x1 <= x0 || y1 <= y0)) { /* the draws wrote nothing */
+        copy->written_seq = source->written_seq;
+        source->rect_base = source->rect_seq = source->written_seq;
+        return copy;
+    }
     vk_work_end(r);
     vk_barrier(r->cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT);
     vk_barrier(r->cmd, copy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkImageCopy regions[16] = {0};
-    uint32_t levels = source->levels ? source->levels : 1;
-    for (uint32_t level = 0; level < levels; level++) {
+    uint32_t levels = partial ? 1 : source->levels ? source->levels : 1;
+    if (partial) {
+        regions[0].srcSubresource = regions[0].dstSubresource = (VkImageSubresourceLayers){source->aspect, 0, 0, 1};
+        regions[0].srcOffset = regions[0].dstOffset = (VkOffset3D){x0, y0, 0};
+        regions[0].extent = (VkExtent3D){(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1};
+    }
+    for (uint32_t level = 0; level < levels && !partial; level++) {
         VkImageCopy *region = &regions[level];
         VkImageAspectFlags aspect = vk_format_has_stencil(source->format) ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
                                                                            : source->aspect;
         region->srcSubresource = region->dstSubresource = (VkImageSubresourceLayers){aspect, level, 0, source->layers};
-        region->extent.width = source->width >> level ? source->width >> level : 1;
-        region->extent.height = source->height >> level ? source->height >> level : 1;
+        region->extent.width = vk_img_w(source) >> level ? vk_img_w(source) >> level : 1;
+        region->extent.height = vk_img_h(source) >> level ? vk_img_h(source) >> level : 1;
         region->extent.depth = 1;
     }
     vkCmdCopyImage(r->cmd, source->image, source->layout, copy->image, copy->layout, levels, regions);
+    g_vk_feedback_copies++;
+    g_vk_feedback_bytes += partial ? (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0) * vk_format_bytes(source->format)
+                                   : (uint64_t)source->width * source->height * vk_format_bytes(source->format) *
+                                         (source->layers ? source->layers : 1);
     copy->gpu_written = true;
     copy->written_seq = source->written_seq;
+    source->rect_valid = single;
+    source->rect_base = source->rect_seq = source->written_seq;
+    memset(source->rect, 0, sizeof(source->rect));
     return copy;
 }
 
@@ -1789,10 +1888,11 @@ vk_image *vk_image_srgb(renderer *r, vk_image *source) {
         copy=calloc(1,sizeof(*copy));if(!copy) return NULL;
         source->feedback=copy;
         copy->addr=source->addr;copy->phys=VK_NO_PHYS;copy->width=source->width;copy->height=source->height;
+        copy->ext_w=source->ext_w;copy->ext_h=source->ext_h;
         copy->layers=source->layers;copy->levels=source->levels;copy->depth=source->depth;
         copy->format=VK_FORMAT_R8G8B8A8_UNORM;copy->stage=VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         copy->expanded_srgb=true;
-        if(!create_objects(r,copy,copy->format,copy->width,copy->height,copy->layers,true,0)) {
+        if(!create_objects(r,copy,copy->format,vk_img_w(copy),vk_img_h(copy),copy->layers,true,0)) {
             free_feedback(r,source);return NULL;
         }
     }
@@ -1805,8 +1905,8 @@ vk_image *vk_image_srgb(renderer *r, vk_image *source) {
     for(uint32_t k=0;k<levels;k++) {
         VkImageBlit *b=&regions[k];
         b->srcSubresource=b->dstSubresource=(VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT,k,0,source->depth?1:source->layers};
-        b->srcOffsets[1]=b->dstOffsets[1]=(VkOffset3D){source->width>>k?source->width>>k:1,
-            source->height>>k?source->height>>k:1,source->depth?(source->depth>>k?source->depth>>k:1):1};
+        b->srcOffsets[1]=b->dstOffsets[1]=(VkOffset3D){vk_img_w(source)>>k?vk_img_w(source)>>k:1,
+            vk_img_h(source)>>k?vk_img_h(source)>>k:1,source->depth?(source->depth>>k?source->depth>>k:1):1};
     }
     vkCmdBlitImage(r->cmd,source->image,source->layout,copy->image,copy->layout,levels,regions,VK_FILTER_NEAREST);
     copy->gpu_written=true;copy->written_seq=source->written_seq;
@@ -1846,7 +1946,7 @@ bool vk_image_promote(renderer *r, vk_image *img) {
     if (img->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !vk_format_bytes(img->format) || g_retired_count == MAX_RETIRED) return false;
     vk_image n = *img;
     n.sub = NULL, n.sub_count = n.sub_cap = 0;
-    if (!create_objects(r, &n, img->format, img->width, img->height, img->layers, true, 0)) return false;
+    if (!create_objects(r, &n, img->format, vk_img_w(img), vk_img_h(img), img->layers, true, 0)) return false;
     n.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     n.access = 0;
     n.stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -1861,8 +1961,8 @@ bool vk_image_promote(renderer *r, vk_image *img) {
         for (uint32_t level = 0; level < levels; level++) {
             VkImageCopy *c = &copies[level];
             c->srcSubresource = c->dstSubresource = (VkImageSubresourceLayers){img->aspect, level, 0, img->layers};
-            c->extent.width = img->width >> level ? img->width >> level : 1;
-            c->extent.height = img->height >> level ? img->height >> level : 1;
+            c->extent.width = vk_img_w(img) >> level ? vk_img_w(img) >> level : 1;
+            c->extent.height = vk_img_h(img) >> level ? vk_img_h(img) >> level : 1;
             c->extent.depth = img->depth >> level ? img->depth >> level : 1;
         }
         vkCmdCopyImage(cmd, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, n.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, copies);
@@ -1877,6 +1977,53 @@ bool vk_image_promote(renderer *r, vk_image *img) {
     *img = n;
     LOG_I(GPU, "host image 0x%llx %ux%u format %d: views may reinterpret it now", (unsigned long long)img->addr, img->width,
           img->height, (int)img->format);
+    return true;
+}
+
+/* PS5C_RT_SCALE: a full-size color target drawn together with scaled ones (made by a compute
+ * shader or a copy before its first draw) becomes scaled too: a smaller image takes its place,
+ * its contents blitted down. The old objects retire like a promotion's. */
+bool vk_image_rescale(renderer *r, vk_image *img) {
+    if (!r->rt_scale || img->ext_w || img->depth || img->layers != 1 || (img->levels ? img->levels : 1) != 1 ||
+        img->aspect != VK_IMAGE_ASPECT_COLOR_BIT || g_retired_count == MAX_RETIRED)
+        return false;
+    uint32_t cw, ch;
+    if (!rt_scaled_size(r, img->width, img->height, &cw, &ch)) return false;
+    free_feedback(r, img);
+    vk_image n = *img;
+    n.sub = NULL, n.sub_count = n.sub_cap = 0;
+    n.feedback = NULL;
+    if (!create_objects(r, &n, img->format, cw, ch, 1, img->mutable_fmt, 0)) return false;
+    n.ext_w = cw;
+    n.ext_h = ch;
+    n.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    n.access = 0;
+    n.stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkCommandBuffer cmd = vk_begin(r);
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(r->phys, img->format, &fp);
+    bool blit = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    if (img->layout != VK_IMAGE_LAYOUT_UNDEFINED && blit) {
+        vk_barrier(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        vk_barrier(cmd, &n, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit b = {0};
+        b.srcSubresource = b.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = (VkOffset3D){(int32_t)img->width, (int32_t)img->height, 1};
+        b.dstOffsets[1] = (VkOffset3D){(int32_t)cw, (int32_t)ch, 1};
+        bool linear = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        vkCmdBlitImage(cmd, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, n.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                       linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    }
+    uint32_t k = g_retired_count++;
+    g_retired[k].image = img->image;
+    g_retired[k].memory = img->memory;
+    g_retired[k].view = img->view;
+    g_retired[k].array_view = img->array_view;
+    g_retired[k].sub = img->sub;
+    g_retired[k].sub_count = img->sub_count;
+    *img = n;
+    LOG_I(GPU, "render target 0x%llx %ux%u drawn at %ux%u from now on (PS5C_RT_SCALE)", (unsigned long long)img->addr,
+          img->width, img->height, cw, ch);
     return true;
 }
 
@@ -1917,6 +2064,17 @@ VkResult vk_work_wait(renderer *r, uint64_t timeout_ns) {
                               .pSemaphores = &r->work_timeline, .pValues = &r->work_value[r->work_index]};
     return r->wait_semaphores(r->device, &wi, timeout_ns);
 }
+
+/* Waits for one work slot's last submit. */
+VkResult vk_work_wait_slot(renderer *r, uint32_t slot, uint64_t timeout_ns) {
+    if (!r->work_timeline) return vkWaitForFences(r->device, 1, &r->work_fences[slot], VK_TRUE, timeout_ns);
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                              .pSemaphores = &r->work_timeline, .pValues = &r->work_value[slot]};
+    return r->wait_semaphores(r->device, &wi, timeout_ns);
+}
+
+/* One work slot's last submit has completed (no waiting). */
+bool vk_work_slot_done(renderer *r, uint32_t slot) { return vk_work_wait_slot(r, slot, 0) == VK_SUCCESS; }
 
 void vk_flush(renderer *r) {
     if (!r->recording) return;
@@ -2055,24 +2213,13 @@ static bool texel_rgb(VkFormat fmt, const uint8_t *t, uint8_t *rgb) {
         for (int k = 0; k < 3; k++) rgb[k] = to8(f[k]);
         return true;
     }
-    case VK_FORMAT_R8_UNORM: rgb[0] = rgb[1] = rgb[2] = t[0]; return true;
-    case VK_FORMAT_R8G8_UNORM: rgb[0] = t[0], rgb[1] = t[1], rgb[2] = 0; return true;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_UINT: rgb[0] = rgb[1] = rgb[2] = t[0]; return true;
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_UINT: rgb[0] = t[0], rgb[1] = t[1], rgb[2] = 0; return true;
     case VK_FORMAT_R16G16B16A16_UNORM: rgb[0] = t[1], rgb[1] = t[3], rgb[2] = t[5]; return true;
     case VK_FORMAT_R16G16_UNORM: rgb[0] = t[1], rgb[1] = t[3], rgb[2] = 0; return true;
     default: return false;
-    }
-}
-
-static uint32_t format_bytes(VkFormat fmt) {
-    switch (fmt) {
-    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-    case VK_FORMAT_R16G16B16A16_UNORM:
-    case VK_FORMAT_R32G32_UINT: return 8;
-    case VK_FORMAT_R16_SFLOAT:
-    case VK_FORMAT_R8G8_UNORM: return 2;
-    case VK_FORMAT_R8_UNORM: return 1;
-    default: return 4;
     }
 }
 
@@ -2095,8 +2242,8 @@ static bool readback(renderer *r, vk_image *src, VkImageAspectFlags aspect, uint
     c.imageSubresource.aspectMask = aspect;
     c.imageSubresource.baseArrayLayer = layer;
     c.imageSubresource.layerCount = 1;
-    c.imageExtent.width = src->width;
-    c.imageExtent.height = src->height;
+    c.imageExtent.width = vk_img_w(src);
+    c.imageExtent.height = vk_img_h(src);
     c.imageExtent.depth = 1;
     vkCmdCopyImageToBuffer(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf->buffer, 1, &c);
     vk_check_work(r, vkEndCommandBuffer(cmd), "vkEndCommandBuffer (transfer)");
@@ -2113,7 +2260,7 @@ static bool readback(renderer *r, vk_image *src, VkImageAspectFlags aspect, uint
 int64_t vk_color_coverage(renderer *r, vk_image *src) {
     uint32_t bpp = vk_format_bytes(src->format);
     if (src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !bpp || bpp > 16) return -1;
-    uint64_t n = (uint64_t)src->width * src->height;
+    uint64_t n = (uint64_t)vk_img_w(src) * vk_img_h(src);
     vk_buffer buf;
     if (!readback(r, src, VK_IMAGE_ASPECT_COLOR_BIT, 0, n * bpp, &buf)) return -1;
     static const uint8_t zero[16];
@@ -2127,10 +2274,10 @@ int64_t vk_color_coverage(renderer *r, vk_image *src) {
  * layer, layers one below the other, every 4th texel) at `path` (debugging aid: PS5C_SAVE_TEXTURES). */
 void vk_save_depth(renderer *r, vk_image *src, const char *path) {
     if (src->format != VK_FORMAT_D32_SFLOAT && src->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
-    uint32_t w = src->width / 4, h = src->height / 4, layers = src->layers ? src->layers : 1, row = (w * 3 + 3) & ~3u;
+    uint32_t w = vk_img_w(src) / 4, h = vk_img_h(src) / 4, layers = src->layers ? src->layers : 1, row = (w * 3 + 3) & ~3u;
     uint8_t *bmp = w && h ? (uint8_t *)calloc(1, 54 + (size_t)row * h * layers) : NULL;
     if (!bmp) return;
-    uint64_t n = (uint64_t)src->width * src->height;
+    uint64_t n = (uint64_t)vk_img_w(src) * vk_img_h(src);
     for (uint32_t l = 0; l < layers; l++) {
         vk_buffer buf;
         if (!readback(r, src, VK_IMAGE_ASPECT_DEPTH_BIT, l, n * 4, &buf)) break;
@@ -2149,7 +2296,7 @@ void vk_save_depth(renderer *r, vk_image *src, const char *path) {
               (unsigned long long)zero, (unsigned long long)one, (unsigned long long)n);
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < w; x++) {
-                float f = z[(uint64_t)y * 4 * src->width + x * 4];
+                float f = z[(uint64_t)y * 4 * vk_img_w(src) + x * 4];
                 uint8_t g = hi > lo ? (uint8_t)((f - lo) / (hi - lo) * 255.0f) : 0;
                 uint8_t *px = bmp + 54 + (size_t)(h * layers - 1 - (l * h + y)) * row + x * 3; /* bottom-up rows */
                 px[0] = px[1] = px[2] = g;
@@ -2181,7 +2328,7 @@ void vk_save_depth(renderer *r, vk_image *src, const char *path) {
 void vk_depth_stats(renderer *r, vk_image *src, const char *what) {
     if (src->format != VK_FORMAT_D32_SFLOAT && src->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
     vk_buffer buf;
-    uint64_t n = (uint64_t)src->width * src->height;
+    uint64_t n = (uint64_t)vk_img_w(src) * vk_img_h(src);
     if (!readback(r, src, VK_IMAGE_ASPECT_DEPTH_BIT, 0, n * 4, &buf)) return;
     double sum = 0, hi = 0;
     uint64_t nonzero = 0;
@@ -2205,9 +2352,10 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
         (getenv("PS5C_SAVE_RAW_TEXTURES") && strstr(path, "tex_"));
     bool raw_integer = (src->format == VK_FORMAT_R32_UINT || src->format == VK_FORMAT_R32G32_UINT) && raw_requested;
     if (src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (!have_rgb && !raw_integer)) return;
-    uint32_t bpp = format_bytes(src->format), slices = src->depth > 1 ? src->depth : 1; /* 3D: the slices one below the other */
+    uint32_t bpp = vk_format_bytes(src->format), slices = src->depth > 1 ? src->depth : 1; /* 3D: the slices one below the other */
+    if (!bpp) return;
     vk_buffer buf;
-    uint64_t size = (uint64_t)src->width * src->height * slices * bpp;
+    uint64_t size = (uint64_t)vk_img_w(src) * vk_img_h(src) * slices * bpp;
     if (!vk_buffer_create(r, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, &buf)) return;
     VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = r->pool;
@@ -2224,8 +2372,8 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
     VkBufferImageCopy c = {0};
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     c.imageSubresource.layerCount = 1;
-    c.imageExtent.width = src->width;
-    c.imageExtent.height = src->height;
+    c.imageExtent.width = vk_img_w(src);
+    c.imageExtent.height = vk_img_h(src);
     c.imageExtent.depth = slices;
     vkCmdCopyImageToBuffer(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf.buffer, 1, &c);
     vk_check_work(r, vkEndCommandBuffer(cmd), "vkEndCommandBuffer (transfer)");
@@ -2256,7 +2404,7 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
         /* float statistics of channels R, G, B (debugging: values an 8-bit picture rounds to 0 or 255) */
         for (uint32_t ch = 0; ch < (src->format == VK_FORMAT_R32_SFLOAT ? 1u : src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? 3u : 4u); ch++) {
         double sum = 0, lo = 1e30, hi = -1e30;
-        uint64_t nonzero = 0, nans = 0, infs = 0, n = (uint64_t)src->width * src->height;
+        uint64_t nonzero = 0, nans = 0, infs = 0, n = (uint64_t)vk_img_w(src) * vk_img_h(src);
         for (uint64_t i = 0; i < n; i++) {
             float f;
             if (src->format == VK_FORMAT_R32_SFLOAT || src->format == VK_FORMAT_R32G32B32A32_SFLOAT) {
@@ -2292,8 +2440,8 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
               (unsigned long long)infs, (unsigned long long)n);
         }
     }
-    uint32_t step = src->width >= 1024 && !getenv("PS5C_SAVE_FULL") ? 4 : 1;
-    uint32_t w = src->width / step, h = src->height * slices / step, row = (w * 3 + 3) & ~3u;
+    uint32_t step = vk_img_w(src) >= 1024 && !getenv("PS5C_SAVE_FULL") ? 4 : 1;
+    uint32_t w = vk_img_w(src) / step, h = vk_img_h(src) * slices / step, row = (w * 3 + 3) & ~3u;
     uint8_t *bmp = w && h ? (uint8_t *)calloc(1, 54 + (size_t)row * h) : NULL;
     if (bmp) {
         uint32_t file = 54 + row * h, v;
@@ -2312,7 +2460,7 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
         for (uint32_t y = 0; y < h; y++) {
             uint8_t *o = bmp + 54 + (size_t)(h - 1 - y) * row;
             for (uint32_t x = 0; x < w; x++) {
-                texel_rgb(src->format, px + ((size_t)y * step * src->width + (size_t)x * step) * bpp, rgb);
+                texel_rgb(src->format, px + ((size_t)y * step * vk_img_w(src) + (size_t)x * step) * bpp, rgb);
                 o[3 * x] = rgb[2];
                 o[3 * x + 1] = rgb[1];
                 o[3 * x + 2] = rgb[0];
@@ -2517,7 +2665,7 @@ void renderer_hide_picture(renderer *r) {
 static vk_image *present_as_unorm(renderer *r, VkCommandBuffer cmd, vk_image *src) {
     vk_image *t = &r->present_tmp;
     VkFormat fmt = present_unorm_of(src->format);
-    if (t->image && (t->width != src->width || t->height != src->height || t->format != fmt)) {
+    if (t->image && (t->width != vk_img_w(src) || t->height != vk_img_h(src) || t->format != fmt)) {
         vk_check_work(r, vkDeviceWaitIdle(r->device), "vkDeviceWaitIdle (transfer)");
         vkDestroyImage(r->device, t->image, NULL);
         vkFreeMemory(r->device, t->memory, NULL);
@@ -2527,8 +2675,8 @@ static vk_image *present_as_unorm(renderer *r, VkCommandBuffer cmd, vk_image *sr
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = fmt;
-        ci.extent.width = src->width;
-        ci.extent.height = src->height;
+        ci.extent.width = vk_img_w(src);
+        ci.extent.height = vk_img_h(src);
         ci.extent.depth = 1;
         ci.mipLevels = 1;
         ci.arrayLayers = 1;
@@ -2546,8 +2694,8 @@ static vk_image *present_as_unorm(renderer *r, VkCommandBuffer cmd, vk_image *sr
             memset(t, 0, sizeof(*t));
             return NULL;
         }
-        t->width = src->width;
-        t->height = src->height;
+        t->width = vk_img_w(src);
+        t->height = vk_img_h(src);
         t->format = fmt;
         t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         t->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2559,12 +2707,301 @@ static vk_image *present_as_unorm(renderer *r, VkCommandBuffer cmd, vk_image *sr
     copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.srcSubresource.layerCount = 1;
     copy.dstSubresource = copy.srcSubresource;
-    copy.extent.width = src->width;
-    copy.extent.height = src->height;
+    copy.extent.width = vk_img_w(src);
+    copy.extent.height = vk_img_h(src);
     copy.extent.depth = 1;
     vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &copy);
     return t;
+}
+
+/* ---- FSR 1 upscale (EASU + RCAS) of the presented frame ----
+ * [geral] upscale_fsr=1, the default (PS5C_UPSCALE=fsr|linear): a frame smaller than the
+ * window goes up through AMD's FSR 1 passes instead of the bilinear blit.
+ * [geral] nitidez_fsr=0|1|2 (soft 0.75, normal 0.25, strong 0 stops) or
+ * PS5C_FSR_SHARPNESS=<stops>: RCAS strength, 0 sharpest. */
+#include "vk_fsr1_spv.h"
+
+static bool fsr_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PS5C_UPSCALE");
+        if (e && *e) on = !strcmp(e, "fsr") || !strcmp(e, "1");
+        else on = settings_get_int("geral", "upscale_fsr", 1) != 0;
+    }
+    return on != 0;
+}
+
+static float fsr_sharpness(void) {
+    static float stops = -1.0f;
+    if (stops < 0.0f) {
+        /* [geral] nitidez_fsr: 0 soft, 1 normal, 2 strong (the launcher's list) */
+        static const float levels[3] = {0.75f, 0.25f, 0.0f};
+        int64_t level = settings_get_int("geral", "nitidez_fsr", 1);
+        const char *e = getenv("PS5C_FSR_SHARPNESS");
+        stops = e && *e ? (float)atof(e) : levels[level >= 0 && level <= 2 ? level : 1];
+        if (stops < 0.0f) stops = 0.0f;
+    }
+    return stops;
+}
+
+static void fsr_image_free(renderer *r, vk_image *t) {
+    if (t->view) vkDestroyImageView(r->device, t->view, NULL);
+    if (t->image) vkDestroyImage(r->device, t->image, NULL);
+    if (t->memory) vkFreeMemory(r->device, t->memory, NULL);
+    memset(t, 0, sizeof(*t));
+}
+
+static bool fsr_image(renderer *r, vk_image *t, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage) {
+    if (t->image && t->width == w && t->height == h) return true;
+    if (t->image) {
+        vk_check_work(r, vkDeviceWaitIdle(r->device), "vkDeviceWaitIdle (upscale)");
+        fsr_image_free(r, t);
+    }
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = fmt;
+    ci.extent = (VkExtent3D){w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = usage;
+    VkMemoryRequirements req;
+    bool ok = vkCreateImage(r->device, &ci, NULL, &t->image) == VK_SUCCESS;
+    if (ok) vkGetImageMemoryRequirements(r->device, t->image, &req);
+    ok = ok && vk_alloc_memory(r, &req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &t->memory) &&
+         vkBindImageMemory(r->device, t->image, t->memory, 0) == VK_SUCCESS;
+    if (ok) {
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = t->image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = fmt;
+        vi.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ok = vkCreateImageView(r->device, &vi, NULL, &t->view) == VK_SUCCESS;
+    }
+    if (!ok) {
+        fsr_image_free(r, t);
+        return false;
+    }
+    t->width = w;
+    t->height = h;
+    t->format = fmt;
+    t->layers = t->levels = 1;
+    t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    t->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    t->stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    return true;
+}
+
+static bool fsr_init(renderer *r) {
+    if (r->fsr.ready || r->fsr.failed) return r->fsr.ready;
+    r->fsr.failed = true;
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(r->device, &si, NULL, &r->fsr.sampler) != VK_SUCCESS) return false;
+    const VkDescriptorType in_type[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    const uint32_t *code[2] = {fsr1_easu_spv, fsr1_rcas_spv};
+    const size_t code_size[2] = {sizeof(fsr1_easu_spv), sizeof(fsr1_rcas_spv)};
+    const uint32_t push_size[2] = {80, 32};
+    for (int i = 0; i < 2; i++) {
+        VkDescriptorSetLayoutBinding b[2] = {
+            {0, in_type[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                              .bindingCount = 2, .pBindings = b};
+        if (vkCreateDescriptorSetLayout(r->device, &li, NULL, &r->fsr.dsl[i]) != VK_SUCCESS) return false;
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size[i]};
+        VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &r->fsr.dsl[i], .pushConstantRangeCount = 1,
+                                         .pPushConstantRanges = &pr};
+        if (vkCreatePipelineLayout(r->device, &pi, NULL, &r->fsr.layout[i]) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = code_size[i],
+                                       .pCode = code[i]};
+        VkShaderModule m;
+        if (vkCreateShaderModule(r->device, &mi, NULL, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                     .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"};
+        ci.layout = r->fsr.layout[i];
+        VkResult res = vkCreateComputePipelines(r->device, VK_NULL_HANDLE, 1, &ci, NULL, &r->fsr.pipe[i]);
+        vkDestroyShaderModule(r->device, m, NULL);
+        if (res != VK_SUCCESS) return false;
+    }
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}};
+    VkDescriptorPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2,
+                                      .poolSizeCount = 2, .pPoolSizes = sizes};
+    if (vkCreateDescriptorPool(r->device, &pci, NULL, &r->fsr.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                      .descriptorPool = r->fsr.pool, .descriptorSetCount = 2, .pSetLayouts = r->fsr.dsl};
+    if (vkAllocateDescriptorSets(r->device, &ai, r->fsr.set) != VK_SUCCESS) return false;
+    r->fsr.failed = false;
+    r->fsr.ready = true;
+    return true;
+}
+
+static void fsr_destroy(renderer *r) {
+    fsr_image_free(r, &r->fsr.in);
+    fsr_image_free(r, &r->fsr.mid);
+    fsr_image_free(r, &r->fsr.out);
+    for (int i = 0; i < 2; i++) {
+        if (r->fsr.pipe[i]) vkDestroyPipeline(r->device, r->fsr.pipe[i], NULL);
+        if (r->fsr.layout[i]) vkDestroyPipelineLayout(r->device, r->fsr.layout[i], NULL);
+        if (r->fsr.dsl[i]) vkDestroyDescriptorSetLayout(r->device, r->fsr.dsl[i], NULL);
+    }
+    if (r->fsr.pool) vkDestroyDescriptorPool(r->device, r->fsr.pool, NULL);
+    if (r->fsr.sampler) vkDestroySampler(r->device, r->fsr.sampler, NULL);
+    if (r->fsr.timing) vkDestroyQueryPool(r->device, r->fsr.timing, NULL);
+    memset(&r->fsr, 0, sizeof(r->fsr));
+}
+
+static bool readback(renderer *r, vk_image *src, VkImageAspectFlags aspect, uint32_t layer, uint64_t size, vk_buffer *buf);
+
+/* An RGBA8 image at full size as a 24-bit BMP (PS5C_FSR_DUMP). */
+static void fsr_save(renderer *r, vk_image *img, const char *path) {
+    uint32_t w = img->width, h = img->height, row = (w * 3 + 3) & ~3u, file = 54 + row * h;
+    vk_buffer buf;
+    if (!readback(r, img, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint64_t)w * h * 4, &buf)) return;
+    uint8_t *bmp = (uint8_t *)calloc(1, file);
+    if (bmp) {
+        const uint8_t *px = (const uint8_t *)buf.mapped;
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                const uint8_t *p = px + ((size_t)y * w + x) * 4;
+                uint8_t *o = bmp + 54 + (size_t)(h - 1 - y) * row + x * 3;
+                o[0] = p[2], o[1] = p[1], o[2] = p[0];
+            }
+        uint32_t v;
+        bmp[0] = 'B', bmp[1] = 'M';
+        memcpy(bmp + 2, &file, 4);
+        v = 54, memcpy(bmp + 10, &v, 4);
+        v = 40, memcpy(bmp + 14, &v, 4);
+        memcpy(bmp + 18, &w, 4);
+        memcpy(bmp + 22, &h, 4);
+        uint16_t planes = 1, bits = 24;
+        memcpy(bmp + 26, &planes, 2);
+        memcpy(bmp + 28, &bits, 2);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(bmp, 1, file, f);
+            fclose(f);
+        }
+        free(bmp);
+    }
+    vk_buffer_destroy(r, &buf);
+}
+
+static uint32_t fsr_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+/* The [0, sw) x [0, sh) part of src at ow x oh: the image to copy 1:1 into the
+ * window, or NULL (the caller blits as before). */
+static vk_image *fsr_upscale(renderer *r, VkCommandBuffer cmd, vk_image *src, uint32_t sw, uint32_t sh, uint32_t ow,
+                             uint32_t oh) {
+    if (!fsr_init(r)) return NULL;
+    bool fresh = !r->fsr.in.image || r->fsr.in.width != sw || r->fsr.in.height != sh || !r->fsr.mid.image ||
+                 r->fsr.mid.width != ow || r->fsr.mid.height != oh;
+    if (!fsr_image(r, &r->fsr.in, sw, sh, VK_FORMAT_R8G8B8A8_UNORM,
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        !fsr_image(r, &r->fsr.mid, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT) ||
+        !fsr_image(r, &r->fsr.out, ow, oh, VK_FORMAT_R8G8B8A8_UNORM,
+                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        if (!r->fsr.logged) LOG_W(GPU, "FSR upscale: images for %ux%u -> %ux%u not created, bilinear instead", sw, sh, ow, oh);
+        r->fsr.logged = true;
+        return NULL;
+    }
+    if (fresh) { /* the sets name the images: rewritten only after vkDeviceWaitIdle (fsr_image) or at their first use */
+        VkDescriptorImageInfo ii[4] = {{r->fsr.sampler, r->fsr.in.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {VK_NULL_HANDLE, r->fsr.mid.view, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, r->fsr.mid.view, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, r->fsr.out.view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet wr[4];
+        for (int i = 0; i < 4; i++)
+            wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = r->fsr.set[i / 2],
+                                           .dstBinding = (uint32_t)(i & 1), .descriptorCount = 1,
+                                           .descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                    : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           .pImageInfo = &ii[i]};
+        vkUpdateDescriptorSets(r->device, 4, wr, 0, NULL);
+        LOG_I(GPU, "FSR upscale: %ux%u -> %ux%u (sharpness %.2f stops)", sw, sh, ow, oh, fsr_sharpness());
+    }
+    /* PS5C_GPU_STATS: GPU time of the upscale, from this slot's previous frame (its fence was waited) */
+    static int timing = -1;
+    if (timing < 0) {
+        timing = getenv("PS5C_GPU_STATS") != NULL;
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                    .queryCount = 2 * FRAMES_IN_FLIGHT};
+        if (timing && vkCreateQueryPool(r->device, &qi, NULL, &r->fsr.timing) != VK_SUCCESS) timing = 0;
+    }
+    uint32_t q = 2 * r->frame_index;
+    if (timing && r->fsr.timing_pending[r->frame_index]) {
+        uint64_t t[2];
+        if (vkGetQueryPoolResults(r->device, r->fsr.timing, q, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            VkPhysicalDeviceProperties pp;
+            vkGetPhysicalDeviceProperties(r->phys, &pp);
+            r->fsr.gpu_ns += (uint64_t)((double)(t[1] - t[0]) * pp.limits.timestampPeriod);
+            r->fsr.runs++;
+        }
+        uint64_t now = pal_time_ns();
+        if (now - r->fsr.last_log >= 1000000000ull && r->fsr.runs) {
+            LOG_I(GPU, "FSR upscale: %llu frames, %.2f ms of GPU each", (unsigned long long)r->fsr.runs,
+                  (double)r->fsr.gpu_ns / r->fsr.runs / 1e6);
+            r->fsr.gpu_ns = r->fsr.runs = 0;
+            r->fsr.last_log = now;
+        }
+    }
+    if (timing) {
+        vkCmdResetQueryPool(cmd, r->fsr.timing, q, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r->fsr.timing, q);
+        r->fsr.timing_pending[r->frame_index] = true;
+    }
+    /* the frame 1:1 into an RGBA8 image the shader samples (any presentable format, BGRA or 10-bit) */
+    vk_barrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vk_barrier(cmd, &r->fsr.in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit blit = {0};
+    blit.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.srcOffsets[1] = (VkOffset3D){(int32_t)sw, (int32_t)sh, 1};
+    blit.dstOffsets[1] = blit.srcOffsets[1];
+    vkCmdBlitImage(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->fsr.in.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    vk_barrier(cmd, &r->fsr.in, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vk_barrier(cmd, &r->fsr.mid, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    /* EASU constants (FsrEasuCon): input viewport sw x sh in an image of the same size */
+    float isx = (float)sw, isy = (float)sh, osx = (float)ow, osy = (float)oh;
+    uint32_t easu[20] = {
+        fsr_bits(isx / osx), fsr_bits(isy / osy), fsr_bits(0.5f * isx / osx - 0.5f), fsr_bits(0.5f * isy / osy - 0.5f),
+        fsr_bits(1.0f / isx), fsr_bits(1.0f / isy), fsr_bits(1.0f / isx), fsr_bits(-1.0f / isy),
+        fsr_bits(-1.0f / isx), fsr_bits(2.0f / isy), fsr_bits(1.0f / isx), fsr_bits(2.0f / isy),
+        fsr_bits(0.0f / isx), fsr_bits(4.0f / isy), 0, 0,
+        ow, oh, 0, 0};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->fsr.pipe[0]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->fsr.layout[0], 0, 1, &r->fsr.set[0], 0, NULL);
+    vkCmdPushConstants(cmd, r->fsr.layout[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(easu), easu);
+    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
+    vk_barrier(cmd, &r->fsr.mid, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vk_barrier(cmd, &r->fsr.out, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    uint32_t rcas[8] = {fsr_bits(exp2f(-fsr_sharpness())), 0, 0, 0, ow, oh, 0, 0};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->fsr.pipe[1]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->fsr.layout[1], 0, 1, &r->fsr.set[1], 0, NULL);
+    vkCmdPushConstants(cmd, r->fsr.layout[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rcas), rcas);
+    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
+    vk_barrier(cmd, &r->fsr.out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (timing) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r->fsr.timing, q + 1);
+    /* PS5C_FSR_DUMP=<n>: the n-th upscaled frame, before and after, to user/frames/fsr_in.bmp and fsr_out.bmp
+     * once its present is submitted (debugging aid: compare with a bilinear resize of fsr_in) */
+    static int dump = -1;
+    static uint32_t count;
+    if (dump < 0) dump = getenv("PS5C_FSR_DUMP") ? atoi(getenv("PS5C_FSR_DUMP")) : 0;
+    r->fsr.dump_now = dump > 0 && ++count == (uint32_t)dump;
+    return &r->fsr.out;
 }
 
 /* Host/GPU counters are sampled at 1 Hz only when visible, before the renderer
@@ -2907,9 +3344,10 @@ void renderer_present(renderer *r, const renderer_surface *s) {
             logged++;
             LOG_I(GPU, "present 0x%llx %ux%u: %s (format %d)", (unsigned long long)s->addr, s->width, s->height,
                   rendered ? "GPU image" : "guest memory", src ? (int)src->format : -1);
+            if (src && src->ext_w) LOG_I(GPU, "present source drawn at %ux%u (PS5C_RT_SCALE)", src->ext_w, src->ext_h);
         }
     }
-    if (src && !src->gpu_written) vk_upload_linear(r, f->cmd, &f->staging, src, s->addr, s->pitch * 4);
+    if (src && !src->gpu_written && !src->ext_w) vk_upload_linear(r, f->cmd, &f->staging, src, s->addr, s->pitch * 4);
     renderer_surface splash_surface;
     if (r->picture_on) { /* the intro covers everything */
         if (r->picture_dirty) {
@@ -2965,6 +3403,8 @@ void renderer_present(renderer *r, const renderer_surface *s) {
     VkClearColorValue black = {{0, 0, 0, 1}};
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(f->cmd, sc.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    /* the displayed part of the source: a PS5C_RT_SCALE target holds it smaller */
+    double src_fx = src ? (double)vk_img_w(src) / src->width : 1.0, src_fy = src ? (double)vk_img_h(src) / src->height : 1.0;
     if (src && present_unorm_of(src->format) != VK_FORMAT_UNDEFINED) src = present_as_unorm(r, f->cmd, src);
     if (src) {
         vk_barrier(f->cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
@@ -2981,9 +3421,30 @@ void renderer_present(renderer *r, const renderer_surface *s) {
         VkImageBlit blit = {0};
         blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         blit.srcSubresource.layerCount = 1;
-        blit.srcOffsets[1].x = (int32_t)s->width;
-        blit.srcOffsets[1].y = (int32_t)s->height;
+        blit.srcOffsets[1].x = (int32_t)(s->width * src_fx + 0.5);
+        blit.srcOffsets[1].y = (int32_t)(s->height * src_fy + 0.5);
         blit.srcOffsets[1].z = 1;
+        VkFilter filter = VK_FILTER_LINEAR;
+        /* PS5C_FSR_DUMP_SIZE=<w>x<h> (with PS5C_FSR_DUMP): upscale to that size for the saved
+         * pictures only; the window gets the bilinear blit (debugging aid, any window size) */
+        static int dump_w = -1, dump_h;
+        if (dump_w < 0) {
+            const char *e = getenv("PS5C_FSR_DUMP_SIZE");
+            dump_w = 0;
+            if (e && sscanf(e, "%dx%d", &dump_w, &dump_h) != 2) dump_w = 0;
+        }
+        if (dump_w > 0 && dump_h > 0 && s->width <= src->width && s->height <= src->height)
+            fsr_upscale(r, f->cmd, src, s->width, s->height, (uint32_t)dump_w, (uint32_t)dump_h);
+        else if (fsr_wanted() && w > 0 && h > 0 && ((uint32_t)w > s->width || (uint32_t)h > s->height) &&
+            s->width <= src->width && s->height <= src->height) {
+            vk_image *up = fsr_upscale(r, f->cmd, src, s->width, s->height, (uint32_t)w, (uint32_t)h);
+            if (up) { /* already at the window's size: a 1:1 copy */
+                src = up;
+                blit.srcOffsets[1].x = w;
+                blit.srcOffsets[1].y = h;
+                filter = VK_FILTER_NEAREST;
+            }
+        }
         blit.dstSubresource = blit.srcSubresource;
         blit.dstOffsets[0].x = x;
         blit.dstOffsets[0].y = y;
@@ -2991,7 +3452,7 @@ void renderer_present(renderer *r, const renderer_surface *s) {
         blit.dstOffsets[1].y = y + h;
         blit.dstOffsets[1].z = 1;
         vkCmdBlitImage(f->cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc.image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
     }
     panel_tick(r);
     panel_draw(r, f->cmd, sc.image, r->frame_index);
@@ -3010,6 +3471,12 @@ void renderer_present(renderer *r, const renderer_surface *s) {
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &r->sc_rendered[sc_index];
     VkResult submitted = vkQueueSubmit(r->queue, 1, &si, f->fence);
+    if (r->fsr.dump_now && submitted == VK_SUCCESS) {
+        r->fsr.dump_now = false;
+        fsr_save(r, &r->fsr.in, "user/frames/fsr_in.bmp");
+        fsr_save(r, &r->fsr.out, "user/frames/fsr_out.bmp");
+        LOG_I(GPU, "FSR upscale: frame saved to user/frames/fsr_in.bmp and fsr_out.bmp");
+    }
     vk_check_work(r, submitted, "vkQueueSubmit (present)");
 
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -3113,6 +3580,25 @@ renderer *renderer_create(pal_window *window, gmem *mem) {
         r->image_backing_limit = mb * 1024 * 1024;
         LOG_I(GPU, "GPU image backing: RAM budget %llu MiB (experimental)", (unsigned long long)mb);
     }
+    /* PS5C_RT_SCALE=<25..99> draws large targets at that share of their size (0: none);
+     * otherwise [geral] resolucao_interna caps their height when the game can't render at
+     * it itself (rt_scaled_size) */
+    const char *rt_scale = getenv("PS5C_RT_SCALE");
+    if (r->image_backing_limit) {
+    } else if (rt_scale && *rt_scale) {
+        if (atoi(rt_scale) >= 25 && atoi(rt_scale) < 100) {
+            r->rt_scale = (uint32_t)atoi(rt_scale);
+            LOG_I(GPU, "render targets of 960x540 and up drawn at %u%% (PS5C_RT_SCALE, experimental)", r->rt_scale);
+        }
+    } else if (settings_internal_height() && settings_internal_height_is_native()) {
+        LOG_I(GPU, "resolucao_interna: the game renders at %d lines itself", settings_internal_height());
+    } else if (settings_internal_height()) {
+        r->rt_scale = 100;
+        r->rt_cap = (uint32_t)settings_internal_height();
+        LOG_I(GPU, "render targets taller than %u lines drawn at that height when the game can't set it (resolucao_interna, experimental)",
+              r->rt_cap);
+    }
+    sh_set_rt_scale(r->rt_scale != 0);
     r->window = window;
     r->mem = mem;
     uint64_t t0 = pal_time_ns();
@@ -3140,6 +3626,7 @@ renderer *renderer_create(pal_window *window, gmem *mem) {
     if (ok) {
         vk_shader_cache_open(r);
         vk_pipeline_async_start(r);
+        vk_shader_cache_migration_end(); /* the pipeline list has taken what it needed */
     }
     uint64_t t1 = pal_time_ns();
     if (!ok) {
@@ -3189,6 +3676,7 @@ void renderer_destroy(renderer *r) {
         if (r->splash.image) vkDestroyImage(r->device, r->splash.image, NULL);
         if (r->splash.memory) vkFreeMemory(r->device, r->splash.memory, NULL);
         if (r->present_tmp.image) vkDestroyImage(r->device, r->present_tmp.image, NULL);
+        fsr_destroy(r);
         if (r->present_tmp.memory) vkFreeMemory(r->device, r->present_tmp.memory, NULL);
         vk_buffer_destroy(r, &r->splash_staging);
         if (r->picture.image) vkDestroyImage(r->device, r->picture.image, NULL);

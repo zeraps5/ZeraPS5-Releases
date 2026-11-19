@@ -24,6 +24,7 @@ typedef struct eq_event {
     /* EVFILT_TIMER: fires every period_ns from next_ns on; data counts the
      * expirations since the last delivery. Expired while the queue is waited on. */
     uint64_t period_ns, next_ns;
+    bool one_shot; /* HRTIMER: removed after its single delivery. */
 } eq_event;
 
 typedef struct equeue_obj {
@@ -74,19 +75,14 @@ static eq_event *find(equeue_obj *q, uint64_t ident, int16_t filter) {
     return NULL;
 }
 
-bool equeue_add(uint64_t handle, uint64_t ident, int16_t filter, uint64_t udata) {
-    equeue_obj *q = get(handle);
-    if (!q) return false;
-    pal_mutex_lock(q->lock);
+/* Caller holds q->lock, including the complete initialization of a timer. */
+static eq_event *add_locked(equeue_obj *q, uint64_t ident, int16_t filter) {
     eq_event *e = find(q, ident, filter);
     if (!e) {
         if (q->count == q->cap) {
             uint32_t cap = q->cap ? q->cap * 2 : 8;
             eq_event *n = (eq_event *)realloc(q->events, cap * sizeof(eq_event));
-            if (!n) {
-                pal_mutex_unlock(q->lock);
-                return false;
-            }
+            if (!n) return NULL;
             q->events = n;
             q->cap = cap;
         }
@@ -95,9 +91,17 @@ bool equeue_add(uint64_t handle, uint64_t ident, int16_t filter, uint64_t udata)
         e->ev.ident = ident;
         e->ev.filter = filter;
     }
-    e->ev.udata = udata;
+    return e;
+}
+
+bool equeue_add(uint64_t handle, uint64_t ident, int16_t filter, uint64_t udata) {
+    equeue_obj *q = get(handle);
+    if (!q) return false;
+    pal_mutex_lock(q->lock);
+    eq_event *e = q->closing ? NULL : add_locked(q, ident, filter);
+    if (e) e->ev.udata = udata;
     pal_mutex_unlock(q->lock);
-    return true;
+    return e != NULL;
 }
 
 bool equeue_remove(uint64_t handle, uint64_t ident, int16_t filter) {
@@ -161,6 +165,11 @@ static uint64_t expire_timers(equeue_obj *q, uint64_t now) {
     uint64_t next = UINT64_MAX;
     for (uint32_t i = 0; i < q->count; i++) {
         eq_event *e = &q->events[i];
+        if (e->one_shot) {
+            if (now >= e->next_ns) e->ready = true;
+            if (!e->ready && e->next_ns < next) next = e->next_ns;
+            continue;
+        }
         if (!e->period_ns) continue;
         if (now >= e->next_ns) {
             uint64_t n = (now - e->next_ns) / e->period_ns + 1;
@@ -174,15 +183,40 @@ static uint64_t expire_timers(equeue_obj *q, uint64_t now) {
 }
 
 bool equeue_add_timer(uint64_t handle, uint64_t ident, uint64_t period_ns, uint64_t udata) {
-    if (!period_ns || !equeue_add(handle, ident, EVFILT_TIMER_, udata)) return false;
     equeue_obj *q = get(handle);
+    if (!q || !period_ns) return false;
     pal_mutex_lock(q->lock);
-    eq_event *e = find(q, ident, EVFILT_TIMER_);
+    eq_event *e = q->closing ? NULL : add_locked(q, ident, EVFILT_TIMER_);
     if (e) {
+        e->ev.udata = udata;
         e->period_ns = period_ns;
         e->next_ns = pal_time_ns() + period_ns;
         e->ready = false;
         pal_cond_broadcast(q->changed); /* a waiter recomputes its wake-up time */
+    }
+    pal_mutex_unlock(q->lock);
+    return e != NULL;
+}
+
+static bool equeue_add_hrtimer(uint64_t handle, uint64_t ident, uint64_t delay_ns, uint64_t udata) {
+    equeue_obj *q = get(handle);
+    if (!q) return false;
+    pal_mutex_lock(q->lock);
+    eq_event *e = q->closing ? NULL : add_locked(q, ident, EVFILT_HRTIMER_);
+    if (e) {
+        e->ev.udata = udata;
+        uint64_t now = pal_time_ns();
+        e->next_ns = delay_ns > UINT64_MAX - now ? UINT64_MAX : now + delay_ns;
+        e->period_ns = 0;
+        e->one_shot = true;
+        e->ready = false;
+        e->ev.flags = 0x11; /* EV_ADD | EV_ONESHOT */
+        e->ev.fflags = 0;
+        e->ev.data = 0;
+        free(e->queue);
+        e->queue = NULL;
+        e->queued = e->queue_cap = 0;
+        pal_cond_broadcast(q->changed);
     }
     pal_mutex_unlock(q->lock);
     return e != NULL;
@@ -197,10 +231,15 @@ int equeue_wait(uint64_t handle, guest_kevent *out, int max, uint64_t timeout_ns
     for (;;) {
         if (q->closing) break;
         uint64_t timer = expire_timers(q, pal_time_ns());
-        for (uint32_t i = 0; i < q->count && n < max; i++) {
+        for (uint32_t i = 0; i < q->count && n < max;) {
             eq_event *e = &q->events[i];
-            if (!e->ready) continue;
+            if (!e->ready) { i++; continue; }
             out[n++] = e->ev;
+            if (e->one_shot) {
+                free(e->queue);
+                *e = q->events[--q->count];
+                continue; /* the swapped-in event has not been visited */
+            }
             e->ready = false; /* EV_CLEAR */
             e->ev.fflags = 0;
             if (e->queued) { /* the next queued event is ready at once */
@@ -208,6 +247,7 @@ int equeue_wait(uint64_t handle, guest_kevent *out, int max, uint64_t timeout_ns
                 memmove(e->queue, e->queue + 1, --e->queued * sizeof(int64_t));
                 e->ready = true;
             }
+            i++;
         }
         if (n > 0) break;
         uint64_t wake = timer < deadline ? timer : deadline;
@@ -320,6 +360,29 @@ static void delete_timer_event(hle_call *c) {
                                                                                              : SCE_KERNEL_ERROR_ENOENT_);
 }
 
+/* Relative timespec (two signed 64-bit fields), single EVFILT_HRTIMER expiry. */
+static void add_hrtimer_event(hle_call *c) {
+    int64_t ts[2];
+    if (!gmem_read(c->mem, hle_arg_ptr(c, 2), ts, sizeof(ts))) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EFAULT);
+        return;
+    }
+    if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000ll) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    uint64_t sec = (uint64_t)ts[0], ns = (uint64_t)ts[1];
+    uint64_t delay = sec > (UINT64_MAX - ns) / 1000000000ull
+                         ? UINT64_MAX : sec * 1000000000ull + ns;
+    hle_ret_s32(c, equeue_add_hrtimer(hle_arg(c, 0), (uint64_t)(int64_t)hle_arg_s32(c, 1), delay, hle_arg(c, 3))
+                       ? 0 : SCE_KERNEL_ERROR_EBADF);
+}
+
+static void delete_hrtimer_event(hle_call *c) {
+    hle_ret_s32(c, equeue_remove(hle_arg(c, 0), (uint64_t)(int64_t)hle_arg_s32(c, 1), EVFILT_HRTIMER_)
+                       ? 0 : SCE_KERNEL_ERROR_ENOENT_);
+}
+
 static const guest_kevent *event_arg(hle_call *c) {
     return (const guest_kevent *)hle_mem(c, hle_arg_ptr(c, 0), sizeof(guest_kevent));
 }
@@ -382,6 +445,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "sceKernelTriggerUserEvent", trigger_user_event),
     HLE_FUNC_ENTRY(K, "sceKernelAddTimerEvent", add_timer_event),
     HLE_FUNC_ENTRY(K, "sceKernelDeleteTimerEvent", delete_timer_event),
+    HLE_FUNC_ENTRY(K, "sceKernelAddHRTimerEvent", add_hrtimer_event),
+    HLE_FUNC_ENTRY(K, "sceKernelDeleteHRTimerEvent", delete_hrtimer_event),
     HLE_FUNC_ENTRY(K, "sceKernelGetEventId", get_event_id),
     HLE_FUNC_ENTRY(K, "sceKernelGetEventFilter", get_event_filter),
     HLE_FUNC_ENTRY(K, "sceKernelGetEventData", get_event_data),

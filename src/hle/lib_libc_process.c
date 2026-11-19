@@ -655,6 +655,14 @@ static void ftell_(hle_call *c) {
     stream *f = get_stream(c, hle_arg_ptr(c, 0));
     hle_ret_u64(c, f ? (uint64_t)sys(c, "lseek", (uint64_t)f->fd, 0, 1) : UINT64_MAX);
 }
+/* void rewind(FILE *): fseek(f, 0, SEEK_SET) and clear the error flag */
+static void rewind_(hle_call *c) {
+    stream *f = get_stream(c, hle_arg_ptr(c, 0));
+    if (f && sys(c, "lseek", (uint64_t)f->fd, 0, 0) >= 0) {
+        f->eof = false;
+        f->error = false;
+    }
+}
 static void fflush_(hle_call *c) {
     hle_ret_s32(c, !hle_arg_ptr(c, 0) || get_stream(c, hle_arg_ptr(c, 0)) ? 0 : -1);
 }
@@ -915,6 +923,9 @@ static const hle_export exports[] = {
     E("fwrite", fwrite_),
     E("fseek", fseek_),
     E("ftell", ftell_),
+    E("fseeko", fseek_), /* off_t is 64 bits: same as fseek/ftell here */
+    E("ftello", ftell_),
+    E("rewind", rewind_),
     E("fflush", fflush_),
     E("setvbuf", setvbuf_),
     E("ferror", ferror_),

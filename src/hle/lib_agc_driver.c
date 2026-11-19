@@ -784,6 +784,18 @@ static void get_reserved_dmem_for_agc(hle_call *c) {
  * Debug markers take no space (their packet size is 0). */
 static void ok_(hle_call *c) { hle_ret_s32(c, 0); }
 
+/* bool sceAgcDriverIsCaptureInProgress(void): no GPU capture tool is attached */
+static void capture_in_progress(hle_call *c) { hle_ret_u32(c, 0); }
+
+/* int sceAgcDriverRegisterWorkloadStream(uint32_t id, const void *stream): ids 1..31 with a
+ * 32-byte record (KytyPS5). Workload packets are not timed here, so nothing keeps it. */
+static void register_workload_stream(hle_call *c) {
+    uint32_t id = hle_arg_u32(c, 0);
+    if (id < 1 || id > 31) hle_ret_s32(c, (int32_t)0x8a6c0033); /* SCE_AGC_DRIVER_ERROR_INVALID_VALUE */
+    else if (!hle_arg_ptr(c, 1)) hle_ret_s32(c, (int32_t)0x8a6c0035); /* ..._INVALID_ARGUMENT */
+    else hle_ret_s32(c, 0);
+}
+
 /* int sceAgcDriverGetResourceRegistrationMaxNameLength(uint32_t *length): names of registered
  * owners and resources (debug tools) are at most this long */
 static void max_name_length(hle_call *c) {
@@ -998,6 +1010,24 @@ static void gnm_init_default_state(hle_call *c) {
     hle_ret_u32(c, sp.n);
 }
 
+/* u32 sceGnmDrawInitToDefaultContextState400(u32 *cmd, u64 dwords): the same default context
+ * state, the rest of the block filled with a NOP; returns the dwords used (the whole block).
+ * LEGO City Undercover (CUSA06549) calls it for every command buffer. */
+static void gnm_init_default_context400(hle_call *c) {
+    uint64_t room = hle_arg(c, 1);
+    uint32_t cap = room > 256 ? 256u : (uint32_t)room;
+    uint32_t *cmd = cap >= 64 ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 0), (uint64_t)cap * 4) : NULL;
+    gnm_init_default_state(c);
+    uint32_t used = (uint32_t)c->a->ret[0];
+    if (!cmd || !used || used > cap) return; /* the 0 from above */
+    if (cap - used >= 2) {
+        cmd[used] = 0xC0001000u | ((cap - used - 2) << 16); /* type 3 NOP over the rest */
+        memset(cmd + used + 1, 0, (size_t)(cap - used - 1) * 4);
+        used = cap;
+    }
+    hle_ret_u32(c, used);
+}
+
 /* int sceGnmDrawIndexAuto(u32 *cmd, u32 dwords, u32 count, u32 flags): DRAW_INDEX_AUTO, auto-index source */
 static void gnm_draw_index_auto(hle_call *c) {
     gnm_space sp;
@@ -1034,6 +1064,7 @@ static const hle_export k_gnm_exports[] = {
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmUpdatePsShader350", gnm_set_ps_shader),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawIndexAuto", gnm_draw_index_auto),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitDefaultHardwareState350", gnm_init_default_state),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitToDefaultContextState400", gnm_init_default_context400),
 };
 
 static const hle_export k_exports[] = {
@@ -1084,6 +1115,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverNotifyDefaultStates", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverTmpInitIdhs", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverIsPaDebug", ok_),
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverIsCaptureInProgress", capture_in_progress),
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverRegisterWorkloadStream", register_workload_stream),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverGetTraceInitiator", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverUserDataGetPacketSize", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverUserDataWritePacket", ok_),

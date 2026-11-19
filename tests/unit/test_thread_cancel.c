@@ -130,6 +130,47 @@ static void runs_cleanup_handlers(void) {
     teardown();
 }
 
+/* entry(block): pthread_key_create(&block[5], block[1]); pthread_setspecific(block[5], block[6]);
+ * if (block[4]) block[4](7) (pthread_exit); return 5;  block[2], [3] = create, setspecific.
+ * The destructor at +0x40 stores 42 through its value; libc's thread-exit hook at
+ * +0x60 sets block[9] = 1. */
+static const uint8_t k_specific[] = {0x53, 0x48, 0x89, 0xfb, 0x48, 0x8d, 0x7b, 0x28, 0x48, 0x8b, 0x73, 0x08,
+                                     0xff, 0x53, 0x10, 0x8b, 0x7b, 0x28, 0x48, 0x8b, 0x73, 0x30, 0xff, 0x53,
+                                     0x18, 0x48, 0x8b, 0x43, 0x20, 0x48, 0x85, 0xc0, 0x74, 0x07, 0xbf, 0x07,
+                                     0x00, 0x00, 0x00, 0xff, 0xd0, 0xb8, 0x05, 0x00, 0x00, 0x00, 0x5b, 0xc3};
+
+static void runs_exit_destructors(bool via_exit) {
+    setup();
+    uint8_t code[0x80] = {0};
+    memcpy(code, k_specific, sizeof(k_specific));
+    memcpy(code + 0x40, k_handler, sizeof(k_handler));
+    const uint8_t hook[] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc3};
+    memcpy(code + 0x60, hook, sizeof(hook));
+    uint64_t flag = BLOCK + 9 * 8;
+    memcpy(code + 0x62, &flag, 8);
+    load_code(code, sizeof(code));
+    put(1, g_page + 0x40);
+    put(2, stub("pthread_key_create"));
+    put(3, stub("pthread_setspecific"));
+    put(4, via_exit ? stub("pthread_exit") : 0);
+    put(5, 0);
+    put(6, BLOCK + 8 * 8);
+    put(8, 0);
+    put(9, 0);
+    g_rt->thread_dtors = g_page + 0x60;
+    guest_thread *t = NULL;
+    CHECK(runtime_start_thread(g_rt, g_page, BLOCK, 0, 0x10000, false, "dtors", &t) == 0);
+    uint64_t handle = (uint64_t)(uintptr_t)t, value = 0;
+    runtime_release_thread(g_rt, t);
+    CHECK(runtime_join_thread(g_rt, handle, &value) == 0);
+    CHECK_EQ_U64(value, via_exit ? 7 : 5);
+    CHECK_EQ_U64(get(8), 42); /* key destructor ran with the thread's value */
+    CHECK_EQ_U64(get(9), 1);  /* libc's thread_local destructors hook ran */
+    teardown();
+}
+static void destructors_on_return(void) { runs_exit_destructors(false); }
+static void destructors_on_pthread_exit(void) { runs_exit_destructors(true); }
+
 static uint64_t call(const char *lib, const char *name, guest_thread *self, uint64_t a0, uint64_t a1, uint64_t a2) {
     const hle_export *e = hle_find(lib, nid_hash_name(name));
     g_bad += !(e && e->fn);
@@ -175,7 +216,8 @@ static void state_and_errors(void) {
 int main(void) {
     if (pal_init() != PS5C_OK) return 2;
     const test_case tests[] = {TEST_CASE(state_and_errors), TEST_CASE(ends_at_a_cancellation_point),
-                               TEST_CASE(waits_while_disabled), TEST_CASE(runs_cleanup_handlers)};
+                               TEST_CASE(waits_while_disabled), TEST_CASE(runs_cleanup_handlers),
+                               TEST_CASE(destructors_on_return), TEST_CASE(destructors_on_pthread_exit)};
     int result = test_run_all("thread_cancel", tests, PS5C_ARRAY_COUNT(tests));
     pal_shutdown();
     return result;

@@ -191,6 +191,12 @@ void gmem_set_change_hook(void (*fn)(guest_addr addr, uint64_t size));
  * view is unmapped and mapped again (release runs) so that both views share every page. */
 void gmem_set_cow_hooks(void (*release)(guest_addr addr, uint64_t size, uint8_t *phys_copy),
                         bool (*aliased)(guest_addr addr, uint64_t size));
+/* Stops every guest thread but the calling one (true when it did) and lets them go again. The
+ * copy-on-write release runs between the two: a guest write that lands between the copy of a
+ * private page and the unmap of its view would be lost, and a guest access to a neighbour part
+ * of the view while it is being placed again would fault. Nothing between stop and resume may
+ * take a lock a guest thread can hold (heap, log, runtime locks). */
+void gmem_set_world_hooks(bool (*stop)(void *user), void (*resume)(void *user), void *user);
 /* Another backed view than the one at `self` shows physical memory of [phys, phys + size). */
 bool gmem_phys_aliased(gmem *m, guest_addr self, uint64_t phys, uint64_t size);
 /* The host's view of the whole physical memory object (NULL: none). */

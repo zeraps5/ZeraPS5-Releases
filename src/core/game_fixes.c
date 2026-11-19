@@ -48,6 +48,7 @@ static const uint8_t k_tmnt_framebuffer[] = {
 static bool tmnt_framebuffer(uint8_t *at) {
     const int internal = settings_internal_height();
     if (!internal) return false;
+    settings_internal_height_native();
     const uint32_t h = (uint32_t)internal, w = h * 16 / 9;
     memcpy(at + 2, &w, 4);
     memcpy(at + 8, &h, 4);
@@ -88,6 +89,7 @@ static const uint8_t k_origins_display[] = { /* hiteR+0x8cc70f..0x8cc7c0 */
 static bool origins_display(uint8_t *at) {
     const int internal = settings_internal_height();
     if (settings_output_4k() && !internal) return false; /* 4K output: the game's own size */
+    if (internal) settings_internal_height_native();
     const uint32_t h = internal ? (uint32_t)internal : 1080, w = h * 16 / 9;
     /* +0x07: jmp +0x84; then the original r8/r9 loads (back here from +0xa4) */
     static const uint8_t site[14] = {0xeb, 0x7b, 0x4c, 0x8b, 0x43, 0x28, 0x4c, 0x8b, 0x4b, 0x30, 0x90, 0x90, 0x90, 0x90};
@@ -103,6 +105,41 @@ static bool origins_display(uint8_t *at) {
     memcpy(at + 0x39, scene, sizeof(scene));
     memcpy(at + 0x07, site, sizeof(site));
     return true;
+}
+
+guest_addr game_longshot_allocator_rva(const loaded_module *m) {
+    /* The v0.1.3 PS5 host uses VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE)
+     * from its first-touch handler. Check both the function entry and the
+     * small-commit branch before calling this private function. */
+    static const guest_addr allocator = 0x8fc20;
+    static const uint8_t entry[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+        0x53, 0x50, 0x48, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t small_commit[] = {
+        0x48, 0x81, 0xfe, 0xff, 0xff, 0xff, 0x03, 0x0f, 0x87, 0xc1, 0x02, 0x00, 0x00,
+        0x85, 0xc0, 0x0f, 0x84, 0xb9, 0x02, 0x00, 0x00,
+    };
+    char title[32], version[32];
+    if (!m || !m->is_main || !m->name || strcmp(m->name, "eboot") || getenv("PS5C_NO_GAME_FIXES") ||
+        !settings_param_string("titleId", title, sizeof(title)) || strcmp(title, "PPSA99025") ||
+        !settings_param_string("contentVersion", version, sizeof(version)) || strcmp(version, "01.000.000"))
+        return 0;
+    for (uint32_t i = 0; i < m->img.segment_count; i++) {
+        const sce_segment *seg = &m->img.segments[i];
+        if (seg->h.p_type != PT_LOAD || !(seg->h.p_flags & PF_X) || !seg->has_data ||
+            seg->h.p_vaddr > allocator || seg->data_off > m->img.file_size)
+            continue;
+        uint64_t off = allocator - seg->h.p_vaddr;
+        uint64_t span = 0xd5 + sizeof(small_commit);
+        uint64_t available = PS5C_MIN(seg->h.p_filesz, m->img.file_size - seg->data_off);
+        if (off <= available && span <= available - off) {
+            const uint8_t *code = m->img.file + seg->data_off + off;
+            if (!memcmp(code, entry, sizeof(entry)) && !memcmp(code + 0xd5, small_commit, sizeof(small_commit)))
+                return allocator;
+        }
+    }
+    return 0;
 }
 
 static const game_fix k_fixes[] = {

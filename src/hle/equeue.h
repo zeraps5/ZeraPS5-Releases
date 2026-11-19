@@ -15,6 +15,7 @@
 #define EVFILT_USER_ (-11)
 #define EVFILT_VIDEO_OUT_ (-13)
 #define EVFILT_GRAPHICS_ (-14)
+#define EVFILT_HRTIMER_ (-15)
 /* APR completions have their own filter, independent of user events. */
 #define EVFILT_AMPR_ (-25)
 

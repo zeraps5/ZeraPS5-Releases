@@ -62,6 +62,13 @@ static void app_content_temporary_data_mount2(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
+/* int sceAppContentTemporaryDataFormat(const SceAppContentMountPoint *mount_point) and
+ * sceAppContentTemporaryDataUnmount(same): /temp0 is a host folder that stays mounted;
+ * formatting leaves its files (a cache the game rewrites), as KytyPS5 does */
+static void app_content_temporary_data_keep(hle_call *c) {
+    hle_ret_s32(c, hle_arg_ptr(c, 0) ? 0 : (int32_t)0x80D90002);
+}
+
 /* int sceAppContentDownloadDataGetAvailableSpaceKb(const SceAppContentMountPoint *mp,
  * size_t *kb): the quota param.json grants (downloadDataSize, MiB), 0 without one */
 static void app_content_download_space(hle_call *c) {
@@ -315,6 +322,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentInitialize", app_content_initialize),
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentAppParamGetInt", app_content_param_get_int),
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentTemporaryDataMount2", app_content_temporary_data_mount2),
+    HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentTemporaryDataFormat", app_content_temporary_data_keep),
+    HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentTemporaryDataUnmount", app_content_temporary_data_keep),
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentDownloadDataGetAvailableSpaceKb", app_content_download_space),
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentTemporaryDataGetAvailableSpaceKb", app_content_temporary_space),
     HLE_FUNC_ENTRY("libSceAppContent", "sceAppContentAddcontMount", app_content_addcont_mount),

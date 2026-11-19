@@ -64,11 +64,20 @@ typedef struct vk_image {
     bool color_attachment; /* format and allocation support color attachment use */
     bool mutable_fmt; /* views may reinterpret the bits as the same-size formats of vk_alias_formats */
     bool gpu_written; /* rendered by the GPU: guest memory is stale */
+    bool drawn_to;    /* used as a color or depth attachment at least once */
+    uint32_t ext_w, ext_h; /* PS5C_RT_SCALE: the smaller host extent it is drawn at (0: width x height) */
     uint64_t written_seq; /* order of the last GPU write (renderer write_seq) */
     uint64_t last_use;    /* renderer use_seq of the last batch that used it (eviction) */
     uint64_t phys;        /* offset in direct memory when addr is a view of it (VK_NO_PHYS: none): another
                            * view of the same memory is the same image (Sonic samples its depth there) */
     struct vk_image *feedback; /* private sampled copy, outside the guest surface cache */
+    /* Since the feedback copy was last made (at rect_base), only draws wrote, within rect
+     * {x0, y0, x1, y1} (empty when x1 <= x0), up to rect_seq: the next copy takes that much.
+     * PS1HD samples the 4096x2048 VRAM it draws to, each draw a little of it. Any other
+     * write (transfer or storage) clears rect_valid. Single-level 2D color images only. */
+    bool rect_valid;
+    uint64_t rect_base, rect_seq;
+    int32_t rect[4];
     bool expanded_srgb; /* private RGBA8 copy of an R/RG UNORM source, sampled through sRGB */
     VkImageView ds_view; /* depth+stencil formats: the attachment view (view samples the depth only) */
     VkImageView stencil_view; /* its stencil read as an 8-bit unsigned texture (made on first use) */
@@ -80,6 +89,10 @@ typedef struct vk_image {
 /* Depth formats with a stencil aspect: attachments and layout changes cover
  * both aspects, while copies and sampling use the depth one (img->aspect). */
 static inline bool vk_format_has_stencil(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+
+/* The host image's extent: width x height, or the smaller one of a scaled render target */
+static inline uint32_t vk_img_w(const vk_image *i) { return i->ext_w ? i->ext_w : i->width; }
+static inline uint32_t vk_img_h(const vk_image *i) { return i->ext_h ? i->ext_h : i->height; }
 
 #define VK_NO_PHYS UINT64_MAX
 
@@ -128,6 +141,11 @@ struct renderer {
     bool dyn_state;
     /* Vulkan 1.3 dynamic rendering (PS5C_VK_DYNRENDER=0: render passes and framebuffers) */
     bool dyn_render;
+    /* PS5C_RT_SCALE=<percent> (experimental): new large color/depth targets are drawn at that share
+     * of their size (vk_pipeline.c sets scale_new while it creates them); 0 off */
+    uint32_t rt_scale;
+    uint32_t rt_cap; /* resolucao_interna: targets taller than this drawn at it (rt_scale 100) */
+    bool scale_new;
     /* VK_KHR_push_descriptor (PS5C_VK_PUSH=0: a descriptor set allocated and updated per draw) */
     uint32_t push_max; /* 0: off; else the most descriptors a pushed set may hold */
     PFN_vkCmdPushDescriptorSetKHR push_descriptor_set;
@@ -229,6 +247,19 @@ struct renderer {
     vk_image splash;
     vk_buffer splash_staging; /* its texels until the first present uploads them */
     vk_image present_tmp; /* an integer frame copied as UNORM for the blit (present_as_unorm) */
+    struct { /* FSR 1 upscale of the presented frame (vk_renderer.c fsr_upscale) */
+        VkSampler sampler;
+        VkDescriptorSetLayout dsl[2];
+        VkPipelineLayout layout[2];
+        VkPipeline pipe[2];
+        VkDescriptorPool pool;
+        VkDescriptorSet set[2];
+        vk_image in, mid, out; /* the frame at its size, EASU at the output size, RCAS at the output size */
+        VkQueryPool timing; /* PS5C_GPU_STATS: two timestamps per frame slot */
+        uint64_t gpu_ns, runs, last_log;
+        bool timing_pending[2];
+        bool ready, failed, logged, dump_now;
+    } fsr;
     bool splash_on, splash_uploaded;
     /* a picture over everything (renderer_show_picture) */
     vk_image picture;
@@ -258,12 +289,18 @@ void vk_save_depth(renderer *r, vk_image *src, const char *path);
  * batch completed. Images start without it: mutable formats cost the driver's
  * compression (KAGE lost a third of its frame rate on Iris Xe). */
 bool vk_image_promote(renderer *r, vk_image *img);
+/* PS5C_RT_SCALE: a full-size color target becomes a scaled one (false: not eligible) */
+bool vk_image_rescale(renderer *r, vk_image *img);
 void vk_pipeline_counts(renderer *r, uint64_t *draws, uint64_t *dispatches);
 /* Internal diagnostics: retained allocation bytes and successful snapshot bindings. */
 void vk_readonly_cache_counts(renderer *r, uint64_t *bytes, uint64_t *uses);
 void vk_buffer_destroy(renderer *r, vk_buffer *b);
 /* The pre-draw contents of a depth attachment that the draw also samples. */
 vk_image *vk_image_feedback(renderer *r, vk_image *source);
+/* Feedback copies made (PS5C_GPU_STATS reports them each second) */
+extern uint64_t g_vk_feedback_copies, g_vk_feedback_bytes;
+/* A draw wrote img within x0..x1, y0..y1 (its scissor); prev_seq: img->written_seq before it */
+void vk_image_note_draw(vk_image *img, uint64_t prev_seq, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
 /* Independent GPU snapshot. Destroy only after its last command completed. */
 vk_image *vk_image_snapshot(renderer *r, vk_image *source);
 void vk_image_snapshot_destroy(renderer *r, vk_image *snapshot);
@@ -311,6 +348,8 @@ void vk_upload_linear(renderer *r, VkCommandBuffer cmd, vk_buffer *staging, vk_i
 VkCommandBuffer vk_begin(renderer *r);
 void vk_flush(renderer *r);
 VkResult vk_work_wait(renderer *r, uint64_t timeout_ns);
+VkResult vk_work_wait_slot(renderer *r, uint32_t slot, uint64_t timeout_ns);
+bool vk_work_slot_done(renderer *r, uint32_t slot);
 void vk_diagnostic_checkpoint(renderer *r, uint32_t kind, uint64_t a, uint64_t b, uint64_t ha, uint64_t hb);
 /* vk_pipeline.c hooks: recording starts (the previous batch is complete, so
  * per-batch resources can be reused) and ends (open render passes close). */

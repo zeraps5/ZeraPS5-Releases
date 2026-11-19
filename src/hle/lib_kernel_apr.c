@@ -31,6 +31,10 @@ int64_t kernel_fs_stat_host(hle_call *c, const char *host, guest_addr out_addr);
 #define E_NOMEM 12
 #define MAX_PATH_ 1024
 
+/* Add/DeleteAmprEvent take int32_t ids, but records store their raw 32 bits.
+ * Completions must use the same sign-extended key as registration. */
+static uint64_t ampr_event_ident(uint32_t id) { return (uint64_t)(int32_t)id; }
+
 typedef struct apr_file {
     uint32_t id;
     uint64_t size;
@@ -469,7 +473,7 @@ static bool execute_ampr(hle_call *c, guest_addr cb, const uint8_t *r, int32_t *
         break;
     case AMPR_OP_RESET_GS: gs_set(cb, 0, 0, 0); return true;
     case AMPR_OP_EVENT:
-        if (!equeue_push(q1, w[1], EVFILT_AMPR_, (int64_t)q2))
+        if (!equeue_push(q1, ampr_event_ident(w[1]), EVFILT_AMPR_, (int64_t)q2))
             LOG_W(KERNEL, "apr: event %u on queue 0x%llx is not registered", w[1],
                   (unsigned long long)q1);
         return true;
@@ -576,7 +580,7 @@ static void execute_records(hle_call *c, guest_addr cb, const uint8_t *rec, uint
             memcpy(w, rec + off, 12);
             memcpy(&ev_data, rec + off + 12, 8);
             uint64_t eq = w[1] | (uint64_t)(w[0] >> 16) << 32;
-            if (!equeue_push(eq, w[2], EVFILT_AMPR_, ev_data)) {
+            if (!equeue_push(eq, ampr_event_ident(w[2]), EVFILT_AMPR_, ev_data)) {
                 LOG_W(KERNEL, "apr: event %u on queue 0x%llx is not registered", w[2],
                       (unsigned long long)eq);
             }
@@ -876,12 +880,12 @@ static void submit_and_get_result(hle_call *c) {
 /* int sceKernelAddAmprEvent(SceKernelEqueue eq, int id, void *udata): completion
  * events that command buffers raise (record 0x08). */
 static void add_ampr_event(hle_call *c) {
-    bool ok = equeue_add(hle_arg(c, 0), (uint64_t)hle_arg_s32(c, 1), EVFILT_AMPR_, hle_arg(c, 2));
+    bool ok = equeue_add(hle_arg(c, 0), ampr_event_ident(hle_arg_u32(c, 1)), EVFILT_AMPR_, hle_arg(c, 2));
     hle_ret_s32(c, ok ? 0 : (int32_t)0x80020009); /* EBADF */
 }
 
 static void delete_ampr_event(hle_call *c) {
-    bool ok = equeue_remove(hle_arg(c, 0), (uint64_t)hle_arg_s32(c, 1), EVFILT_AMPR_);
+    bool ok = equeue_remove(hle_arg(c, 0), ampr_event_ident(hle_arg_u32(c, 1)), EVFILT_AMPR_);
     hle_ret_s32(c, ok ? 0 : (int32_t)0x80020002); /* ENOENT */
 }
 

@@ -202,7 +202,28 @@ static void pgd_terminate(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
-/* ---- web browser dialog: closed by the user (lib_dialogs.c keeps status NONE) ---- */
+/* ---- web browser dialog: closed by the user at once ----
+ * Open finishes the dialog, so a game polling the status after Open (an EULA or
+ * web page) sees FINISHED instead of NONE forever. */
+
+static int32_t g_web;
+
+static void wb_initialize(hle_call *c) {
+    g_web = DIALOG_INITIALIZED;
+    hle_ret_s32(c, 0);
+}
+
+static void wb_open(hle_call *c) {
+    g_web = DIALOG_FINISHED;
+    hle_ret_s32(c, 0);
+}
+
+static void wb_status(hle_call *c) { hle_ret_s32(c, g_web); }
+
+static void wb_terminate(hle_call *c) {
+    g_web = DIALOG_NONE;
+    hle_ret_s32(c, 0);
+}
 
 static void wb_result(hle_call *c) {
     put_s32(c, hle_arg_ptr(c, 0), RESULT_USER_CANCELED);
@@ -417,10 +438,12 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(PGD, "scePlayGoDialogGetResult", pgd_result),
     HLE_FUNC_ENTRY(PGD, "scePlayGoDialogClose", ok),
     HLE_FUNC_ENTRY(PGD, "scePlayGoDialogTerminate", pgd_terminate),
-    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogInitialize", ok),
-    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogTerminate", ok),
-    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogOpen", ok),
-    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogOpenForPredeterminedContent", ok),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogInitialize", wb_initialize),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogTerminate", wb_terminate),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogOpen", wb_open),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogOpenForPredeterminedContent", wb_open),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogGetStatus", wb_status),
+    HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogUpdateStatus", wb_status),
     HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogClose", ok),
     HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogGetResult", wb_result),
     HLE_FUNC_ENTRY(WB, "sceWebBrowserDialogResetCookie", ok),

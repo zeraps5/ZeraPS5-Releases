@@ -44,6 +44,7 @@
 #include "gpu/vk/vk_descriptor_plan.h"
 #include "gpu/vk/vk_spirv_bindings.h"
 #include "gpu/vk/vk_image_formats.h"
+#include "gpu/vk/vk_phys_import.h"
 #include "gpu/vk/vk_packed_formats.h"
 #include "gpu/vk/vk_depth_policy.h"
 #include "gpu/vk/vk_color_target.h"
@@ -264,6 +265,50 @@ void vk_stat_work_slot(bool rotated) {
 }
 uint64_t vk_stat_now(void) { return stat_now(); }
 
+/* PS5C_SCALE_CENSUS=1 (with PS5C_GPU_STATS=1): each second, how shaders and copies touch
+ * large images (at least 960x540), split by whether they were drawn to as attachments.
+ * Groundwork for a generic internal resolution: what would have to follow a smaller image. */
+static int g_census = -1;
+static uint32_t g_census_op[2][3][6]; /* [drawn to][PS, CS, other][sample, gather, load, store, resinfo, other] */
+static uint32_t g_census_draws, g_census_pos, g_census_copy[6];
+static const char *const k_census_copy[6] = {"upload", "copy_from", "copy_to_buffer", "blit", "mip_chain", "linear"};
+static bool census_on(void) {
+    if (g_census < 0) {
+        const char *e = getenv("PS5C_SCALE_CENSUS");
+        g_census = e && *e == '1';
+    }
+    return g_census > 0;
+}
+static bool census_large(const vk_image *img) { return img && img->width >= 960 && img->height >= 540; }
+static void census_image(const vk_image *img, uint32_t stage, uint32_t op) {
+    if (!census_on() || !census_large(img)) return;
+    int c = op == SH_OP_IMAGE_SAMPLE ? 0 : op == SH_OP_IMAGE_GATHER4 ? 1 : op == SH_OP_IMAGE_LOAD ? 2
+          : op == SH_OP_IMAGE_STORE ? 3 : op == SH_OP_IMAGE_GET_RESINFO ? 4 : 5;
+    g_census_op[img->drawn_to][stage == SH_STAGE_PS ? 0 : stage == SH_STAGE_CS ? 1 : 2][c]++;
+}
+static void census_copy(const vk_image *img, int where) {
+    if (census_on() && census_large(img) && img->drawn_to) g_census_copy[where]++;
+}
+static void census_report(void) {
+    if (!census_on()) return;
+    char line[700];
+    int n = snprintf(line, sizeof(line), "draws to large targets %u (%u read the pixel position)", g_census_draws, g_census_pos);
+    static const char *const stages[3] = {"PS", "CS", "other"};
+    for (int d = 1; d >= 0; d--)
+        for (int s = 0; s < 3; s++) {
+            const uint32_t *o = g_census_op[d][s];
+            if (!(o[0] | o[1] | o[2] | o[3] | o[4] | o[5])) continue;
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "; %s %s: sample %u gather %u load %u store %u resinfo %u other %u",
+                          d ? "targets" : "images", stages[s], o[0], o[1], o[2], o[3], o[4], o[5]);
+        }
+    for (int i = 0; i < 6; i++)
+        if (g_census_copy[i]) n += snprintf(line + n, sizeof(line) - (size_t)n, "; %s %u", k_census_copy[i], g_census_copy[i]);
+    LOG_I(GPU, "scale census: %s", line);
+    memset(g_census_op, 0, sizeof(g_census_op));
+    memset(g_census_copy, 0, sizeof(g_census_copy));
+    g_census_draws = g_census_pos = 0;
+}
+
 static void stat_report(renderer *r) {
     if (!g_stats_on) return;
     uint64_t now = pal_time_ns();
@@ -278,9 +323,13 @@ static void stat_report(renderer *r) {
           line, (double)g_stat_bytes / 1048576.0, (unsigned long long)g_stat_held, (unsigned long long)g_stat_held_forced,
           (unsigned long long)g_stat_held_ordered, (unsigned long long)g_stat_partial, (unsigned long long)g_stat_patched);
     g_stat_held = g_stat_held_forced = g_stat_held_ordered = g_stat_partial = g_stat_patched = 0;
+    census_report();
     LOG_I(GPU, "access scopes: %llu, pinning %.1f ms, %llu after a mapping change", (unsigned long long)g_stat_pins,
           (double)g_stat_pin_ns / 1e6, (unsigned long long)g_stat_map_epochs);
     g_stat_pins = g_stat_pin_ns = g_stat_map_epochs = 0;
+    if (g_vk_feedback_copies)
+        LOG_I(GPU, "feedback copies: %llu, %.1f MB", (unsigned long long)g_vk_feedback_copies, (double)g_vk_feedback_bytes / 1048576.0);
+    g_vk_feedback_copies = g_vk_feedback_bytes = 0;
     if (g_stat_stencil_draws)
         LOG_I(GPU, "stencil: %llu draws test or write it, DB_STENCIL_INFO %08llx",
               (unsigned long long)g_stat_stencil_draws, (unsigned long long)g_stat_stencil_info);
@@ -357,6 +406,7 @@ static void stat_report(renderer *r) {
           g_stat_copy_by[0] / 1048576.0, g_stat_copy_by[1] / 1048576.0, g_stat_copy_by[2] / 1048576.0,
           g_stat_copy_by[3] / 1048576.0, g_stat_copy_by[4] / 1048576.0);
     if (g_stat_patch_shared) LOG_I(GPU, "patched reads shared: %llu", (unsigned long long)g_stat_patch_shared);
+    phys_import_stats();
     g_stat_patch_shared = 0;
     memset(g_stat_copy_by, 0, sizeof(g_stat_copy_by));
     if (g_stat_vc_hits || g_stat_vc_copies || g_stat_vc_skips)
@@ -438,6 +488,7 @@ typedef struct guest_shader {
 typedef struct fused_shader {
     guest_addr es, gs;
     uint32_t *code, dwords; /* the joined code (front, then back) */
+    uint32_t front_words; /* nonzero for a separately linked pixel epilog */
     uint64_t checked_epoch;
     sh_program *prog;
     bool ok;
@@ -492,6 +543,7 @@ typedef struct writeback {
      * dependencies/completion; mode 2 verifies the proof without pruning. */
     uint64_t scope_lo,scope_hi;
     uint8_t scope_mode;
+    uint8_t slot; /* the work slot whose batch produces the results (its arena holds them) */
 } writeback;
 
 static bool wb_scope_valid(const writeback *w) {
@@ -711,6 +763,7 @@ typedef struct texture_cpu_source {
 typedef struct held_release {
     gpu *g;
     gpu_release rel;
+    uint8_t slot; /* performed once that work slot's batch completes */
 } held_release;
 
 #define WORK_EXTRA_POOLS 15
@@ -789,8 +842,9 @@ typedef struct vk_pipelines {
     uint32_t cur_dyn[8]; /* gfx_dyn last set (r->dyn_state) */
     bool cur_dyn_valid;
     writeback wb[MAX_WRITEBACKS];
-    uint8_t *wb_originals; /* optional, bounded CPU scratch; never bound to the GPU */
-    uint64_t wb_original_used;
+    uint8_t *wb_originals[2]; /* optional, bounded CPU scratch per work slot; never bound to the GPU */
+    uint64_t wb_original_used[2];
+    bool cross_slot; /* the batch reads results in the other slot's arena: that slot must not be reused under it */
     bool writeback_oom; /* no GPU store may be published without its CPU snapshot */
     uint32_t wb_count;
     uint64_t batch;
@@ -802,6 +856,7 @@ typedef struct vk_pipelines {
     uint64_t tex_hash[VK_MAX_IMAGES]; /* guest contents hash of the last upload, per cached image (0: none) */
     uint64_t tex_checked[VK_MAX_IMAGES]; /* epoch in which the guest contents were last compared */
     bool tex_dynamic[VK_MAX_IMAGES]; /* large texture the CPU rewrote after its upload: hashed whole */
+    uint16_t tex_dynamic_still[VK_MAX_IMAGES]; /* whole hashes in a row that found a dynamic texture unchanged */
     uint64_t *tex_scan[VK_MAX_IMAGES]; /* texture_scan: hash per 64 KiB slice of a large texture's memory */
     uint32_t tex_scan_count[VK_MAX_IMAGES], tex_scan_next[VK_MAX_IMAGES];
     texture_cpu_source tex_cpu[VK_MAX_IMAGES];
@@ -1514,6 +1569,7 @@ void vk_pipeline_shutdown(renderer *r) {
     vk_pipelines *P = r->pipes;
     if (!P) return;
     large_import_cache_drop(r);
+    phys_import_drop(r);
     for (uint32_t i = 0; i < P->pipe_count; i++) {
         if (P->pipes[i].shared) continue;
         if (P->pipes[i].pipe) vkDestroyPipeline(r->device, P->pipes[i].pipe, NULL);
@@ -1544,7 +1600,8 @@ void vk_pipeline_shutdown(renderer *r) {
     free_dispatch_stage(P->dispatch_stage);
     free(P->depth_clear_ps);
     for(uint32_t i=0;i<P->wb_count;i++)if(!P->wb[i].orig_pooled)free(P->wb[i].orig);
-    free(P->wb_originals);
+    free(P->wb_originals[0]);
+    free(P->wb_originals[1]);
     for (uint32_t i = 0; i < VK_MAX_IMAGES; i++) free(P->tex_scan[i]);
     for (uint32_t i = 0; i < PS5C_ARRAY_COUNT(P->cs_bl); i++) free(P->cs_bl[i]);
     resident_shutdown(r);
@@ -1682,10 +1739,27 @@ static void wb_merge(uint8_t *dst, const uint8_t *src, const uint8_t *orig, uint
 
 static void resident_apply(renderer *r, writeback *w);
 static void resident_release_wb(vk_pipelines *P, writeback *w);
+static uint32_t work_slot(const vk_pipelines *P) { return (uint32_t)(P->work - P->work_slots); }
 
-static void apply_writebacks(renderer *r) {
+/* Results of one work slot (`slot`), or of every batch (-1). A slot's entries
+ * come first in the lists: its batch was submitted before the other one. */
+static void apply_writebacks_of(renderer *r, int slot) {
     vk_pipelines *P = r->pipes;
-    bool own_access = !r->guest_access.pinned && (P->wb_count || P->htile_check_count || P->dcc_check_count);
+    uint32_t wb_n = 0, held_n = 0;
+    if (slot < 0) {
+        wb_n = P->wb_count;
+        held_n = P->held_count;
+        /* the caller waited for the current slot; results of the other one come from an earlier submit */
+        uint32_t other = work_slot(P) ^ 1;
+        bool older = false;
+        for (uint32_t i = 0; i < wb_n && !older; i++) older = P->wb[i].slot == other;
+        for (uint32_t i = 0; i < held_n && !older; i++) older = P->held[i].slot == other;
+        if (older) vk_check_work(r, vk_work_wait_slot(r, other, UINT64_MAX), "vkWaitForFences (older writebacks)");
+    } else {
+        while (wb_n < P->wb_count && P->wb[wb_n].slot == (uint8_t)slot) wb_n++;
+        while (held_n < P->held_count && P->held[held_n].slot == (uint8_t)slot) held_n++;
+    }
+    bool own_access = !r->guest_access.pinned && (wb_n || P->htile_check_count || P->dcc_check_count);
     if (own_access && !vk_guest_access_begin(r)) return;
     static int have = -1;
     static guest_addr lo, hi;
@@ -1704,14 +1778,14 @@ static void apply_writebacks(renderer *r) {
         low = getenv("PS5C_LOG_GPU_LOW16") != NULL;
         low16 = low ? (uint32_t)strtoul(getenv("PS5C_LOG_GPU_LOW16"), NULL, 16) & 0xFFFF : 0;
     }
-    for (uint32_t i = 0; i < P->wb_count; i++) {
+    for (uint32_t i = 0; i < wb_n; i++) {
         writeback *w = &P->wb[i];
         if (w->res) {
             resident_apply(r, w);
             continue;
         }
         uint8_t *dst = (uint8_t *)guest_host(r, w->addr, w->size);
-        const uint8_t *src = (const uint8_t *)P->work->arena.mapped + w->offset;
+        const uint8_t *src = (const uint8_t *)P->work_slots[w->slot].arena.mapped + w->offset;
         { /* PS5C_LOG_STORE_ADDR=break: writebacks over the address the guest breakpoint published */
             static int published = -1;
             static uint32_t logged;
@@ -1781,14 +1855,39 @@ static void apply_writebacks(renderer *r) {
         if(!w->orig_pooled)free(w->orig);
         w->orig = NULL;
     }
-    P->wb_count = 0;
-    P->wb_original_used = 0;
-    htile_checks_verify(r);
-    dcc_checks_verify(r);
+    if (wb_n < P->wb_count) memmove(P->wb, P->wb + wb_n, (P->wb_count - wb_n) * sizeof(P->wb[0]));
+    P->wb_count -= wb_n;
+    if (slot < 0) P->wb_original_used[0] = P->wb_original_used[1] = 0;
+    else P->wb_original_used[slot] = 0; /* every entry of that slot is applied */
+    if (slot < 0) { /* the predictions belong to the batch being recorded: not before it completes */
+        htile_checks_verify(r);
+        dcc_checks_verify(r);
+    }
     if (own_access) vk_guest_access_end(r);
     /* the batch is complete: labels and interrupts behind its work, in order */
-    for (uint32_t i = 0; i < P->held_count; i++) gpu_perform_release(P->held[i].g, &P->held[i].rel);
-    P->held_count = 0;
+    for (uint32_t i = 0; i < held_n; i++) gpu_perform_release(P->held[i].g, &P->held[i].rel);
+    if (held_n < P->held_count) memmove(P->held, P->held + held_n, (P->held_count - held_n) * sizeof(P->held[0]));
+    P->held_count -= held_n;
+}
+
+static void apply_writebacks(renderer *r) { apply_writebacks_of(r, -1); }
+
+/* Results and labels of the other slot's batch reach guest memory as soon as
+ * it has completed (the game may be waiting for its labels), not when the slot
+ * is reused. Not while this batch reads them in place from that slot's arena. */
+static void retired_poll(renderer *r) {
+    vk_pipelines *P = r->pipes;
+    if (!P || P->cross_slot || (!P->wb_count && !P->held_count)) return;
+    uint32_t other = work_slot(P) ^ 1;
+    if (!(P->wb_count && P->wb[0].slot == other) && !(P->held_count && P->held[0].slot == other)) return;
+    if (!vk_work_slot_done(r, other)) return;
+    uint32_t n = 0;
+    while (n < P->wb_count && P->wb[n].slot == other) n++;
+    apply_writebacks_of(r, (int)other);
+    /* patched copies count the batch's writebacks from the start of the list */
+    uint32_t copies = P->copy_count < MAX_COPY_CACHE ? P->copy_count : MAX_COPY_CACHE;
+    for (uint32_t q = 0; n && q < copies; q++)
+        if (P->copies[q].patched) P->copies[q].patched = P->copies[q].patched > n ? P->copies[q].patched - n : 1;
 }
 
 /* A held release writes inside [addr, addr + size). */
@@ -1836,13 +1935,18 @@ static void held_patch(const vk_pipelines *P, uint8_t *dst, guest_addr addr, uin
 }
 
 static void drop_writebacks(vk_pipelines *P, uint32_t from) {
+    /* from 0: the batch changed under the caller. Entries of the other slot (a
+     * submitted batch whose results vk_work_begin left pending) stay. */
+    if (!from)
+        while (from < P->wb_count && P->wb[from].slot != work_slot(P)) from++;
     for (uint32_t i = from; i < P->wb_count; i++) {
         if (P->wb[i].res) resident_release_wb(P, &P->wb[i]);
         if(!P->wb[i].orig_pooled)free(P->wb[i].orig);
         P->wb[i].orig = NULL;
     }
     P->wb_count = from;
-    if(!from)P->wb_original_used = 0;
+    if(!from)P->wb_original_used[0] = P->wb_original_used[1] = 0;
+    else if(P->wb[from-1].slot != work_slot(P))P->wb_original_used[work_slot(P)] = 0; /* none of this slot left */
 }
 
 /* Retain at most one ordinary arena's worth of CPU originals. Reuse starts
@@ -1858,14 +1962,15 @@ static uint8_t *writeback_original(vk_pipelines *P, uint64_t size, bool *pooled)
         const char *e=getenv("PS5C_WB_POOL");enabled=!e || strcmp(e,"0");
     }
     *pooled=false;
-    if(enabled && size<=ARENA_SIZE-P->wb_original_used) {
-        if(!P->wb_originals) {
-            P->wb_originals=(uint8_t *)malloc(ARENA_SIZE);
-            if(P->wb_originals)LOG_I(GPU,"writeback originals: reusable CPU pool, limit 128 MiB");
+    uint32_t s=work_slot(P);
+    if(enabled && size<=ARENA_SIZE-P->wb_original_used[s]) {
+        if(!P->wb_originals[s]) {
+            P->wb_originals[s]=(uint8_t *)malloc(ARENA_SIZE);
+            if(P->wb_originals[s])LOG_I(GPU,"writeback originals: reusable CPU pool, limit 128 MiB");
         }
-        if(P->wb_originals) {
-            uint8_t *p=P->wb_originals+P->wb_original_used;
-            P->wb_original_used+=(size+63)&~63ull;*pooled=true;return p;
+        if(P->wb_originals[s]) {
+            uint8_t *p=P->wb_originals[s]+P->wb_original_used[s];
+            P->wb_original_used[s]+=(size+63)&~63ull;*pooled=true;return p;
         }
     }
     return (uint8_t *)malloc(size);
@@ -1909,6 +2014,7 @@ bool renderer_release(renderer *r, gpu *g, const gpu_release *rel) {
     if (off < 0) off = getenv("PS5C_HOLD_RELEASES") && !atoi(getenv("PS5C_HOLD_RELEASES"));
     pal_mutex_lock(r->lock);
     vk_pipelines *P = r->pipes;
+    if (P) retired_poll(r);
     bool hold = P && (P->large_import_pending || (!off && (P->wb_count || P->held_count)));
     if (hold && P->held_count == MAX_HELD_RELEASES) { /* complete the batch, then this one happens now */
         end_pass(r);
@@ -1920,6 +2026,7 @@ bool renderer_release(renderer *r, gpu *g, const gpu_release *rel) {
     if (hold) {
         P->held[P->held_count].g = g;
         P->held[P->held_count].rel = *rel;
+        P->held[P->held_count].slot = (uint8_t)work_slot(P);
         P->held_count++;
         g_stat_held++;
     } else if (off && P && P->wb_count) { /* the old way: wait for the GPU now */
@@ -2113,12 +2220,23 @@ static void occlusion_collect(renderer *r) {
     P->occlusion_count=0;
 }
 
+/* PS5C_VK_RETIRE=0: a batch with results or labels still owed to guest memory
+ * keeps the next one in its slot (the CPU records only after the GPU is done).
+ * By default the next batch goes to the other slot; the results come in when
+ * their slot is reused, or sooner when something needs them (needs timeline semaphores). */
+static bool retire_on(renderer *r) {
+    static int on = -1;
+    if (on < 0) on = !getenv("PS5C_VK_RETIRE") || atoi(getenv("PS5C_VK_RETIRE"));
+    return on && r->work_timeline;
+}
+
 bool vk_work_can_overlap(renderer *r) {
     vk_pipelines *P=r->pipes;
     /* CPU-visible results and held releases always complete in their owning
      * slot. The optional timestamp and persistent snapshot caches currently
      * have single-batch lifetimes too, so keep those combinations serial. */
-    if(!P || !P->overlap_ready || P->wb_count || P->held_count || P->htile_check_count || P->dcc_check_count ||
+    if(!P || !P->overlap_ready || ((P->wb_count || P->held_count) && !retire_on(r)) || P->cross_slot ||
+       P->htile_check_count || P->dcc_check_count ||
        P->prof || P->readonly_count || P->occlusion_pool || P->large_import_cache || P->res_count)return false;
     if(P->overlap_setting[0]!='@')return !strcmp(P->overlap_setting,"1");
     FILE *f=fopen(P->overlap_setting+1,"r");int value=0;
@@ -2131,10 +2249,16 @@ void vk_work_begin(renderer *r) {
     vk_pipelines *P = r->pipes;
     /* A switch is allowed only with no pending CPU results in the old slot;
      * otherwise vk_begin waited on the active slot, which still owns them. */
+    bool rotated=P->work!=&P->work_slots[r->work_index];
     P->work=&P->work_slots[r->work_index];
+    P->cross_slot=false;
     occlusion_collect(r);
     if(P->occlusion_pool)vkCmdResetQueryPool(r->cmd,P->occlusion_pool,0,1024);
-    apply_writebacks(r); /* the previous batch has completed */
+    /* the batch this slot ran before has completed; the other slot's (submitted
+     * after it) stays pending unless it has completed as well */
+    if(rotated && (P->wb_count || P->held_count) && !vk_work_slot_done(r,r->work_index^1)) {
+        apply_writebacks_of(r,(int)r->work_index);
+    } else apply_writebacks(r);
     prof_collect(r);
     if(P->work->other_arena.buffer) {
         work_resources *w=P->work;bool local=!strcmp(w->local_setting,"1");
@@ -2184,7 +2308,8 @@ void vk_work_begin(renderer *r) {
     if (P->fb_count == MAX_FBS) {
         /* The cache is shared by both work slots. The selected slot's fence
          * alone cannot protect framebuffers used by the other slot. */
-        if(P->overlap_ready)vk_check_work(r, vkQueueWaitIdle(r->queue), "vkQueueWaitIdle (work slots)");
+        /* Dynamic rendering: entries are ids only, no Vulkan object to wait for. */
+        if(P->overlap_ready && !r->dyn_render)vk_check_work(r, vkQueueWaitIdle(r->queue), "vkQueueWaitIdle (work slots)");
         for (uint32_t i = 0; i < P->fb_count && !r->dyn_render; i++) vkDestroyFramebuffer(r->device, P->fbs[i].fb, NULL);
         P->fb_count = 0;
     }
@@ -2246,10 +2371,16 @@ static bool sync_depth_alias(renderer *r, vk_image *dst) {
         if (!src) return false;
     }
     if (!src) return true;
+    if (vk_img_w(src) != vk_img_w(dst) || vk_img_h(src) != vk_img_h(dst)) { /* PS5C_RT_SCALE: one is smaller */
+        static uint32_t mismatch;
+        if (mismatch++ < 8) LOG_W(GPU, "depth alias 0x%llx: scaled and full-size formats (PS5C_RT_SCALE), not copied",
+                                  (unsigned long long)dst->addr);
+        return true;
+    }
     src->last_use = dst->last_use = r->use_seq;
     vk_pipelines *P = r->pipes;
     if (P->work->upload_count == PS5C_ARRAY_COUNT(P->work->uploads)) return false;
-    uint64_t bytes = (uint64_t)dst->width * dst->height * dst->layers *
+    uint64_t bytes = (uint64_t)vk_img_w(dst) * vk_img_h(dst) * dst->layers *
                      (other == VK_FORMAT_R16_UINT || other == VK_FORMAT_D16_UNORM ? 2u : 4u);
     vk_buffer *scratch = &P->work->uploads[P->work->upload_count];
     if (!staging_get(r, P, bytes, scratch)) return false;
@@ -2262,8 +2393,8 @@ static bool sync_depth_alias(renderer *r, vk_image *dst) {
     VkBufferImageCopy region = {0};
     region.imageSubresource.aspectMask = src->aspect&VK_IMAGE_ASPECT_DEPTH_BIT?VK_IMAGE_ASPECT_DEPTH_BIT:src->aspect;
     region.imageSubresource.layerCount = src->layers;
-    region.imageExtent.width = src->width;
-    region.imageExtent.height = src->height;
+    region.imageExtent.width = vk_img_w(src);
+    region.imageExtent.height = vk_img_h(src);
     region.imageExtent.depth = 1;
     vkCmdCopyImageToBuffer(r->cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch->buffer, 1, &region);
     VkBufferMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -2768,7 +2899,8 @@ static bool arena_copy_patched(renderer *r, guest_addr addr, uint64_t size, uint
         for (uint32_t q = 0; q < n; q++) /* destinations of one copy must not overlap */
             if (lo - addr < regions[q].dstOffset + regions[q].size && regions[q].dstOffset < hi - addr) return false;
         if (n == 8) return false;
-        sources[n] = w->res ? P->res[w->res - 1].buf.buffer : P->work->arena.buffer;
+        sources[n] = w->res ? P->res[w->res - 1].buf.buffer : P->work_slots[w->slot].arena.buffer;
+        if (!w->res && w->slot != work_slot(P)) P->cross_slot = true;
         if (w->res) P->res[w->res - 1].used_batch = P->batch;
         regions[n++] = (VkBufferCopy){(w->res ? w->addr - P->res[w->res - 1].addr : w->offset) + (lo - w->addr), lo - addr, hi - lo};
     }
@@ -3139,6 +3271,7 @@ static int resident_bind(renderer *r, guest_addr base, uint64_t size, bool store
             w->addr = e->addr;
             w->size = e->size;
             w->res = (uint32_t)k + 1;
+            w->slot = (uint8_t)work_slot(P);
             e->wb_batch = P->batch;
         }
     }
@@ -3327,34 +3460,44 @@ static const sh_program *depth_clear_program(renderer *r) {
     return *p;
 }
 
-/* The two halves of a merged-stage program as one: the first half up to its
- * s_setpc_b64 s[6:7] (made s_nop), then the second. Kept per (first, second)
- * address pair, the code compared with guest memory once per epoch. */
-static uint32_t *join_halves(renderer *r, guest_addr es, guest_addr gs, uint32_t *dwords) {
+/* The two halves of a merged-stage program or a RADV pixel shader. The
+ * optional null export after a pixel shader's indirect jump keeps its
+ * original address for branches that skip the color export. */
+static uint32_t *join_halves(renderer *r, guest_addr es, guest_addr gs, uint32_t front_words, uint32_t *dwords) {
     uint32_t avail = 0, back = 0;
     const uint32_t *front = vk_shader_code(r->mem, es, &avail);
     const uint32_t *bcode = vk_shader_code(r->mem, gs, &back);
     if (!front || !bcode) return NULL;
-    uint32_t n = sh_front_dwords(front, avail);
-    if (!n) return NULL;
-    uint32_t *code = (uint32_t *)malloc(((size_t)n + back) * 4);
+    uint32_t n = front_words ? front_words : sh_front_dwords(front, avail);
+    if (!n || n > avail) return NULL;
+    uint32_t null_export_words = 0;
+    if (front_words) {
+        if (front[n - 1] != 0xBE802000u && front[n - 1] != 0xBE802002u) return NULL;
+        if (avail - n >= 3 && front[n] == 0xF8001890u &&
+            front[n + 1] == 0x80808080u && front[n + 2] == 0xBF810000u)
+            null_export_words = 3;
+        else if (n == avail || front[n] != 0xBF9F0000u)
+            return NULL;
+    }
+    uint32_t epilog_start = n + null_export_words;
+    uint32_t *code = (uint32_t *)malloc(((size_t)epilog_start + back) * 4);
     if (!code) return NULL;
-    memcpy(code, front, (size_t)n * 4);
-    code[n - 1] = 0xBF800000u; /* s_nop: fall into the second half */
-    memcpy(code + n, bcode, (size_t)back * 4);
-    *dwords = n + back;
+    memcpy(code, front, (size_t)epilog_start * 4);
+    code[n - 1] = null_export_words ? 0xBF820000u | null_export_words : 0xBF800000u;
+    memcpy(code + epilog_start, bcode, (size_t)back * 4);
+    *dwords = epilog_start + back;
     return code;
 }
 
-static const sh_program *get_fused_program(renderer *r, guest_addr es, guest_addr gs) {
+static const sh_program *get_fused_program(renderer *r, guest_addr es, guest_addr gs, uint32_t front_words) {
     vk_pipelines *P = r->pipes;
     if (!es || !gs) return NULL;
     fused_shader *f = NULL;
     for (uint32_t i = 0; i < P->fused_count && !f; i++)
-        if (P->fused[i].es == es && P->fused[i].gs == gs) f = &P->fused[i];
+        if (P->fused[i].es == es && P->fused[i].gs == gs && P->fused[i].front_words == front_words) f = &P->fused[i];
     if (f && f->checked_epoch == P->epoch) return f->ok ? f->prog : NULL;
     uint32_t dwords = 0;
-    uint32_t *code = join_halves(r, es, gs, &dwords);
+    uint32_t *code = join_halves(r, es, gs, front_words, &dwords);
     if (f && code && f->code && f->prog && f->ok && f->prog->dwords <= dwords &&
         !memcmp(code, f->code, (size_t)f->prog->dwords * 4)) {
         free(code); /* unchanged */
@@ -3371,6 +3514,7 @@ static const sh_program *get_fused_program(renderer *r, guest_addr es, guest_add
     forget_wave_variants(P,f->prog);
     free(f->code);
     f->es = es, f->gs = gs, f->code = code, f->dwords = dwords, f->checked_epoch = P->epoch;
+    f->front_words = front_words;
     if (!f->prog) f->prog = program_storage_alloc(sparse_programs());
     vr_flow_invalidate(&P->vertex_flow);
     f->ok = code && f->prog && analyze_cached_program(code, dwords, es, f->prog);
@@ -3379,6 +3523,36 @@ static const sh_program *get_fused_program(renderer *r, guest_addr es, guest_add
         LOG_I(GPU, "merged program 0x%llx + 0x%llx: %s", (unsigned long long)es, (unsigned long long)gs,
               f->ok ? "joined" : "analysis failed");
     return f->ok ? f->prog : NULL;
+}
+
+/* PS5 RADV's separate pixel epilog: ACO saves USER_DATA_3 in s0 or s1,
+ * then jumps through s[0:1] or s[2:3] with a high address word of 2. */
+static const sh_program *get_radv_pixel_program(renderer *r, guest_addr addr, uint32_t lo) {
+    if (!getenv("PS5C_RADV_PS_EPILOG")) return NULL;
+    if (!lo || (lo & 3)) return NULL;
+    uint32_t avail = 0;
+    const uint32_t *code = vk_shader_code(r->mem, addr, &avail);
+    if (!code || avail < 4) return NULL;
+    uint32_t start = code[0] == 0xBE80037Eu ? 1 : 0; /* optional save of exec_lo */
+    if ((code[start] != 0xBE800303u && code[start] != 0xBE810303u) ||
+        code[start + 1] != 0xBE830382u)
+        return NULL;
+    bool low_in_s0 = code[start] == 0xBE800303u, low_in_s2 = false, high_in_s1 = false;
+    for (uint32_t i = start + 2; i < avail && i < SH_MAX_CODE_DWORDS;) {
+        rdna2_inst inst;
+        uint32_t word = code[i];
+        if (word == 0xBE800301u) low_in_s0 = true;
+        if (word == 0xBE820301u) low_in_s2 = true;
+        if (word == 0xBE810382u) high_in_s1 = true;
+        if (word == 0xBF810000u || word == 0xBF9F0000u) return NULL;
+        if ((word == 0xBE802000u && low_in_s0 && high_in_s1) ||
+            (word == 0xBE802002u && low_in_s2)) {
+            return get_fused_program(r, addr, 0x200000000ull | lo, i + 1);
+        }
+        if (!rdna2_decode(code + i, avail - i, &inst)) return NULL;
+        i += inst.words;
+    }
+    return NULL;
 }
 
 /* ---- Formats ---- */
@@ -3604,9 +3778,14 @@ static VkFramebuffer get_framebuffer(renderer *r, VkRenderPass rp, const VkImage
         }
     }
     if (P->fb_count == MAX_FBS) {
+        /* Dynamic rendering: the entries only name sets of views with ids that
+         * are never reused, so the cache simply starts over (an open pass gets
+         * a new id at worst, which ends and reopens it). Before, the full cache
+         * failed the draw and the batch was flushed and waited for. */
+        if (r->dyn_render) P->fb_count = 0;
         /* The caller must retry the whole draw in a new batch. Flushing here
          * would leave its already-selected targets unprotected from eviction. */
-        return VK_NULL_HANDLE;
+        else return VK_NULL_HANDLE;
     }
     fb_entry *e = &P->fbs[P->fb_count];
     VkFramebufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -3939,6 +4118,7 @@ static bool stage_spirv(const stage_state *st, uint32_t binding_base, uint64_t *
     size_t words = 0;
     uint64_t key = vk_shader_cache_key(st->prog, &st->info, st->shapes, binding_base);
     *key_out = key;
+    vk_shader_cache_note_source(key, st->prog, &st->info, st->shapes, binding_base);
     /* The corpus's contiguous-code format cannot describe linked ranges. */
     if(st->prog->function_count<=1)
         corpus_add(key, st->prog, &st->info, st->shapes, binding_base, st->prog->base, st->prog->code, st->prog->dwords);
@@ -4277,17 +4457,49 @@ bool vk_pipeline_prewarm_size(const void *recipe, uint64_t *bytes) {
     return true;
 }
 
-/* Bindings of a stage: its uniforms, then one per BUFFER/IMAGE site */
-static void recipe_bindings(pipe_recipe *rc, const sh_program *p, const sh_site_shape *shapes, uint8_t stage) {
-    rc->btype[rc->nbind] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    rc->bstage[rc->nbind++] = stage;
+/* Bindings of a stage: its uniforms, then one per BUFFER/IMAGE site (at most SH_MAX_SITES + 1) */
+uint32_t vk_pipeline_binding_types(const sh_program *p, const sh_site_shape *shapes, uint8_t *types) {
+    uint32_t n = 0;
+    types[n++] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     for (uint32_t i = 0; i < p->site_count; i++) {
         if (p->sites[i].kind == SH_SITE_SMEM && !shapes[i].address_map) continue;
-        rc->btype[rc->nbind] = (uint8_t)(p->sites[i].kind != SH_SITE_IMAGE ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                         : sh_site_storage(&p->sites[i],&shapes[i]) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-        rc->bstage[rc->nbind++] = stage;
+        types[n++] = (uint8_t)(p->sites[i].kind != SH_SITE_IMAGE ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                               : sh_site_storage(&p->sites[i],&shapes[i]) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                                          : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     }
+    return n;
+}
+
+static void recipe_bindings(pipe_recipe *rc, const sh_program *p, const sh_site_shape *shapes, uint8_t stage) {
+    uint32_t n = vk_pipeline_binding_types(p, shapes, rc->btype + rc->nbind);
+    memset(rc->bstage + rc->nbind, stage, n);
+    rc->nbind += n;
+}
+
+/* After a translator change: a recipe of the earlier translator with its
+ * shaders' new keys, if every stage was translated again with the same
+ * bindings (else a pipeline layout could disagree with its SPIR-V). Mesh
+ * replay recipes (mesh 2) key a generated stage and are not carried over. */
+bool vk_pipeline_recipe_migrate(void *recipe) {
+    pipe_recipe *rc = (pipe_recipe *)recipe;
+    if (!recipe_version_ok(rc) || rc->compute > 1 || rc->nbind > RECIPE_BINDINGS || rc->mesh == 2) return false;
+    uint32_t at = 0;
+    uint64_t keys[2] = {0, 0};
+    for (uint32_t i = 0; i < (rc->compute ? 1u : 2u); i++) {
+        const uint8_t *types = NULL;
+        uint32_t n = 0;
+        uint8_t stage = rc->compute ? 2 : (uint8_t)i;
+        if (!vk_shader_cache_migrated(rc->spv[i], &keys[i], &types, &n) || n > rc->nbind - at ||
+            memcmp(rc->btype + at, types, n))
+            return false;
+        for (uint32_t j = 0; j < n; j++)
+            if (rc->bstage[at + j] != stage) return false;
+        at += n;
+    }
+    if (at != rc->nbind) return false;
+    rc->spv[0] = keys[0];
+    rc->spv[1] = keys[1];
+    return true;
 }
 
 /* Disk recipes can travel between devices. Guard prewarming as well as fresh
@@ -4907,6 +5119,7 @@ static void add_buffer(renderer *r, bind_list *bl, VkDeviceSize off, VkDeviceSiz
  * turn and compare it, twice round the texture. Only then: reading every texture's
  * memory all the time cost Dragon Ball Sparking Zero two thirds of its frames. */
 #define TEX_SCAN_SLICE (64u << 10)
+#define TEX_DYNAMIC_SETTLE 64 /* unchanged whole hashes before a dynamic texture is sampled again */
 static void texture_scan_drop(vk_pipelines *P, uint32_t idx) {
     free(P->tex_scan[idx]);
     P->tex_scan[idx] = NULL;
@@ -4949,6 +5162,7 @@ void vk_pipeline_forget_image(renderer *r, uint32_t index) {
     P->tex_hash[index] = 0;
     P->tex_checked[index] = 0;
     P->tex_dynamic[index] = false;
+    P->tex_dynamic_still[index] = 0;
     P->tex_fill_hash[index] = 0;
     P->tex_armed[index] = false;
     P->tex_watch_streak[index] = P->tex_watch_wait[index] = 0;
@@ -5196,7 +5410,7 @@ static vk_image *grow_layers(renderer *r, vk_image *old, VkFormat vf, uint32_t l
     /* `old` was used in this batch: the cache does not replace it */
     vk_image *img = vk_image_get_layers(r, addr, w, h, vf, layers);
     if (!img || img == old) return img;
-    if (old->gpu_written && old->format == img->format && old->layers < layers) {
+    if (old->gpu_written && old->format == img->format && old->layers < layers && !old->ext_w) {
         end_pass(r);
         vk_barrier(r->cmd, old, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -5551,6 +5765,17 @@ static vk_image *mip_chain(renderer *r, vk_image *img, const uint32_t *t) {
         cp.extent.width = lv[k]->width;
         cp.extent.height = lv[k]->height;
         cp.extent.depth = 1;
+        census_copy(lv[k], 4);
+        if (lv[k]->ext_w) { /* PS5C_RT_SCALE: a smaller level fills the chain's level by a blit */
+            VkImageBlit b = {0};
+            b.srcSubresource = cp.srcSubresource;
+            b.dstSubresource = cp.dstSubresource;
+            b.srcOffsets[1] = (VkOffset3D){(int32_t)lv[k]->ext_w, (int32_t)lv[k]->ext_h, 1};
+            b.dstOffsets[1] = (VkOffset3D){(int32_t)lv[k]->width, (int32_t)lv[k]->height, 1};
+            vkCmdBlitImage(r->cmd, lv[k]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &b, VK_FILTER_LINEAR);
+            continue;
+        }
         vkCmdCopyImage(r->cmd, lv[k]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &cp);
     }
@@ -5589,8 +5814,13 @@ static vk_image *depth_as_color(renderer *r, vk_image *z, VkFormat vf) {
         return z;
     vk_pipelines *P = r->pipes;
     vk_image *c = vk_image_find(r, z->addr, z->width, z->height, vf);
-    if (!c) c = vk_image_get(r, z->addr, z->width, z->height, vf); /* z was used in this batch: not evicted */
+    if (!c) {
+        r->scale_new = z->ext_w != 0; /* PS5C_RT_SCALE: drawn at the depth's size */
+        c = vk_image_get(r, z->addr, z->width, z->height, vf); /* z was used in this batch: not evicted */
+        r->scale_new = false;
+    }
     if (!c) return NULL;
+    if (vk_img_w(c) != vk_img_w(z) || vk_img_h(c) != vk_img_h(z)) return z;
     if (c->gpu_written && c->written_seq >= z->written_seq) return c;
     if (!z->gpu_written) return c;
     uint64_t size = (uint64_t)z->width * z->height * vk_format_bytes(vf);
@@ -5603,9 +5833,10 @@ static vk_image *depth_as_color(renderer *r, vk_image *z, VkFormat vf) {
     VkBufferImageCopy copy = {0};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     copy.imageSubresource.layerCount = 1;
-    copy.imageExtent.width = z->width;
-    copy.imageExtent.height = z->height;
+    copy.imageExtent.width = vk_img_w(z);
+    copy.imageExtent.height = vk_img_h(z);
     copy.imageExtent.depth = 1;
+    census_copy(z, 2);
     vkCmdCopyImageToBuffer(r->cmd, z->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp->buffer, 1, &copy);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -5843,7 +6074,7 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
         source.addr=addr+mip.offset;source.size=gsize;source.slice=slice;
         source.sw=sw_mode;source.w=w_el;source.h=h_el;source.bpe=bpe;source.ox=mip.ox;source.oy=mip.oy;source.layers=layers;source.fmt=vk_packed_bytes(fmt)?fmt:0;
         if(memcmp(&source,&P->tex_cpu[idx],sizeof(source))) {
-            P->tex_hash[idx]=P->tex_checked[idx]=P->tex_fill_hash[idx]=0;P->tex_dynamic[idx]=false;P->tex_cpu[idx]=source;
+            P->tex_hash[idx]=P->tex_checked[idx]=P->tex_fill_hash[idx]=0;P->tex_dynamic[idx]=false;P->tex_dynamic_still[idx]=0;P->tex_cpu[idx]=source;
             texture_scan_drop(P,idx);
             P->tex_armed[idx]=false;P->tex_watch_streak[idx]=P->tex_watch_wait[idx]=0;
         }
@@ -5887,6 +6118,27 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
         if (idx < PS5C_ARRAY_COUNT(P->tex_hash)) P->tex_hash[idx] = hash; /* kept until the CPU rewrites it */
         return img;
     }
+    /* A dynamic texture that stopped changing goes back to the sampled hash and the
+     * slice scan: Tomb Raider I-III's 90 MB array (512x512, 256 layers), filled
+     * layer by layer while a level loads, was hashed whole at every frame of the
+     * level afterwards (~38 ms each). Video planes change at every frame and stay
+     * dynamic. PS5C_TEX_DYNAMIC_KEEP=1: a dynamic texture stays dynamic. */
+    if (dynamic && src && supported && hash && P->tex_hash[idx] == hash) {
+        static int keep = -1;
+        if (keep < 0) keep = getenv("PS5C_TEX_DYNAMIC_KEEP") != NULL;
+        if (!keep && ++P->tex_dynamic_still[idx] >= TEX_DYNAMIC_SETTLE) {
+            static unsigned settle_logs;
+            if (settle_logs++ < 8)
+                LOG_I(GPU, "texture 0x%llx %ux%u x%u (%llu MB) unchanged for %u whole hashes: sampled again",
+                      (unsigned long long)addr, w, h, layers, (unsigned long long)(gsize >> 20), TEX_DYNAMIC_SETTLE);
+            P->tex_dynamic[idx] = false;
+            P->tex_dynamic_still[idx] = 0;
+            P->tex_hash[idx] = texture_cpu_hash(r, &P->tex_cpu[idx], false);
+            texture_scan_baseline(P, idx, src, gsize);
+        }
+        return img;
+    }
+    if (idx < VK_MAX_IMAGES) P->tex_dynamic_still[idx] = 0;
     if (idx < PS5C_ARRAY_COUNT(P->tex_hash) && P->tex_hash[idx] == hash && !scanned) return img;
     if (idx < PS5C_ARRAY_COUNT(P->tex_hash)) {
         /* the sampled detector saw the change: hashed whole from now on (a slice scan
@@ -5956,6 +6208,17 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
         stat_add(ST_UPLOAD, t0);
         vk_barrier(r->cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+        if (img->ext_w) { /* PS5C_RT_SCALE: guest memory is not copied into a smaller target */
+            static uint32_t logged;
+            if (logged++ < 8)
+                LOG_I(GPU, "texture 0x%llx %ux%u: guest contents not copied into a scaled target", (unsigned long long)addr, w, h);
+            if (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkClearColorValue zero = {{0, 0, 0, 0}};
+                VkImageSubresourceRange all = {img->aspect, 0, 1, 0, layers};
+                vkCmdClearColorImage(r->cmd, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
+            }
+            return img;
+        }
         VkBufferImageCopy copy = {0};
         copy.bufferRowLength = w_el * block;
         copy.imageSubresource.aspectMask = img->aspect;
@@ -5963,6 +6226,7 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
         copy.imageExtent.width = w;
         copy.imageExtent.height = h;
         copy.imageExtent.depth = 1;
+        census_copy(img, 0);
         vkCmdCopyBufferToImage(r->cmd, staging->buffer, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         return img;
     }
@@ -6373,6 +6637,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
     uint32_t wb_earlier = P->wb_count; /* results of earlier work (not this stage's own stores) */
     const sh_program *p = st->prog;
     st->footprint_count=0;
+    if (g_pimp.on > 0) memset(g_pimp_extra, 0, p->site_count * sizeof(g_pimp_extra[0]));
     if(st->info.stage==SH_STAGE_CS)footprint_prepare(r,st);
     VkDeviceSize off;
     uint32_t uniform_shift=st->info.uniform_shift;
@@ -6758,6 +7023,10 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                 if(at>P->arena_limit || P->arena_limit-at<16)return false;
                 if(range>P->arena_limit-at-16)range=P->arena_limit-at-16;
                 add_buffer(r, bl, at, range + 16);
+                if (w->slot != work_slot(P)) { /* results of the batch before, in its own arena */
+                    bl->buf[bl->count - 1].buffer = P->work_slots[w->slot].arena.buffer;
+                    P->cross_slot = true;
+                }
                 if ((site->store || coherent) && stored) *stored = true;
                 traffic_record(p, i, st->info.stage, stride, size, 0);
                 continue;
@@ -6852,6 +7121,18 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                 traffic_record(p, i, st->info.stage, stride, size, g_stat_bytes - copy_before);
                 continue;
             }
+            if (!site->store && !coherent && !windowed && size && phys_import_enabled(r)) {
+                VkDeviceSize ioff, irange = ((size + 3) & ~3ull) + 16;
+                bool shiftable = st->shapes[i].buffer_length == SH_BUFFER_SHIFTED && !st->shapes[i].address_map;
+                VkBuffer ibuf = phys_import_bind(r, base, irange, P->align, shiftable, &ioff, &g_pimp_extra[i]);
+                if (ibuf) {
+                    add_buffer(r, bl, 0, irange + g_pimp_extra[i]);
+                    bl->buf[bl->count - 1].buffer = ibuf;
+                    bl->buf[bl->count - 1].offset = ioff;
+                    traffic_record(p, i, st->info.stage, stride, size, 0);
+                    continue;
+                }
+            }
             if (st->info.stage != SH_STAGE_CS && !p->has_stores && !site->store && !coherent && !windowed && size &&
                 P->vc_on >= 0) {
                 /* sites of one buffer share the widest read's copy (site_copy_size): a narrower site binds
@@ -6922,6 +7203,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                     writeback *nw = &P->wb[P->wb_count];
                     memset(nw,0,sizeof(*nw));
                     nw->offset = off;
+                    nw->slot = (uint8_t)work_slot(P);
                     nw->addr = wbase;
                     nw->size = wsize;
                     nw->orig = writeback_original(P,wsize,&nw->orig_pooled);
@@ -7088,6 +7370,27 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                  * that format on the private zero/discard image. */
                 placeholder=true;stencil_read=false;view_fmt=img?img->format:VK_FORMAT_UNDEFINED;
             }
+            if (!placeholder) census_image(img, st->info.stage, p->ops[site->inst]);
+            if (census_on() && img && !placeholder && census_large(img)) { /* which shaders read large images, how */
+                static uint64_t seen[512];
+                static uint32_t nseen;
+                uint64_t key = p->hash ^ ((uint64_t)i << 56);
+                bool known = false;
+                for (uint32_t q = 0; q < nseen; q++) known |= seen[q] == key;
+                if (!known && nseen < 512) {
+                    seen[nseen++] = key;
+                    LOG_I(GPU, "scale census: stage %u shader %016llx site %u %s %s image 0x%llx %ux%u host %ux%u map %u type %u",
+                          st->info.stage, (unsigned long long)p->hash, i, p->insts[site->inst].name,
+                          site->store ? "store" : "read", (unsigned long long)img->addr, img->width, img->height, vk_img_w(img),
+                          vk_img_h(img), st->shapes[i].address_map, st->shapes[i].img_type);
+                }
+            }
+            if (r->rt_scale && !st->shapes[i].address_map && SH_U_SITE + i < st->eval.smem_words) {
+                /* PS5C_RT_SCALE: host / guest of a target drawn smaller, for its integer coordinates */
+                float f = img && !placeholder && img->ext_w ? (float)img->ext_w / (float)img->width : 0.0f;
+                memcpy(&st->eval.smem_data[SH_U_SITE + i], &f, 4);
+                if (!st->images_only) memcpy((uint32_t *)arena_ptr(r, st->u_off) + SH_U_SITE + i, &f, 4); /* the uploaded copy */
+            }
             uint32_t k = bl->count++;
             memset(&bl->w[k], 0, sizeof(bl->w[k]));
             bl->w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -7155,7 +7458,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             if(p->sites[s].kind==SH_SITE_SMEM && !st->shapes[s].address_map)continue;
             if(st->shapes[s].buffer_length==SH_BUFFER_SHIFTED && !st->shapes[s].address_map && p->sites[s].kind==SH_SITE_BUFFER) {
                 if(SH_U_SITE+s>=st->eval.smem_words)return false;
-                uniforms[SH_U_SITE+s]=(uint32_t)vertex_share_shift(p,&st->eval,s,NULL);
+                uniforms[SH_U_SITE+s]=(uint32_t)vertex_share_shift(p,&st->eval,s,NULL)+(g_pimp.on>0?g_pimp_extra[s]:0);
             } else if(st->shapes[s].buffer_length==SH_BUFFER_LENGTH && !st->shapes[s].address_map &&
                (p->sites[s].kind==SH_SITE_BUFFER || p->sites[s].kind==SH_SITE_SBUFFER)) {
                 if(binding>=bl->count || SH_U_SITE+s>=st->eval.smem_words)return false;
@@ -7249,7 +7552,7 @@ static bool prepare_linear_image_copies(renderer *r,const stage_state *st,const 
         if(seen)continue;
         if(plan->count==MAX_WRITEBACKS)return false;
         writeback *prior=find_writeback(P,addr,bytes);
-        if(prior && prior->res)return false; /* results in a resident buffer: not this bounded path */
+        if(prior && (prior->res || prior->slot!=work_slot(P)))return false; /* resident or another slot's arena: not this bounded path */
         VkDeviceSize offset;
         if(prior) {
             wb_scope_add(prior,addr,0,bytes,true);
@@ -7263,7 +7566,7 @@ static bool prepare_linear_image_copies(renderer *r,const stage_state *st,const 
             w->orig=writeback_original(P,bytes,&w->orig_pooled);
             if(!w->orig){P->writeback_oom=true;return false;}
             memcpy(w->orig,arena_ptr(r,offset),(size_t)bytes);
-            w->offset=offset;w->addr=addr;w->size=bytes;P->wb_count++;
+            w->offset=offset;w->addr=addr;w->size=bytes;w->slot=(uint8_t)work_slot(P);P->wb_count++;
         }
         plan->copies[plan->count++]=(linear_image_copy){image,addr,offset};
         static guest_addr reported[64];static uint32_t reports;
@@ -7280,9 +7583,11 @@ static bool prepare_linear_image_copies(renderer *r,const stage_state *st,const 
 static void record_linear_image_copies(renderer *r,const linear_image_plan *plan) {
     for(uint32_t i=0;i<plan->count;i++) {
         const linear_image_copy *copy=&plan->copies[i];vk_image *image=copy->image;
+        if(image->ext_w)continue; /* PS5C_RT_SCALE: a smaller target has no linear guest copy */
         vk_barrier(r->cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy region={.bufferOffset=copy->offset,
             .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={image->width,image->height,1}};
+        census_copy(image, 5);
         vkCmdCopyImageToBuffer(r->cmd,image->image,image->layout,r->pipes->work->arena.buffer,1,&region);
         vk_barrier(r->cmd,image,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
@@ -7822,6 +8127,12 @@ static bool setup_stage(renderer *r, stage_state *st) {
                     SH_U_SITE + first >= st->eval.smem_words) continue;
                 st->shapes[i].buffer_length = st->shapes[first].buffer_length = SH_BUFFER_SHIFTED;
             }
+        /* direct memory reads (vk_phys_import.h): a vertex fetch may bind from below its base */
+        if(st->info.stage==SH_STAGE_VS && !st->gcn && phys_import_enabled(r))
+            for (uint32_t i = 0; i < st->prog->site_count; i++)
+                if (!st->shapes[i].address_map && !st->shapes[i].buffer_length && SH_U_SITE + i < st->eval.smem_words &&
+                    vertex_share_eligible(st->prog, &st->eval, i))
+                    st->shapes[i].buffer_length = SH_BUFFER_SHIFTED;
     }
     if (!st->eval.vsrc && !calls) eval_store(r, st, key, reloc_key, ok, &read);
     if (g_stats_on) prog_stat_add(g_stat_eval_prog, st->prog, pal_time_ns() - t0);
@@ -7939,13 +8250,14 @@ static void resolve(renderer *r, const gpu *g) {
     VkImageBlit b = {0};
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.srcSubresource.layerCount = 1;
-    b.srcOffsets[1].x = (int32_t)w;
-    b.srcOffsets[1].y = (int32_t)h;
+    b.srcOffsets[1].x = (int32_t)(src->ext_w ? src->ext_w : w);
+    b.srcOffsets[1].y = (int32_t)(src->ext_h ? src->ext_h : h);
     b.srcOffsets[1].z = 1;
     b.dstSubresource = b.srcSubresource;
-    b.dstOffsets[1].x = (int32_t)w1;
-    b.dstOffsets[1].y = (int32_t)h1;
+    b.dstOffsets[1].x = (int32_t)(dst->ext_w ? dst->ext_w : w1);
+    b.dstOffsets[1].y = (int32_t)(dst->ext_h ? dst->ext_h : h1);
     b.dstOffsets[1].z = 1;
+    census_copy(src, 3);
     vkCmdBlitImage(r->cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     dst->gpu_written = true;
@@ -8053,7 +8365,11 @@ static vk_image *depth_image(renderer *r, const gpu *g, guest_addr za, uint32_t 
     vk_image *img;
     if (layers == 1) {
         img = vk_image_find_array(r, za, zw, zh, zf); /* a slice 0 draw into a known array */
-        if (!img) img = vk_image_get(r, za, zw, zh, zf);
+        if (!img) {
+            r->scale_new = true; /* PS5C_RT_SCALE */
+            img = vk_image_get(r, za, zw, zh, zf);
+            r->scale_new = false;
+        }
     } else {
         img = vk_image_find_array(r, za, zw, zh, zf);
         if (!img || img->layers < layers) {
@@ -8822,7 +9138,11 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
                     }
                 }
             }
-            if (!rts[i]) rts[i] = vk_image_get(r, base, w, h, f);
+            if (!rts[i]) {
+                r->scale_new = true; /* PS5C_RT_SCALE */
+                rts[i] = vk_image_get(r, base, w, h, f);
+                r->scale_new = false;
+            }
         }
         if (!rts[i]) {
             if (r->image_cache_pressure) return draw_fail(__LINE__);
@@ -9181,13 +9501,59 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         }
     }
 
+    if (r->rt_scale) { /* PS5C_RT_SCALE: full-size color targets drawn with scaled ones become scaled */
+        bool scaled = zimg && zimg->ext_w, plain = false;
+        for (uint32_t i = 0; i < k.rt_count; i++)
+            if (rts[i]) {
+                scaled |= rts[i]->ext_w != 0;
+                plain |= !rts[i]->ext_w && !color_views[i];
+            }
+        if (scaled && plain) {
+            end_pass(r);
+            for (uint32_t i = 0; i < k.rt_count; i++)
+                if (rts[i] && !rts[i]->ext_w && !color_views[i]) vk_image_rescale(r, rts[i]);
+        }
+    }
     VkImageView views[GPU_MAX_RENDER_TARGETS + 1];
     uint32_t nviews = 0;
     for (uint32_t i = 0; i < k.rt_count; i++) {
         if (rts[i]) views[nviews++] = color_views[i] ? color_views[i] : rts[i]->view;
     }
     if (zimg) views[nviews++] = zview;
-    VkFramebuffer fb = get_framebuffer(r, rp, views, nviews, fb_w, fb_h, fb_layers);
+    /* PS5C_RT_SCALE: the targets may be drawn smaller than the guest's size (fb_w x fb_h,
+     * which the vertex shader's viewport transform keeps using); hfb_w x hfb_h is the host's */
+    uint32_t hfb_w = fb_w, hfb_h = fb_h;
+    {
+        bool scaled = false, plain = false;
+        for (uint32_t i = 0; i < k.rt_count; i++)
+            if (rts[i]) *(rts[i]->ext_w ? &scaled : &plain) = true;
+        if (zimg) *(zimg->ext_w ? &scaled : &plain) = true;
+        if (scaled) {
+            for (uint32_t i = 0; i < k.rt_count; i++)
+                if (rts[i] && rts[i]->ext_w) {
+                    if (rts[i]->ext_w < hfb_w) hfb_w = rts[i]->ext_w;
+                    if (rts[i]->ext_h < hfb_h) hfb_h = rts[i]->ext_h;
+                }
+            if (zimg && zimg->ext_w) {
+                if (zimg->ext_w < hfb_w) hfb_w = zimg->ext_w;
+                if (zimg->ext_h < hfb_h) hfb_h = zimg->ext_h;
+            }
+            if (plain) {
+                static uint32_t logged;
+                if (logged++ < 8) {
+                    LOG_W(GPU, "draw mixes scaled and full-size targets (PS5C_RT_SCALE): %ux%u drawn at %ux%u",
+                          fb_w, fb_h, hfb_w, hfb_h);
+                    for (uint32_t i = 0; i <= k.rt_count; i++) {
+                        vk_image *t = i < k.rt_count ? rts[i] : zimg;
+                        if (t) LOG_I(GPU, "  %s 0x%llx %ux%u fmt %d host %ux%u written %d drawn %d", i < k.rt_count ? "color" : "depth",
+                                     (unsigned long long)t->addr, t->width, t->height, (int)t->format, vk_img_w(t), vk_img_h(t),
+                                     (int)t->gpu_written, (int)t->drawn_to);
+                    }
+                }
+            }
+        }
+    }
+    VkFramebuffer fb = get_framebuffer(r, rp, views, nviews, hfb_w, hfb_h, fb_layers);
     if (!fb) return P->fb_count != MAX_FBS || draw_fail(__LINE__);
 
     /* resources */
@@ -9251,6 +9617,12 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         vpt[7] += far_depth_offset;
         memcpy(vs->eval.smem_data + SH_U_VPORT, vpt, sizeof(vpt));
         for (uint32_t i = 0; i < 24; i++) vs->eval.smem_data[SH_U_UCP + i] = gpu_reg(g, 0xA16Fu /* PA_CL_UCP_0_X */ + i);
+        /* PS5C_RT_SCALE: the pixel shader's position back at the guest's scale (guest / host - 1) */
+        if (r->rt_scale) {
+            float frag[2] = {hfb_w != fb_w ? (float)fb_w / (float)hfb_w - 1.0f : 0.0f,
+                             hfb_h != fb_h ? (float)fb_h / (float)hfb_h - 1.0f : 0.0f};
+            memcpy(ps->eval.smem_data + SH_U_VPORT, frag, sizeof(frag));
+        }
     }
     uint64_t t0 = stat_now();
     if(vs->info.stage==SH_STAGE_MESH) {
@@ -9313,7 +9685,7 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         index_ps = setting ? strtoull(setting, NULL, 16) : 0;
     }
     if (log_indices && index_logged < 24 && (ps->prog->hash == index_ps || ps->prog->base == index_ps)) {
-        if (!d->indexed || (d->index_size != 2 && d->index_size != 4)) {
+        if (!d->indexed || (d->index_size != 1 && d->index_size != 2 && d->index_size != 4)) {
             LOG_I(GPU, "draw frame %llu PS %016llx: %u vertices, not indexed (index size %u), prim %u, %u instances",
                   (unsigned long long)g->stats.flips, (unsigned long long)ps->prog->hash, d->count, d->index_size,
                   gpu_reg(g, mmVGT_PRIMITIVE_TYPE), d->instances);
@@ -9335,6 +9707,21 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
                   gpu_reg(g, mmVGT_MULTI_PRIM_IB_RESET_INDX), text, pending);
         }
         index_logged++;
+    }
+    if (d->indexed && d->index_size == 1 && vs->info.stage != SH_STAGE_MESH) {
+        /* Widen the guest indices on the Vulkan 1.3 path, which cannot
+         * assume VK_KHR_index_type_uint8 is enabled. */
+        if (!arena_alloc(r, (uint64_t)d->count * sizeof(uint16_t), &index_off))
+            return draw_fail(__LINE__);
+        uint16_t *indices = (uint16_t *)arena_ptr(r, index_off);
+        uint32_t reset = gpu_reg(g, mmVGT_MULTI_PRIM_IB_RESET_INDX);
+        uint32_t reset_mode = gpu_reg(g, mmVGT_MULTI_PRIM_IB_RESET_EN);
+        bool strip_or_fan = k.prim == GPU_PRIM_LINESTRIP || k.prim == GPU_PRIM_TRIFAN || k.prim == GPU_PRIM_TRISTRIP;
+        uint32_t restart = strip_or_fan && (reset_mode & 1u)
+            ? reset & ((reset_mode & 2u) ? UINT32_MAX : UINT8_MAX) : UINT32_MAX;
+        for (uint32_t i = 0; i < d->count; i++)
+            indices[i] = index_ptr[i] == restart ? UINT16_MAX : index_ptr[i];
+        index_buf = P->work->arena.buffer;
     }
     VkDeviceSize geometry_off=0;uint32_t geometry_groups=0,geometry_total=0,geometry_stride=0;
     if(k.mesh==2) {
@@ -9411,14 +9798,25 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         texture_gpu_write(r,bl.written[i]);
         bl.written[i]->written_seq = ++r->write_seq;
     }
+    uint64_t rt_prev[GPU_MAX_RENDER_TARGETS] = {0}; /* for vk_image_note_draw below */
     for (uint32_t i = 0; i < k.rt_count; i++) {
         if (!rts[i]) continue;
         vk_barrier(cmd, rts[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         rts[i]->gpu_written = true;
+        rts[i]->drawn_to = true;
         texture_gpu_write(r,rts[i]);
+        rt_prev[i] = rts[i]->written_seq;
         rts[i]->written_seq = ++r->write_seq;
+    }
+    if (census_on()) {
+        bool large = census_large(zimg);
+        for (uint32_t i = 0; i < k.rt_count; i++) large |= census_large(rts[i]);
+        if (large) {
+            g_census_draws++;
+            if (gpu_reg(g, mmSPI_PS_INPUT_ENA) & 0xF00u) g_census_pos++; /* POS_X/Y/Z/W_FLOAT */
+        }
     }
     if (zimg) {
         /* A read-only depth attachment can also be sampled by shaders. Its
@@ -9430,6 +9828,7 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
                        (depth_read_only ? VK_ACCESS_SHADER_READ_BIT : 0),
                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                        (depth_read_only ? draw_shader_stages : 0));
+        zimg->drawn_to = true;
         if (k.depth_write || zclear) {
             zimg->gpu_written = true;
             zimg->written_seq = ++r->write_seq;
@@ -9459,8 +9858,8 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
                     .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
             }
             VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.renderArea.extent.width = fb_w;
-            ri.renderArea.extent.height = fb_h;
+            ri.renderArea.extent.width = hfb_w;
+            ri.renderArea.extent.height = hfb_h;
             ri.layerCount = fb_layers;
             ri.colorAttachmentCount = k.rt_count;
             ri.pColorAttachments = color;
@@ -9475,8 +9874,8 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         VkRenderPassBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         bi.renderPass = rp;
         bi.framebuffer = fb;
-        bi.renderArea.extent.width = fb_w;
-        bi.renderArea.extent.height = fb_h;
+        bi.renderArea.extent.width = hfb_w;
+        bi.renderArea.extent.height = hfb_h;
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         }
         P->cur_fb = fb;
@@ -9486,7 +9885,7 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     }
 
     /* viewport: the whole target (the vertex shader applies the guest's) */
-    VkViewport vp = {0, 0, (float)fb_w, (float)fb_h, 0, 1};
+    VkViewport vp = {0, 0, (float)hfb_w, (float)hfb_h, 0, 1};
     /* scissor: screen, window, generic and (when enabled) viewport 0 rectangles */
     int32_t x0 = 0, y0 = 0, x1 = (int32_t)fb_w, y1 = (int32_t)fb_h;
     const uint32_t rects[4] = {mmPA_SC_SCREEN_SCISSOR_TL, mmPA_SC_WINDOW_SCISSOR_TL, mmPA_SC_GENERIC_SCISSOR_TL,
@@ -9504,7 +9903,15 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     }
     if (x1 < x0) x1 = x0;
     if (y1 < y0) y1 = y0;
+    if (hfb_w != fb_w || hfb_h != fb_h) { /* PS5C_RT_SCALE: the rectangles at the host's size */
+        x0 = (int32_t)((uint64_t)x0 * hfb_w / fb_w), x1 = (int32_t)(((uint64_t)x1 * hfb_w + fb_w - 1) / fb_w);
+        y0 = (int32_t)((uint64_t)y0 * hfb_h / fb_h), y1 = (int32_t)(((uint64_t)y1 * hfb_h + fb_h - 1) / fb_h);
+        if (x1 > (int32_t)hfb_w) x1 = (int32_t)hfb_w;
+        if (y1 > (int32_t)hfb_h) y1 = (int32_t)hfb_h;
+    }
     VkRect2D sc = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+    for (uint32_t i = 0; i < k.rt_count; i++)
+        if (rts[i]) vk_image_note_draw(rts[i], rt_prev[i], x0, y0, x1, y1); /* the draw writes within its scissor */
     if (log_scissor_from >= 0 && g->stats.flips >= (uint64_t)log_scissor_from && /* =<from flip> */
         (x0 || y0 || x1 != (int32_t)fb_w || y1 != (int32_t)fb_h)) {
         static uint32_t logged;
@@ -9681,6 +10088,7 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
             for (uint32_t c = 0; c < 4; c++) {
                 uint32_t n = j * 4 + c;
                 if (!ix) v[c] = n;
+                else if (d->index_size == 1) v[c] = ix[n];
                 else if (d->index_size == 4) memcpy(&v[c], ix + n * 4, 4);
                 else { uint16_t s; memcpy(&s, ix + n * 2, 2); v[c] = s; }
             }
@@ -9732,7 +10140,8 @@ static bool draw_with_retry(renderer *r, const gpu *g, const gpu_draw *d, stage_
         /* A full descriptor pool or arena only needs a fresh slot: with overlap the
          * batch is submitted and the other slot continues (PSPHD's 4,500-dword
          * uniform draws filled the pool ~11 times a second, each a full GPU wait). */
-        if(vk_work_can_overlap(r))vk_flush(r);
+        /* results still owed by earlier batches: complete them, or the retry fails the same way */
+        if(vk_work_can_overlap(r) && !r->pipes->wb_count && !r->pipes->held_count)vk_flush(r);
         else sync_batch(r);
         vk_begin(r);
         if(!do_draw(r,g,d,vs,ps))r->pipes->skipped++;
@@ -9949,8 +10358,16 @@ static bool depth_copy(renderer *r, const gpu *g) {
               (unsigned long long)dst_addr, w, h, rc, ov, src ? "" : ": no source image");
     }
     if (!src) return true;
+    r->scale_new = src->ext_w != 0; /* PS5C_RT_SCALE: the copy at the source's size */
     vk_image *dst = vk_image_get(r, dst_addr, w, h, f);
+    r->scale_new = false;
     if (!dst || dst == src) return true;
+    if (vk_img_w(dst) != vk_img_w(src) || vk_img_h(dst) != vk_img_h(src)) {
+        static uint32_t mismatch;
+        if (mismatch++ < 8) LOG_W(GPU, "depth copy 0x%llx: scaled and full-size depth (PS5C_RT_SCALE), not copied", (unsigned long long)dst_addr);
+        return true;
+    }
+    w = vk_img_w(src), h = vk_img_h(src);
     end_pass(r);
     vk_barrier(r->cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     vk_barrier(r->cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -9960,6 +10377,7 @@ static bool depth_copy(renderer *r, const gpu *g) {
     c.extent.width = w;
     c.extent.height = h;
     c.extent.depth = 1;
+    census_copy(src, 1);
     vkCmdCopyImage(r->cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     dst->gpu_written = true;
     dst->written_seq = ++r->write_seq;
@@ -9973,6 +10391,7 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
     vk_cpu_prepare(r,g->stats.flips);
     uint64_t t_draw = stat_now();
     vk_begin(r);
+    retired_poll(r);
     uint32_t mode = (gpu_reg(g, mmCB_COLOR_CONTROL) >> 4) & 7;
     static long long cb_modes = -2; /* PS5C_LOG_CB_MODES=<flip>: each draw's CB mode and first targets (debugging aid) */
     if (cb_modes == -2) cb_modes = getenv("PS5C_LOG_CB_MODES") ? atoll(getenv("PS5C_LOG_CB_MODES")) : -1;
@@ -10019,7 +10438,7 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
     uint64_t t0 = stat_now();
     vs->prog = get_program(r, gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_ES));
     if (!vs->prog && !getenv("PS5C_NO_FUSED")) /* the first half of a merged-stage program */
-        vs->prog = get_fused_program(r, gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_ES), gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_GS));
+        vs->prog = get_fused_program(r, gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_ES), gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_GS), 0);
     bool clear_only = vk_depth_stencil_clear_only(gpu_reg(g, mmDB_RENDER_CONTROL), gpu_reg(g, mmCB_COLOR_CONTROL),
                                           gpu_reg(g, mmCB_TARGET_MASK));
     /* No color output, no shader depth/stencil/kill/coverage and no requested
@@ -10027,7 +10446,9 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
      * here while its position-only VS exports no interpolants for that PS. */
     bool opaque_depth = vk_opaque_depth_only(gpu_reg(g, mmDB_SHADER_CONTROL), gpu_reg(g, mmCB_COLOR_CONTROL),
                                             gpu_reg(g, mmCB_TARGET_MASK));
-    const sh_program *guest_ps = clear_only ? NULL : get_program(r, gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_PS));
+    guest_addr ps_addr = gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_PS);
+    const sh_program *guest_ps = clear_only || g->gcn ? NULL : get_radv_pixel_program(r, ps_addr, gpu_reg(g, mmSPI_SHADER_USER_DATA_PS_0 + 3));
+    if (!clear_only && !guest_ps) guest_ps = get_program(r, ps_addr);
     /* Storage/atomic instructions are observable even without color exports.
      * Keep such a PS; DB metadata alone must not erase its memory effects. */
     opaque_depth = opaque_depth && (!guest_ps || !guest_ps->has_stores);
@@ -10244,9 +10665,11 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
                 (culling_triangle || (!maxvert && !(stages&0x30u) && (stages&0x02000000u))) &&
                 ((gpu_reg(g,mmVGT_PRIMITIVE_TYPE)==GPU_PRIM_TRILIST && d->count && !(d->count%3)) || strip) &&
                 ((gpu_reg(g,mmGE_CNTL)>>9)&0x1ffu)>=3;
+            bool mesh_index_supported = !d->indexed || d->index_size == 2 || d->index_size == 4 ||
+                (d->index_size == 1 && !(gpu_reg(g, mmVGT_MULTI_PRIM_IB_RESET_EN) & 1u));
             if(d->count && ((r->mesh_shader && (point || triangle)) || compute) &&
                (uint64_t)sh_graphics_lds_dwords(gs_rsrc2)*4+2048<=(compute?r->props.limits.maxComputeSharedMemorySize:r->mesh_limits.maxMeshSharedMemorySize) && (fast || !((stages>>19)&3u)) &&
-               (!d->indexed || d->index_size==2 || d->index_size==4) &&
+               mesh_index_supported &&
                !vs->info.vs_layer && !vs->info.vs_ucp_mask && !vs->prog->has_stores) {
                 const sh_program *variant=program_with_wave(r,vs->prog,fast,g->stats.flips,&mesh_program);
                 if(variant) {
@@ -11461,6 +11884,7 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
     r->pipes->wave_operation++;
     uint64_t t_disp = stat_now();
     vk_begin(r);
+    retired_poll(r);
     uint64_t t_prof = prof_now(r);
     static int64_t trace_from = -2;
     if (trace_from == -2) trace_from = getenv("PS5C_TRACE_DISPATCH") ? atoll(getenv("PS5C_TRACE_DISPATCH")) : -1;
@@ -11492,6 +11916,7 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
         uint32_t rsrc2 = gpu_reg(g, mmCOMPUTE_PGM_RSRC2);
         uint32_t user = (rsrc2 >> 1) & 0x1F;
         init_sgprs(&cs->eval, g, 0, mmCOMPUTE_USER_DATA_0, user);
+        cs->gcn = g_gcn = g->gcn; /* a PS4 dispatch: GCN buffer/image descriptors (gcn_descriptors) */
         cs->info.stage = SH_STAGE_CS;
         cs->info.fp16_overflow = sh_fp16_overflow_bit(SH_STAGE_CS, gpu_reg(g, mmCOMPUTE_PGM_RSRC1));
         cs->info.local_size[0] = gpu_reg(g, mmCOMPUTE_NUM_THREAD_X) & 0x3FF;

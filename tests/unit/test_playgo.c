@@ -276,9 +276,18 @@ static void test_unknown_installation(void) {
     CHECK(CALL("Initialize", f.page, 0, 0, 0) == 0);
     uint32_t guard = 0x12345678, value = 0;
     CHECK(gmem_write(&f.rt.mem, f.page + 32, &guard, 4));
+    /* nothing to ask (a folder or a plain .exfat dump): every chunk is local */
     f.rt.opts.playgo_query_locus = NULL;
-    CHECK(CALL("Open", f.page + 32, 0, 0, 0) == ERR(14));
-    CHECK(gmem_read(&f.rt.mem, f.page + 32, &value, 4) && value == guard);
+    CHECK(CALL("Open", f.page + 32, 0, 0, 0) == 0);
+    uint32_t local = 0;
+    CHECK(gmem_read(&f.rt.mem, f.page + 32, &local, 4) && local);
+    uint16_t local_id = 2;
+    uint8_t locus = 0;
+    CHECK(gmem_write(&f.rt.mem, f.page + 64, &local_id, 2));
+    CHECK(CALL("GetLocus", local, f.page + 64, 1, f.page + 80) == 0);
+    CHECK(gmem_read(&f.rt.mem, f.page + 80, &locus, 1) && locus == 3);
+    CHECK(CALL("Close", local, 0, 0, 0) == 0);
+    CHECK(gmem_write(&f.rt.mem, f.page + 32, &guard, 4));
     f.rt.opts.playgo_query_locus = query_locus;
     f.known[2] = false;
     CHECK(CALL("Open", f.page + 32, 0, 0, 0) == ERR(14));

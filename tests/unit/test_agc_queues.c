@@ -153,7 +153,10 @@ static void test_semaphore_wait_allows_other_queue_to_signal(void) {
     /* Always submit the producer, so a failing assertion cannot strand the worker. */
     CHECK(invoke("sceAgcDriverSubmitAcb",41,base+272,0)==0);
     CHECK(invoke("#kAPt2J4U3v8",base+128,0,1)==0);
-    CHECK(parked && value(done)==1 && value(counter)==0);
+    /* The suspend point does not wait for a queue parked on a CP wait (suspend_ready), so it
+     * can return after the signal but before the parked waiter's next retry. Wait for the
+     * waiter itself; it must also finish before later tests reuse its command buffer. */
+    CHECK(parked && wait_value(done,1) && value(counter)==0);
 }
 static void test_interrupt_registrations_grow_without_losing_notifications(void) {
     CHECK(equeue_init());

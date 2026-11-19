@@ -25,6 +25,9 @@ PFN_vkDestroyPipeline vkDestroyPipeline=destroy_pipe;
 PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout=destroy_layout;
 PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout=destroy_dsl;
 const char *vk_shader_cache_dir(void) { return dir; }
+/* no translator change in these tests */
+bool vk_shader_cache_migrating(void) { return false; }
+bool vk_pipeline_recipe_migrate(void *recipe) { (void)recipe; return false; }
 size_t vk_pipeline_recipe_size(void) { return sizeof(recipe); }
 bool vk_pipeline_prewarm_size(const void *data,uint64_t *bytes) {
     *bytes=source_bytes;return !missing || ((const recipe *)data)->id!=2;

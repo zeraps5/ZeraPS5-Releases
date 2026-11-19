@@ -8,6 +8,7 @@
  *
  * POSIX entry points return -1 and set the thread's errno; sce* ones return
  * 0x80020000 | errno. Descriptors 0-2 are the console. */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -257,14 +258,27 @@ static bool overlay_twin(uint32_t i, const char *host, char *out, size_t cap) {
     return w > 0 && (size_t)w < cap;
 }
 
-/* Guest path -> host path. Returns 0 or a negative errno. */
-static int resolve_path(hle_call *c, const char *guest, char *host, size_t host_size) {
-    init_dirs(c->rt);
-    char norm[PATH_MAX_];
+/* The working directory (chdir/getcwd), a normalized guest path. Relative
+ * paths start there; /app0 until the game changes it. */
+static char g_cwd[PATH_MAX_] = "/app0";
+static atomic_flag g_cwd_lock = ATOMIC_FLAG_INIT; /* chdir is rare: a short spin */
+static void cwd_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_cwd_lock, memory_order_acquire)) {}
+}
+static void cwd_unlock(void) { atomic_flag_clear_explicit(&g_cwd_lock, memory_order_release); }
+
+/* Guest path -> normalized absolute guest path ("." and ".." folded, never
+ * above the mount point). Returns its length, or a negative errno. */
+static int normalize_path(const char *guest, char *norm, size_t cap) {
     size_t n = 0;
     const char *p = guest;
+    norm[0] = 0;
     if (*p != '/') {
-        n = (size_t)snprintf(norm, sizeof(norm), "/app0");
+        cwd_lock();
+        n = (size_t)snprintf(norm, cap, "%s", g_cwd);
+        cwd_unlock();
+        if (n >= cap) return -E_NAMETOOLONG;
+        if (n == 1) n = norm[0] = 0; /* working directory "/" */
     }
     /* Normalize component by component. */
     while (*p) {
@@ -281,7 +295,7 @@ static int resolve_path(hle_call *c, const char *guest, char *host, size_t host_
                 n = strlen(norm);
             }
         } else {
-            if (n + 1 + len >= sizeof(norm)) return -E_NAMETOOLONG;
+            if (n + 1 + len >= cap) return -E_NAMETOOLONG;
             norm[n++] = '/';
             memcpy(norm + n, p, len);
             n += len;
@@ -289,6 +303,16 @@ static int resolve_path(hle_call *c, const char *guest, char *host, size_t host_
         }
         p += len;
     }
+    return (int)n;
+}
+
+/* Guest path -> host path. Returns 0 or a negative errno. */
+static int resolve_path(hle_call *c, const char *guest, char *host, size_t host_size) {
+    init_dirs(c->rt);
+    char norm[PATH_MAX_];
+    int normalized = normalize_path(guest, norm, sizeof(norm));
+    if (normalized < 0) return normalized;
+    size_t n = (size_t)normalized;
     if (n == 0) return -E_NOENT;
 
     const char *rest = strchr(norm + 1, '/');
@@ -339,7 +363,13 @@ static int resolve_path(hle_call *c, const char *guest, char *host, size_t host_
 typedef bool (*dir_collect_fn)(void *user, const char *name, bool is_dir);
 
 static bool guest_is_root(const char *guest) {
-    if (*guest != '/') return false;
+    if (!*guest) return false;
+    if (*guest != '/') {
+        cwd_lock();
+        bool at_root = !strcmp(g_cwd, "/");
+        cwd_unlock();
+        if (!at_root) return false;
+    }
     for (const char *p = guest; *p;) {
         while (*p == '/') p++;
         if (!*p) break;
@@ -1010,6 +1040,8 @@ static int64_t do_read(hle_call *c, int32_t fd, guest_addr buf, uint64_t n, int6
     if (e->is_dir) return -E_ISDIR;
     if (n == 0) return 0;
     void *dst = hle_mem(c, buf, n);
+    if (!dst && e->file && runtime_longshot_commit(c->rt, buf, n))
+        dst = hle_mem(c, buf, n);
     if (!dst) return -E_FAULT;
     if (e->dev == DEV_RANDOM) {
         static uint64_t state;
@@ -1250,26 +1282,65 @@ static void aio_delete_many(hle_call *c) {
 static void aio_ok(hle_call *c) { hle_ret_s32(c, 0); }
 
 /* struct iovec { void *base; size_t len; } */
-static int64_t do_readv(hle_call *c, int32_t fd, guest_addr iov, int32_t count, int64_t offset) {
-    if (count < 0 || count > 1024) return -E_INVAL;
-    int64_t total = 0;
+static int64_t do_vector_io(hle_call *c, int32_t fd, guest_addr iov, int32_t count, int64_t offset, bool write) {
+    if (count <= 0 || count > 1024) return -E_INVAL;
+    typedef struct { guest_addr base; uint64_t len; } file_iov;
+    file_iov small[8], *vectors = count <= 8 ? small : malloc((size_t)count * sizeof(*vectors));
+    if (!vectors) return -E_NOMEM;
+    int64_t total = 0, result = 0;
+    uint64_t requested = 0;
+    /* Snapshot the vector metadata before I/O; no partial transfer on a bad
+     * vector array or a total length that cannot be represented by ssize_t. */
+    if (!gmem_read(c->mem, iov, vectors, (uint64_t)count * sizeof(*vectors))) {
+        result = -E_FAULT;
+        goto done;
+    }
     for (int32_t i = 0; i < count; i++) {
-        uint64_t base = 0, len = 0;
-        gmem_read_u64(c->mem, iov + (uint64_t)i * 16, &base);
-        gmem_read_u64(c->mem, iov + (uint64_t)i * 16 + 8, &len);
-        int64_t r = do_read(c, fd, base, len, offset >= 0 ? offset + total : -1);
-        if (r < 0) return total ? total : r;
+        if (vectors[i].len > (uint64_t)INT64_MAX - requested) {
+            result = -E_INVAL;
+            goto done;
+        }
+        requested += vectors[i].len;
+    }
+    for (int32_t i = 0; i < count; i++) {
+        uint64_t base = vectors[i].base, len = vectors[i].len;
+        if (offset >= 0 && (uint64_t)offset > (uint64_t)INT64_MAX - (uint64_t)total) {
+            result = total ? total : -E_INVAL;
+            goto done;
+        }
+        int64_t at = offset >= 0 ? offset + total : -1;
+        int64_t r = write ? do_write(c, fd, base, len, at) : do_read(c, fd, base, len, at);
+        if (r < 0) {
+            result = total ? total : r;
+            goto done;
+        }
         total += r;
         if ((uint64_t)r < len) break;
     }
-    return total;
+    result = total;
+done:
+    if (vectors != small) free(vectors);
+    return result;
 }
 
 static void posix_readv(hle_call *c) {
-    ret_posix(c, do_readv(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), -1));
+    ret_posix(c, do_vector_io(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), -1, false));
 }
 static void posix_preadv(hle_call *c) {
-    ret_posix(c, do_readv(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), (int64_t)hle_arg(c, 3)));
+    int64_t offset = (int64_t)hle_arg(c, 3);
+    ret_posix(c, offset < 0 ? -E_INVAL : do_vector_io(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), offset, false));
+}
+static void sce_preadv(hle_call *c) {
+    int64_t offset = (int64_t)hle_arg(c, 3);
+    ret_sce(c, offset < 0 ? -E_INVAL : do_vector_io(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), offset, false));
+}
+static void posix_pwritev(hle_call *c) {
+    int64_t offset = (int64_t)hle_arg(c, 3);
+    ret_posix(c, offset < 0 ? -E_INVAL : do_vector_io(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), offset, true));
+}
+static void sce_pwritev(hle_call *c) {
+    int64_t offset = (int64_t)hle_arg(c, 3);
+    ret_sce(c, offset < 0 ? -E_INVAL : do_vector_io(c, hle_arg_s32(c, 0), hle_arg_ptr(c, 1), hle_arg_s32(c, 2), offset, true));
 }
 
 static int64_t do_lseek(int32_t fd, int64_t offset, int32_t whence) {
@@ -1461,6 +1532,56 @@ static int64_t do_unlink(hle_call *c) {
     return pal_file_remove(host) == PS5C_OK ? 0 : -E_NOENT;
 }
 
+/* int chdir(const char *path): an existing directory becomes the start of relative paths */
+static int64_t do_chdir(hle_call *c) {
+    char path[PATH_MAX_], host[PATH_MAX_], norm[PATH_MAX_];
+    int err = read_guest_path(c, 0, path, sizeof(path));
+    if (!err && !path[0]) err = -E_NOENT;
+    if (!err && guest_is_root(path)) { /* "/" holds the mount points, as stat and open see it */
+        cwd_lock();
+        memcpy(g_cwd, "/", 2);
+        cwd_unlock();
+        LOG_I(KERNEL, "chdir: working directory /");
+        return 0;
+    }
+    if (!err) err = resolve_path(c, path, host, sizeof(host));
+    if (err) return err;
+    pal_path_info info = {0};
+    if (pal_path_stat(host, &info) != PS5C_OK) return -E_NOENT;
+    if (!info.is_dir) return -E_NOTDIR;
+    int n = normalize_path(path, norm, sizeof(norm));
+    if (n <= 0) return n < 0 ? n : -E_NOENT;
+    cwd_lock();
+    memcpy(g_cwd, norm, (size_t)n + 1);
+    cwd_unlock();
+    LOG_I(KERNEL, "chdir: working directory %s", norm);
+    return 0;
+}
+static void posix_chdir(hle_call *c) { ret_posix(c, do_chdir(c)); }
+
+/* char *getcwd(char *buf, size_t size) */
+static void posix_getcwd(hle_call *c) {
+    guest_addr buf = hle_arg_ptr(c, 0);
+    uint64_t size = hle_arg(c, 1);
+    char cwd[PATH_MAX_];
+    cwd_lock();
+    memcpy(cwd, g_cwd, sizeof(cwd));
+    cwd_unlock();
+    size_t len = strlen(cwd);
+    if (!buf || !size) {
+        set_errno(c, E_INVAL);
+        hle_ret_u64(c, 0);
+    } else if (len + 1 > size) {
+        set_errno(c, 34); /* ERANGE */
+        hle_ret_u64(c, 0);
+    } else if (!gmem_write(c->mem, buf, cwd, len + 1)) {
+        set_errno(c, E_FAULT);
+        hle_ret_u64(c, 0);
+    } else {
+        hle_ret_u64(c, buf);
+    }
+}
+
 static void posix_unlink(hle_call *c) { ret_posix(c, do_unlink(c)); }
 static void sce_unlink(hle_call *c) { ret_sce(c, do_unlink(c)); }
 
@@ -1579,6 +1700,9 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("readv", posix_readv),
     POSIX_ENTRY("_readv", posix_readv),
     POSIX_ENTRY("preadv", posix_preadv),
+    HLE_FUNC_ENTRY(K, "sceKernelPreadv", sce_preadv),
+    POSIX_ENTRY("pwritev", posix_pwritev),
+    HLE_FUNC_ENTRY(K, "sceKernelPwritev", sce_pwritev),
     POSIX_ENTRY("write", posix_write),
     POSIX_ENTRY("_write", posix_write),
     HLE_FUNC_ENTRY(K, "sceKernelWrite", sce_write),
@@ -1601,6 +1725,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "sceKernelFstat", sce_fstat),
     HLE_FUNC_ENTRY(K, "sceKernelCheckReachability", sce_check_reachability),
     POSIX_ENTRY("mkdir", posix_mkdir),
+    POSIX_ENTRY("chdir", posix_chdir),
+    POSIX_ENTRY("getcwd", posix_getcwd),
     HLE_FUNC_ENTRY(K, "sceKernelMkdir", sce_mkdir),
     POSIX_ENTRY("unlink", posix_unlink),
     HLE_FUNC_ENTRY(K, "sceKernelUnlink", sce_unlink),
@@ -1615,6 +1741,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "sceKernelGetdirentries", sce_getdirentries),
     POSIX_ENTRY("fsync", fsync_),
     HLE_FUNC_ENTRY(K, "sceKernelFsync", fsync_),
+    HLE_FUNC_ENTRY(K, "sceKernelFdatasync", fsync_),
 };
 
 void hle_register_libkernel_fs(void) {

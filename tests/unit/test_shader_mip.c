@@ -147,6 +147,37 @@ int main(void) {
     mutated[0] = 0xbf820000; /* branch, even to next instruction, is not proven */
     CHECK(sh_analyze(mutated, PS5C_ARRAY_COUNT(mutated), 0x100000, p));
     CHECK(!sh_image_mip_source(p, &info, 0, &source, &literal));
+    /* With branches: a constant mip written on the path every storing lane takes (mip-chain shaders) */
+    uint32_t chain[] = {0x7e000280, 0x7e020280, 0x7da41080, /* v_cmpx_eq_u32 0, v8 */
+                        0xbf880003,                         /* s_cbranch_execz past the store */
+                        0x7e040281,                         /* v_mov_b32 v2, 1 */
+                        0xf0240f08, 0x00000400, 0xbf810000};
+    CHECK(sh_analyze(chain, PS5C_ARRAY_COUNT(chain), 0x100000, p));
+    CHECK(p->has_flow);
+    CHECK(sh_image_mip_source(p, &info, 0, &source, &literal) && source == RDNA2_OP_LITERAL && literal == 1);
+    CHECK(sh_translate(p, &info, &shape, 0, &spv, &words));
+    free(spv);
+    uint32_t skipped[] = {0x7e000280, 0x7e020280, 0x7e040280, /* v2 = 0 */
+                          0xbf880000 | 1,                     /* s_cbranch_execz over the mov, onto the store */
+                          0x7e040281, 0xf0240f08, 0x00000400, 0xbf810000};
+    CHECK(sh_analyze(skipped, PS5C_ARRAY_COUNT(skipped), 0x100000, p));
+    CHECK(!sh_image_mip_source(p, &info, 0, &source, &literal));
+    uint32_t widened[] = {0xbf880000, 0x7e000280, 0x7e020280, 0x7e040281,
+                          0xbefe04c1, /* s_mov_b64 exec, -1: lanes that skipped the mov */
+                          0xf0240f08, 0x00000400, 0xbf810000};
+    CHECK(sh_analyze(widened, PS5C_ARRAY_COUNT(widened), 0x100000, p));
+    CHECK(!sh_image_mip_source(p, &info, 0, &source, &literal));
+    uint32_t looped[] = {0x7e000280, 0x7e020280, 0x7e040281, 0xf0240f08, 0x00000400,
+                         0xbf89fffb, /* s_cbranch_execnz back to the mov */
+                         0xbf810000};
+    CHECK(sh_analyze(looped, PS5C_ARRAY_COUNT(looped), 0x100000, p));
+    CHECK(sh_image_mip_source(p, &info, 0, &source, &literal) && literal == 1); /* the loop re-runs the mov first */
+    uint32_t changed[] = {0x7e000280, 0x7e020280, 0x7e040281, 0xf0240f08, 0x00000400,
+                          0x4a040481, /* v_add_nc_u32 v2, 1, v2 */
+                          0xbf89fffc, /* s_cbranch_execnz back to the store */
+                          0xbf810000};
+    CHECK(sh_analyze(changed, PS5C_ARRAY_COUNT(changed), 0x100000, p));
+    CHECK(!sh_image_mip_source(p, &info, 0, &source, &literal));
     uint32_t desc[8] = {0, 0, 3u | (15u << 14), (9u << 28) | (4u << 16) | (1u << 12)}, selected[8];
     CHECK(sh_image_mip_desc(desc, 2, selected));
     CHECK(((selected[3] >> 12) & 15) == 3 && ((selected[3] >> 16) & 15) == 4);
