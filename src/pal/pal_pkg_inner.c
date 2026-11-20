@@ -369,9 +369,111 @@ ps5c_err pkg_inner_read(pkg_inner *in, void *buf, uint64_t size, uint64_t off) {
     return PS5C_OK;
 }
 
+/* PS4 files compressed on their own hold a PFSC stream (the layout of
+ * pfs_image.dat) in their blocks; it is decoded a block at a time. */
+#define FBLOCKS 4
+
+typedef struct pkg_pfsc {
+    uint64_t bsz, len, nb;
+    uint64_t *off;                   /* nb + 1 block starts in the stored file */
+} pkg_pfsc;
+
+typedef struct pkg_fblock {
+    uint32_t node;                   /* inner node + 1, 0 = empty */
+    uint64_t blk, tick;
+    uint8_t *buf;
+} pkg_fblock;
+
+static ps5c_err pfsc_table(pkg_inner *in, uint32_t idx, const pfs_node *p, pkg_pfsc **out) {
+    if (in->pfsc[idx]) { *out = in->pfsc[idx]; return PS5C_OK; }
+    uint8_t h[0x30];
+    uint64_t stored = p->nblocks * in->ps4fs.block_size;
+    ps5c_err e = stored < sizeof h ? PS5C_ERR_INVALID : pfs_read(&in->ps4fs, p, h, sizeof h, 0);
+    if (e) return e;
+    if (memcmp(h, "PFSC", 4)) return PS5C_ERR_INVALID;
+    uint64_t bsz = rd_le64(h + 0x10), table = rd_le64(h + 0x18), len = rd_le64(h + 0x28);
+    if (!bsz || bsz > UBLOCK || len < p->size) return PS5C_ERR_UNSUPPORTED;
+    uint64_t nb = (len + bsz - 1) / bsz;
+    if (nb > (1u << 26) || table > stored || (nb + 1) * 8 > stored - table) return PS5C_ERR_INVALID;
+    pkg_pfsc *t = calloc(1, sizeof *t);
+    uint8_t *raw = malloc((size_t)(nb + 1) * 8);
+    if (t) t->off = malloc((size_t)(nb + 1) * sizeof *t->off);
+    if (!t || !raw || !t->off) e = PS5C_ERR_NOMEM;
+    else e = pfs_read(&in->ps4fs, p, raw, (nb + 1) * 8, table);
+    for (uint64_t i = 0; !e && i <= nb; i++) {
+        t->off[i] = rd_le64(raw + i * 8);
+        if (t->off[i] > stored || (i && (t->off[i] < t->off[i - 1] || t->off[i] - t->off[i - 1] > CBUF_MAX)))
+            e = PS5C_ERR_INVALID;
+    }
+    free(raw);
+    if (e) {
+        if (t) free(t->off);
+        free(t);
+        return e;
+    }
+    t->bsz = bsz, t->len = len, t->nb = nb;
+    *out = in->pfsc[idx] = t;
+    return PS5C_OK;
+}
+
+/* the decoded block blk of node idx, under file_lock */
+static ps5c_err pfsc_block(pkg_inner *in, uint32_t idx, const pfs_node *p, const pkg_pfsc *t, uint64_t blk,
+                           const uint8_t **out) {
+    pkg_fblock *victim = NULL;
+    for (uint32_t i = 0; i < FBLOCKS; i++) {
+        pkg_fblock *f = &in->fblocks[i];
+        if (f->node == idx + 1 && f->blk == blk) {
+            f->tick = ++in->file_tick;
+            *out = f->buf;
+            return PS5C_OK;
+        }
+        if (!victim || f->tick < victim->tick) victim = f;
+    }
+    if (!victim->buf && !(victim->buf = malloc(UBLOCK + CBUF_MAX))) return PS5C_ERR_NOMEM;
+    victim->node = 0;
+    uint64_t a = t->off[blk], clen = t->off[blk + 1] - a, ulen = PS5C_MIN(t->bsz, t->len - blk * t->bsz);
+    ps5c_err e = PS5C_OK;
+    if (!clen) memset(victim->buf, 0, (size_t)ulen);
+    else if (clen == t->bsz || clen == ulen) e = pfs_read(&in->ps4fs, p, victim->buf, ulen, a);
+    else {
+        uint8_t *cbuf = victim->buf + UBLOCK;
+        e = pfs_read(&in->ps4fs, p, cbuf, clen, a);
+        if (!e && inflate_zlib(cbuf, (size_t)clen, victim->buf, (size_t)ulen) != (long)ulen) {
+            memset(victim->buf, 0, (size_t)ulen);
+            pal_mutex_lock(in->lock);
+            in->bad_blocks++;
+            pal_mutex_unlock(in->lock);
+        }
+    }
+    if (e) return e;
+    victim->node = idx + 1;
+    victim->blk = blk;
+    victim->tick = ++in->file_tick;
+    *out = victim->buf;
+    return PS5C_OK;
+}
+
+static ps5c_err read_pfsc(pkg_inner *in, uint32_t idx, const pfs_node *p, uint8_t *out, uint64_t size, uint64_t off) {
+    pal_mutex_lock(in->file_lock);
+    pkg_pfsc *t;
+    ps5c_err e = pfsc_table(in, idx, p, &t);
+    while (!e && size) {
+        uint64_t blk = off / t->bsz, at = off % t->bsz, n = PS5C_MIN(t->bsz - at, size);
+        const uint8_t *b;
+        if ((e = pfsc_block(in, idx, p, t, blk, &b))) break;
+        memcpy(out, b + at, (size_t)n);
+        out += n, off += n, size -= n;
+    }
+    pal_mutex_unlock(in->file_lock);
+    return e;
+}
+
 ps5c_err pkg_inner_read_file(pkg_inner *in, const pkg_inner_node *n, void *buf, uint64_t size, uint64_t off) {
     if (off > n->size || size > n->size - off) return PS5C_ERR_INVALID;
-    return pkg_inner_read(in, buf, size, n->offset + off);
+    if (!n->pfs) return pkg_inner_read(in, buf, size, n->offset + off);
+    const pfs_node *p = &in->ps4fs.nodes[n->pfs - 1];
+    if (!(p->flags & 1)) return pfs_read(&in->ps4fs, p, buf, size, off);
+    return read_pfsc(in, (uint32_t)(n - in->nodes), p, buf, size, off);
 }
 
 static ps5c_err add_node(pkg_inner *in, pkg_inner_node **out) {
@@ -412,7 +514,14 @@ static ps5c_err load_tree(pkg_inner *in) {
     uint8_t *it = malloc((size_t)(ninodes * INODE_SIZE));
     uint8_t *seen = calloc((size_t)ninodes, 1);
     if (!it || !seen) { free(it); free(seen); return PS5C_ERR_NOMEM; }
-    e = pkg_inner_read(in, it, ninodes * INODE_SIZE, sb + in->block_size);
+    /* inodes never straddle a block: each block holds block_size / INODE_SIZE of them and
+       the rest of the block is padding (only shows once there are more than one block's worth) */
+    const uint64_t per_block = in->block_size / INODE_SIZE;
+    for (uint64_t first = 0; !e && first < ninodes; first += per_block) {
+        uint64_t n = ninodes - first < per_block ? ninodes - first : per_block;
+        e = pkg_inner_read(in, it + first * INODE_SIZE, n * INODE_SIZE,
+                           sb + in->block_size * (1 + first / per_block));
+    }
     pkg_inner_node *root = NULL;
     if (!e) e = add_node(in, &root);
     if (!e) {
@@ -510,16 +619,19 @@ static ps5c_err inner_pfs_read(void *user, void *buf, uint64_t size, uint64_t of
     return pkg_inner_read(user, buf, size, off);
 }
 
-/* PS4: the inner PFS through pal_pfs, as pkg_inner nodes (contiguous files) */
+/* PS4: the inner PFS through pal_pfs, as pkg_inner nodes. A file in one run
+ * of blocks reads at its offset in the image; the others (scattered blocks,
+ * or compressed on their own) through in->ps4fs, which stays open. */
 static ps5c_err load_tree_pfs(pkg_inner *in) {
-    pfs_image fs;
-    ps5c_err e = pfs_open(&fs, inner_pfs_read, in, 0);
+    pfs_image *fs = &in->ps4fs;
+    ps5c_err e = pfs_open(fs, inner_pfs_read, in, 0);
     if (e) return e;
+    in->have_ps4fs = true;
     in->superblock = 0;
-    in->block_size = fs.block_size;
-    uint32_t scattered = 0;
-    for (uint32_t i = 0; !e && i < fs.count; i++) {
-        const pfs_node *p = &fs.nodes[i];
+    in->block_size = fs->block_size;
+    uint32_t scattered = 0, compressed = 0;
+    for (uint32_t i = 0; !e && i < fs->count; i++) {
+        const pfs_node *p = &fs->nodes[i];
         pkg_inner_node *n;
         if ((e = add_node(in, &n))) break;
         n->name = strdup(p->name);
@@ -529,15 +641,22 @@ static ps5c_err load_tree_pfs(pkg_inner *in) {
         n->sibling = p->sibling;
         n->dir = p->dir;
         n->size = p->dir ? 0 : p->size;
-        n->offset = p->start >= 0 ? (uint64_t)p->start * fs.block_size : 0;
+        n->offset = p->start >= 0 ? (uint64_t)p->start * fs->block_size : 0;
         if (!p->dir && (p->blocks || (p->flags & 1))) {
-            scattered++;
-            n->size = 0; /* not one run of the image: not readable this way */
+            n->pfs = i + 1;
+            n->offset = 0;
+            if (p->flags & 1) compressed++;
+            else scattered++;
         }
     }
-    in->uroot = fs.uroot;
-    if (scattered) LOG_W(CORE, "PS4 package: %u files are scattered or compressed on their own; they read as empty", scattered);
-    pfs_close(&fs);
+    in->uroot = fs->uroot;
+    if (!e && (scattered || compressed)) {
+        in->pfsc = calloc(in->count, sizeof *in->pfsc);
+        in->fblocks = calloc(FBLOCKS, sizeof *in->fblocks);
+        if (!in->pfsc || !in->fblocks || pal_mutex_create(&in->file_lock)) e = PS5C_ERR_NOMEM;
+        else LOG_I(CORE, "PS4 package: %u scattered files and %u compressed on their own, read through their blocks",
+                   scattered, compressed);
+    }
     return e;
 }
 
@@ -618,6 +737,13 @@ void pkg_inner_close(pkg_inner *in) {
         decoder_free(d);
     }
     if (in->lock) pal_mutex_destroy(in->lock);
+    for (uint32_t i = 0; in->pfsc && i < in->count; i++)
+        if (in->pfsc[i]) free(in->pfsc[i]->off), free(in->pfsc[i]);
+    free(in->pfsc);
+    for (uint32_t i = 0; in->fblocks && i < FBLOCKS; i++) free(in->fblocks[i].buf);
+    free(in->fblocks);
+    if (in->file_lock) pal_mutex_destroy(in->file_lock);
+    if (in->have_ps4fs) pfs_close(&in->ps4fs);
     pkg_outer_close(&in->outer);
     free(in);
 }

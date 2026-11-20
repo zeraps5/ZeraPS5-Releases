@@ -267,13 +267,46 @@ static void trophy_unlock_ps4(hle_call *c) {
 }
 
 /* PS4 int sceNpTrophyGetTrophyUnlockState(ctx, handle, SceNpTrophyFlagArray *flags, u32 *count):
- * a 128-byte bit array, none unlocked */
+ * 128 bits (SCE_NP_TROPHY_FLAG_SETSIZE) in four 32-bit words, 16 bytes; none unlocked.
+ * Clearing 128 bytes ran past LEGO City Undercover's array on the TrophyInstall
+ * stack, and its stack check ended the game at 19 s. */
 static void trophy_unlock_state_ps4(hle_call *c) {
-    uint8_t *flags = (uint8_t *)hle_mem(c, hle_arg_ptr(c, 2), 128);
+    uint8_t *flags = (uint8_t *)hle_mem(c, hle_arg_ptr(c, 2), 16);
     uint32_t *count = (uint32_t *)hle_mem(c, hle_arg_ptr(c, 3), 4);
-    if (flags) memset(flags, 0, 128);
+    if (flags) memset(flags, 0, 16);
     if (count) *count = 0;
     hle_ret_s32(c, flags ? 0 : (int32_t)0x80551604);
+}
+
+/* PS4 structures start with a size the game fills in (kept); the rest reads as no trophies
+ * unlocked, with the asked id in its field: GameDetails 1184 bytes, GameData 32, GroupDetails
+ * 1184 (groupId at 8), GroupData 40 (groupId at 8), Details 1176 (trophyId at 8), Data 24 (trophyId at 8). */
+static void sized_out(hle_call *c, uint32_t arg, uint32_t size, bool id, int32_t value) {
+    guest_addr p = hle_arg_ptr(c, arg);
+    uint8_t *d = p ? (uint8_t *)hle_mem(c, p, size) : NULL;
+    if (!d) return;
+    memset(d + 8, 0, size - 8);
+    if (id) memcpy(d + 8, &value, 4);
+}
+
+static void trophy_get_game_info_ps4(hle_call *c) {
+    sized_out(c, 2, 1184, false, 0);
+    sized_out(c, 3, 32, false, 0);
+    hle_ret_s32(c, 0);
+}
+
+static void trophy_get_group_info_ps4(hle_call *c) {
+    int32_t id = hle_arg_s32(c, 2);
+    sized_out(c, 3, 1184, true, id);
+    sized_out(c, 4, 40, true, id);
+    hle_ret_s32(c, 0);
+}
+
+static void trophy_get_trophy_info_ps4(hle_call *c) {
+    int32_t id = hle_arg_s32(c, 2);
+    sized_out(c, 3, 1176, true, id);
+    sized_out(c, 4, 24, true, id);
+    hle_ret_s32(c, 0);
 }
 
 #define T "libSceNpTrophy2"
@@ -289,6 +322,9 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(T1, "sceNpTrophyDestroyContext", np_ok),
     HLE_FUNC_ENTRY(T1, "sceNpTrophyUnlockTrophy", trophy_unlock_ps4),
     HLE_FUNC_ENTRY(T1, "sceNpTrophyGetTrophyUnlockState", trophy_unlock_state_ps4),
+    HLE_FUNC_ENTRY(T1, "sceNpTrophyGetGameInfo", trophy_get_game_info_ps4),
+    HLE_FUNC_ENTRY(T1, "sceNpTrophyGetGroupInfo", trophy_get_group_info_ps4),
+    HLE_FUNC_ENTRY(T1, "sceNpTrophyGetTrophyInfo", trophy_get_trophy_info_ps4),
     HLE_FUNC_ENTRY(T, "sceNpTrophy2CreateContext", create_id),
     HLE_FUNC_ENTRY(T, "sceNpTrophy2CreateHandle", create_id),
     HLE_FUNC_ENTRY(T, "sceNpTrophy2RegisterContext", np_ok),

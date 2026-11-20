@@ -90,6 +90,7 @@ static void batch_wait(hle_call *c) {
     hle_ret_s32(c, context_valid(c) ? ACM_UNSUPPORTED : ACM_INVALID_PARAMETER);
 }
 static void command_unsupported(hle_call *c) { hle_ret_s32(c, ACM_UNSUPPORTED); }
+static void job_priority(hle_call *c) { hle_ret_s32(c, 0); } /* a hint only */
 void hle_acm_reset(ps5_runtime *rt) {
     free(rt->acm); rt->acm = NULL; /* runtime teardown: no live callers */
 }
@@ -103,6 +104,8 @@ void hle_register_acm(void) {
         /* commands appended to a batch: batches are not executed, so they are refused too */
         HLE_FUNC_ENTRY("libSceAcm", "sceAcm_ConvReverb_SharedInput", command_unsupported),
         HLE_FUNC_ENTRY("libSceAcm", "sceAcm_FFT", command_unsupported),
+        HLE_FUNC_ENTRY("libSceAcm", "sceAcm_Panner", command_unsupported),
+        HLE_FUNC_ENTRY("libSceAcm", "sceAcmBatchJobPriority", job_priority),
     };
     hle_register_table(table, PS5C_ARRAY_COUNT(table));
 }

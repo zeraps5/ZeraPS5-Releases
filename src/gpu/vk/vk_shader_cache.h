@@ -37,6 +37,15 @@ vk_shader_cache_usage vk_shader_cache_memory(void);
 const char *vk_shader_cache_dir(void);
 const char *vk_shader_cache_game_dir(void);
 void vk_shader_cache_store(uint64_t key, const uint32_t *spirv, size_t words);
+/* The inputs of a translation (sources.bin), recorded once per key: after a
+ * translator change, vk_shader_cache_open translates them again. */
+void vk_shader_cache_note_source(uint64_t key, const sh_program *p, const sh_stage_info *info, const sh_site_shape *shapes,
+                                 uint32_t binding_base);
+/* Until vk_shader_cache_migration_end (vk_pipeline_async.c, after its list):
+ * the new key and binding types of a shader known by its key before the change. */
+bool vk_shader_cache_migrating(void);
+bool vk_shader_cache_migrated(uint64_t old_key, uint64_t *key, const uint8_t **types, uint32_t *n);
+void vk_shader_cache_migration_end(void);
 
 /* Time spent translating (a miss) and creating a pipeline (driver compile). */
 void vk_shader_cache_note_translate(uint64_t ns);

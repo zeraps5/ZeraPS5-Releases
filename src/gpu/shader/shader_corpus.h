@@ -35,5 +35,11 @@ bool sh_corpus_read(const char *path, sh_corpus_entry *e);
  * contract. Old/code-only captures keep opcode inference. */
 bool sh_corpus_analyze(const sh_corpus_entry *e, sh_program *p);
 void sh_corpus_free(sh_corpus_entry *e);
+/* The same layout in memory (vk_shader_cache.c keeps entries in one file):
+ * the encoded size, encoding into `out` (cap bytes) and decoding (code is
+ * malloc'ed, sh_corpus_free). Decoding accepts the sizes sh_corpus_read does. */
+size_t sh_corpus_encoded_size(const sh_corpus_entry *e);
+bool sh_corpus_encode(const sh_corpus_entry *e, uint8_t *out, size_t cap);
+bool sh_corpus_decode(const uint8_t *data, size_t size, sh_corpus_entry *e);
 
 #endif

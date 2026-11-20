@@ -9,7 +9,14 @@ static gpu g;
 static guest_addr base;
 static uint32_t interrupts;
 static guest_addr sync_label;
+static gpu_draw draws[3];
+static uint32_t draw_count;
 
+static void record_draw(void *user, const gpu *state, const gpu_draw *draw) {
+    PS5C_UNUSED(user); PS5C_UNUSED(state);
+    if (draw_count < PS5C_ARRAY_COUNT(draws)) draws[draw_count] = *draw;
+    draw_count++;
+}
 static void irq(void *user, int32_t queue, uint32_t context) {
     PS5C_UNUSED(user); PS5C_UNUSED(queue); PS5C_UNUSED(context); interrupts++;
 }
@@ -28,6 +35,28 @@ static void reset(void) {
     interrupts = 0; sync_label = 0;
 }
 static void put(guest_addr at, const uint32_t *p, uint32_t n) { gmem_write(&mem, at, p, n * 4); }
+static void test_8bit_index_draws(void) {
+    reset();
+    draw_count = 0;
+    guest_addr indices = base + 128, args = base + 96;
+    const uint32_t indexed_args[] = {3, 1, 7, 0, 0};
+    put(args, indexed_args, PS5C_ARRAY_COUNT(indexed_args));
+    const uint32_t pm4[] = {
+        0xc0002a00, 2, /* INDEX_TYPE: VGT_INDEX_8 */
+        0xc0012600, (uint32_t)indices, (uint32_t)(indices >> 32), /* INDEX_BASE */
+        0xc0042700, 32, (uint32_t)indices, (uint32_t)(indices >> 32), 3, 0, /* DRAW_INDEX_2 */
+        0xc0033500, 32, 5, 3, 0, /* DRAW_INDEX_OFFSET_2 */
+        0xc0021100, 1, (uint32_t)args, (uint32_t)(args >> 32), /* SET_BASE */
+        0xc0032500, 0, 0, 0, 0, /* DRAW_INDEX_INDIRECT */
+    };
+    put(base + 256, pm4, PS5C_ARRAY_COUNT(pm4));
+    gpu_submit(&g, base + 256, PS5C_ARRAY_COUNT(pm4), 0);
+    CHECK(draw_count == 3);
+    const uint32_t offsets[] = {0, 5, 7};
+    for (uint32_t i = 0; i < PS5C_ARRAY_COUNT(draws); i++)
+        CHECK(draws[i].indexed && draws[i].count == 3 && draws[i].index_size == 1 &&
+              draws[i].index_addr == indices + offsets[i]);
+}
 static uint32_t value(guest_addr at) { uint32_t v = ~0u; gmem_read(&mem, at, &v, 4); return v; }
 static void atomic_add(uint32_t *p, guest_addr at) {
     uint32_t a[] = {0xc0061e00, 9, (uint32_t)at, (uint32_t)(at >> 32), 1, 0, 0, 0};
@@ -338,9 +367,9 @@ int main(void) {
     pal_init(); gmem_config cfg = gmem_default_config(); cfg.identity = false;
     if (gmem_init(&mem, &cfg) != PS5C_OK ||
         gmem_map(&mem, GUEST_MODULE_BASE, GUEST_PAGE_SIZE, GPROT_RW, GMAP_FIXED, "CP waits test", &base) != PS5C_OK) return 2;
-    gpu_callbacks cb = {.interrupt=irq, .sync_mem=sync_read};
+    gpu_callbacks cb = {.interrupt=irq, .sync_mem=sync_read, .draw=record_draw};
     if (gpu_init(&g, &mem, &cb) != PS5C_OK) return 2;
-    const test_case cases[] = {TEST_CASE(test_dispatch_wave_initiator), TEST_CASE(test_nested_wait_no_replay_or_early_irq), TEST_CASE(test_chain_rewind_preserves_tail_jump),
+    const test_case cases[] = {TEST_CASE(test_8bit_index_draws), TEST_CASE(test_dispatch_wave_initiator), TEST_CASE(test_nested_wait_no_replay_or_early_irq), TEST_CASE(test_chain_rewind_preserves_tail_jump),
         TEST_CASE(test_conditional_chain_keeps_real_call_depth),
         TEST_CASE(test_conditional_chain_wait_resumes_only_selected_path),
         TEST_CASE(test_conditional_four_byte_predicate_and_else),

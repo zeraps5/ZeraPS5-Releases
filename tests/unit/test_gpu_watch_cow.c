@@ -27,6 +27,40 @@ static int32_t write_loop(void *arg) {
     return 0;
 }
 
+/* A guest thread writing a neighbour page while part of its view is unmapped: each slot is
+ * written once, so a write that lands between the copy of the private page and the unmap stays
+ * lost. The world hooks stop it (as runtime.c stops every guest thread). */
+static atomic_uintptr_t g_writer;
+static atomic_uint g_written, g_stops, g_resumes;
+static atomic_int g_writer_done;
+static int32_t slot_writer(void *arg) {
+    atomic_store(&g_writer, pal_thread_open_current());
+    volatile uint32_t *w = (volatile uint32_t *)arg;
+    for (uint32_t i = 0; i < PAGE / 4; i++) {
+        w[i] = i + 1;
+        atomic_store(&g_written, i + 1);
+        for (volatile uint32_t k = 0; k < 2000; k++) {}
+    }
+    /* alive until the unmap is done: a finished thread cannot be suspended (a busy PC
+     * could let it finish first) */
+    while (!atomic_load(&g_writer_done)) pal_thread_yield();
+    return 0;
+}
+static bool stop_writer(void *user) {
+    (void)user;
+    uintptr_t h = atomic_load(&g_writer);
+    atomic_fetch_add(&g_stops, 1);
+    if (!h || !pal_thread_suspend(h)) return false;
+    pal_cpu_regs regs;
+    pal_thread_get_regs(h, &regs);
+    return true;
+}
+static void resume_writer(void *user) {
+    (void)user;
+    atomic_fetch_add(&g_resumes, 1);
+    pal_thread_resume(atomic_load(&g_writer));
+}
+
 int main(void) {
 #ifdef _WIN32
     _putenv("PS5C_GPU_WATCH=cow");
@@ -150,6 +184,25 @@ int main(void) {
     CHECK(gmem_map_direct(&m, GUEST_PH_BASE + 0x140000, VIEW, PAGE, GPROT_RW, GMAP_FIXED, 0x40000, "view 3 again", &o5, &shared) == PS5C_OK);
     volatile uint8_t *u = (volatile uint8_t *)(uintptr_t)o5;
     CHECK(u[PAGE + 3] == 0x12 && u[6 * PAGE + 3] == 0x11 && u[4 * PAGE + 1] == 0x13 && u[7 * PAGE] == 0x87);
+
+    /* partial unmap while another thread writes the part that stays: no write lost */
+    gmem_set_world_hooks(stop_writer, resume_writer, NULL);
+    guest_addr o6 = 0;
+    CHECK(gmem_map_direct(&m, GUEST_PH_BASE + 0x180000, VIEW, PAGE, GPROT_RW, GMAP_FIXED, 0x80000, "view 4", &o6, &shared) == PS5C_OK);
+    volatile uint8_t *v6 = (volatile uint8_t *)(uintptr_t)o6;
+    for (uint32_t i = 0; i < VIEW; i++) v6[i] = 0;
+    CHECK(gpu_watch_arm(GPU_WATCH_TEXTURES, o6, VIEW));
+    v6[3] = 1; /* the tracker holds private pages in this view */
+    CHECK(pal_thread_create(&t, slot_writer, (void *)(v6 + 6 * PAGE), "slot writer", 0) == PS5C_OK);
+    while (atomic_load(&g_written) < 64) pal_thread_yield();
+    CHECK(gmem_unmap(&m, o6, GUEST_PAGE_SIZE) == PS5C_OK);
+    atomic_store(&g_writer_done, 1);
+    pal_thread_join(t, NULL);
+    CHECK(atomic_load(&g_stops) == 1 && atomic_load(&g_resumes) == 1);
+    for (uint32_t i = 0; i < PAGE / 4; i++) CHECK(((volatile uint32_t *)(v6 + 6 * PAGE))[i] == i + 1);
+    gmem_set_world_hooks(NULL, NULL, NULL);
+    pal_thread_close_handle(atomic_load(&g_writer));
+    CHECK(gmem_unmap(&m, o6 + GUEST_PAGE_SIZE, VIEW - GUEST_PAGE_SIZE) == PS5C_OK);
 
     /* what the sweeper does: a write found without any client asking the system */
     CHECK(gpu_watch_arm(GPU_WATCH_TEXTURES, o5 + 7 * PAGE, PAGE));

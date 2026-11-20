@@ -365,6 +365,7 @@ void ue_scale_prepare(const char *app_dir, const char *title_id) {
               pal_file_write(f, pak, pak_size, NULL) == PS5C_OK;
     if (f) pal_file_close(f);
     free(pak);
+    if (ok) settings_internal_height_native();
     if (ok) LOG_I(CORE, "Unreal: internal resolution %lld%% (%s, %s)", (long long)percent, profile_name, path);
     else LOG_W(CORE, "Unreal: cannot write %s", path);
 }

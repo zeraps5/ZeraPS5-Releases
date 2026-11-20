@@ -357,6 +357,14 @@ void gmem_set_cow_hooks(void (*release)(guest_addr addr, uint64_t size, uint8_t 
     g_release_hook = release;
     g_alias_hook = aliased;
 }
+static bool (*g_world_stop)(void *user);
+static void (*g_world_resume)(void *user);
+static void *g_world_user;
+void gmem_set_world_hooks(bool (*stop)(void *user), void (*resume)(void *user), void *user) {
+    g_world_user = user;
+    g_world_resume = resume;
+    g_world_stop = stop;
+}
 /* Caller holds the map lock. */
 static uint8_t *phys_window(gmem *m) {
     if (!m->phys_win && m->shm) {
@@ -587,12 +595,19 @@ static ps5c_err ph_release_unit(gmem *m, guest_addr os_base, guest_addr addr, gu
         trace_memory_locked(m,"after-private-split",lo,hi-lo);
         return PS5C_OK;
     }
+    /* Guest threads stand still while the tracker's private pages are copied back and the view is
+     * placed again (gmem_set_world_hooks): only when the tracker has pages in this view. */
+    bool stopped = false;
     if (g_release_hook) { /* only views reach here: preserve the COW tracker's private pages */
         uint8_t *win = phys_window(m);
+        stopped = g_world_stop && g_alias_hook && g_alias_hook(os_base, os_size) && g_world_stop(g_world_user);
         g_release_hook(os_base, os_size, win ? win + phys : NULL);
     }
     ps5c_err result=pal_ph_unmap_view(host_ptr(m,os_base));
-    if(result!=PS5C_OK)return result;
+    if(result!=PS5C_OK) {
+        if (stopped) g_world_resume(g_world_user);
+        return result;
+    }
     for (size_t k = 0; k < n; k++) { /* unbacked for now */
         gmem_vma *v = &m->vmas.data[first + k];
         if (!v->reserved && v->start >= addr && v->start + v->size <= end) m->mapped_bytes -= v->size;
@@ -609,8 +624,9 @@ static ps5c_err ph_release_unit(gmem *m, guest_addr os_base, guest_addr addr, gu
         pal_ph_split(host_ptr(m, v->start), v->size);
         ps5c_err err = pal_ph_map_view(m->shm, vphys, host_ptr(m, v->start), v->size, v->prot, v->demand);
         if (err != PS5C_OK) {
-            LOG_E(MEM,"remap of 0x%llx+0x%llx failed: %s",(unsigned long long)v->start,
-                  (unsigned long long)v->size,ps5c_err_str(err));
+            if (!stopped) /* no logging while the guest threads stand still (one may hold the log lock) */
+                LOG_E(MEM,"remap of 0x%llx+0x%llx failed: %s",(unsigned long long)v->start,
+                      (unsigned long long)v->size,ps5c_err_str(err));
             result=err;
             continue;
         }
@@ -618,6 +634,12 @@ static ps5c_err ph_release_unit(gmem *m, guest_addr os_base, guest_addr addr, gu
         v->os_base = v->start;
         v->os_size = v->size;
         v->phys = vphys;
+    }
+    if (stopped) {
+        g_world_resume(g_world_user);
+        if (result != PS5C_OK)
+            LOG_E(MEM, "remap of parts of 0x%llx+0x%llx failed: %s", (unsigned long long)os_base,
+                  (unsigned long long)os_size, ps5c_err_str(result));
     }
     changed(os_base, os_size); /* the parts placed again have their own protection now */
     trace_memory_locked(m,"after-unit-release",os_base,os_size);

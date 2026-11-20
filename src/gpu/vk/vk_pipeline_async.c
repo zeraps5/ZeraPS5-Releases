@@ -138,6 +138,60 @@ static bool list_append(const void *recipe) {
     }
 }
 
+/* g.lock not needed yet (before the workers): queue a listed recipe for prewarming within the budgets */
+static void admit(const uint8_t *recipe, uint64_t key, uint64_t *recipes, uint64_t *sources) {
+    uint64_t bytes = 0;
+    if (g.count < g.prewarm_limit && g.rsize <= g.recipe_budget - *recipes &&
+        vk_pipeline_prewarm_size(recipe, &bytes) && bytes <= g.source_budget - *sources) {
+        job *j = add_job(key, recipe, J_QUEUED);
+        if (j) { j->prewarm = true; *recipes += g.rsize; *sources += bytes; }
+    }
+}
+
+/* The list of an earlier translator (`file` holds it, `size` bytes): its
+ * recipes whose shaders were translated again (vk_shader_cache_migrated)
+ * start the new list and are prewarmed; the rest are dropped. */
+static void migrate_list(pal_file *file, uint64_t size) {
+    uint8_t *recipe = malloc(g.rsize);
+    uint64_t done = 0, recipes = 0, sources = 0, t0 = pal_time_ns();
+    uint32_t total = 0, kept = 0;
+    uint8_t **all = NULL;
+    uint32_t n = 0;
+    /* read them all before the file starts over */
+    for (uint64_t at = sizeof(list_head); recipe && size - at >= g.rsize && at <= g.list_limit; at += g.rsize) {
+        if (pal_file_pread(file, recipe, g.rsize, at, &done) != PS5C_OK || done != g.rsize) break;
+        total++;
+        if (!vk_pipeline_recipe_migrate(recipe)) continue;
+        uint8_t **grown = realloc(all, sizeof(*all) * (n + 1));
+        uint8_t *copy = grown ? malloc(g.rsize) : NULL;
+        if (grown) all = grown;
+        if (!copy) break;
+        memcpy(copy, recipe, g.rsize);
+        all[n++] = copy;
+    }
+    list_head want = {LIST_MAGIC, PS5C_SHADER_TRANSLATOR_HASH, g.rsize};
+    if (pal_file_truncate(file, 0) == PS5C_OK && pal_file_pwrite(file, &want, sizeof(want), 0, &done) == PS5C_OK &&
+        done == sizeof(want)) {
+        g.list = file;
+        g.list_end = sizeof(want);
+    } else {
+        pal_file_close(file);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t key = hash_recipe(all[i], g.rsize);
+        if (!hmap64_get(&g.recorded, key, &(uint64_t){0}) && list_append(all[i])) {
+            kept++;
+            admit(all[i], key, &recipes, &sources);
+        }
+        free(all[i]);
+    }
+    free(all);
+    free(recipe);
+    g.queued = g.count;
+    LOG_I(GPU, "pipelines: the translator changed; %u of %u listed pipelines carried over (%.0f ms)", kept, total,
+          (pal_time_ns() - t0) / 1e6);
+}
+
 static void load_list(const char *path) {
     uint64_t size = 0;
     list_head want = {LIST_MAGIC, PS5C_SHADER_TRANSLATOR_HASH, g.rsize};
@@ -149,6 +203,11 @@ static void load_list(const char *path) {
     if (pal_file_size(file, &size) != PS5C_OK) goto close_file;
     if (size >= sizeof(head) && (pal_file_pread(file, &head, sizeof(head), 0, &done) != PS5C_OK || done != sizeof(head)))
         goto close_file;
+    if (writable && size >= sizeof(head) && head.magic == want.magic && head.recipe_size == want.recipe_size &&
+        head.translator != want.translator && vk_shader_cache_migrating()) {
+        migrate_list(file, size);
+        return;
+    }
     if (size < sizeof(head) || memcmp(&head, &want, sizeof(head))) {
         if (!writable || g.list_limit < sizeof(want) || pal_file_truncate(file, 0) != PS5C_OK ||
             pal_file_pwrite(file, &want, sizeof(want), 0, &done) != PS5C_OK || done != sizeof(want)) goto close_file;
@@ -169,12 +228,7 @@ static void load_list(const char *path) {
         uint64_t key = hash_recipe(recipe, g.rsize);
         if (!hmap64_get(&g.recorded, key, &(uint64_t){0})) {
             if (!hmap64_put(&g.recorded, key, 0)) { limited = true; break; }
-            uint64_t bytes = 0;
-            if (g.count < g.prewarm_limit && g.rsize <= g.recipe_budget - recipes &&
-                vk_pipeline_prewarm_size(recipe, &bytes) && bytes <= g.source_budget - sources) {
-                job *j = add_job(key, recipe, J_QUEUED);
-                if (j) { j->prewarm = true; recipes += g.rsize; sources += bytes; }
-            }
+            admit(recipe, key, &recipes, &sources);
         }
         good += g.rsize;
     }
@@ -301,9 +355,12 @@ void vk_pipeline_async_start(renderer *r) {
     hmap64_init(&g.index);
     hmap64_init(&g.recorded);
     g.list_limit = vk_cache_budget_mb("PS5C_PIPELINE_LIST_MB", 256);
-    g.recipe_budget = vk_cache_budget_mb("PS5C_PIPELINE_PREWARM_RECIPE_MB", 8);
-    g.source_budget = vk_cache_budget_mb("PS5C_PIPELINE_PREWARM_MB", 16);
-    g.prewarm_limit = (uint32_t)vk_cache_budget("PS5C_PIPELINE_PREWARM_COUNT", 64, 65536);
+    /* A recipe is ~160 KB: 32 MB prewarm ~200 pipelines (Rogue Prince's level
+     * uses ~125; after a translator change each one not prewarmed is a draw
+     * waiting for a full driver compile). */
+    g.recipe_budget = vk_cache_budget_mb("PS5C_PIPELINE_PREWARM_RECIPE_MB", 32);
+    g.source_budget = vk_cache_budget_mb("PS5C_PIPELINE_PREWARM_MB", 32);
+    g.prewarm_limit = (uint32_t)vk_cache_budget("PS5C_PIPELINE_PREWARM_COUNT", 256, 65536);
     g.record_limit = (uint32_t)vk_cache_budget("PS5C_PIPELINE_LIST_ENTRIES", 65536, 262144);
     char path[400];
     snprintf(path, sizeof(path), "%s/pipelines-list.bin", dir);

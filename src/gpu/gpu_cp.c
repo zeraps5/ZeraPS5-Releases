@@ -244,6 +244,12 @@ static void save_shader(const gpu *g, guest_addr addr) { save_shader_words(g, ad
 
 /* ---- Draws ---- */
 
+static uint32_t draw_index_size(const gpu *g) {
+    uint32_t type = gpu_reg(g, mmVGT_INDEX_TYPE) & 3u;
+    if (!g->gcn && type == 2u) return 1;
+    return type == 1u ? 4 : 2;
+}
+
 static double f32_of(uint32_t bits) {
     float f;
     memcpy(&f, &bits, 4);
@@ -514,7 +520,23 @@ static void dispatch(gpu *g, uint32_t x, uint32_t y, uint32_t z) {
         LOG_I(GPU, "%s", line);
     }
     if (dumping(g) || saving_shaders()) save_shader(g, gpu_reg_addr256(g, mmCOMPUTE_PGM_LO));
-    if (g->cb.dispatch) g->cb.dispatch(g->cb.user, g, x, y, z);
+    if (!g->cb.dispatch) return;
+    if (!g->gcn) {
+        g->cb.dispatch(g->cb.user, g, x, y, z);
+        return;
+    }
+    /* A PS4 dispatch runs the RDNA2 copy of its GCN program, as draw_gcn does
+     * for VS/PS; one that cannot be re-encoded is skipped (it was decoded as
+     * RDNA2 bytes before). */
+    guest_addr pgm = gpu_reg_addr256(g, mmCOMPUTE_PGM_LO), none = 0;
+    guest_addr code = pgm ? gcn_copy_of(g, pgm, mmCOMPUTE_USER_DATA_0, &none) : 0;
+    if (!code) return;
+    uint32_t lo = g->regs[mmCOMPUTE_PGM_LO], hi = g->regs[mmCOMPUTE_PGM_HI];
+    g->regs[mmCOMPUTE_PGM_LO] = (uint32_t)(code >> 8);
+    g->regs[mmCOMPUTE_PGM_HI] = (uint32_t)(code >> 40) & 0xFF;
+    g->cb.dispatch(g->cb.user, g, x, y, z);
+    g->regs[mmCOMPUTE_PGM_LO] = lo;
+    g->regs[mmCOMPUTE_PGM_HI] = hi;
 }
 
 /* Reads indirect arguments: earlier GPU work of the batch may still hold them. */
@@ -530,7 +552,24 @@ static bool read_args(gpu *g, guest_addr a, void *dst, uint32_t size) {
     bool trace = trace_addr && a == trace_addr && size <= 20 && traced++ < 24;
     uint32_t before[5] = {0};
     bool before_ok = trace && gmem_read(g->mem, a, before, size);
+    /* PS5C_GPU_STATS: how often indirect arguments wait for GPU results (a whole flush and wait) */
+    static int stats = -1;
+    static uint64_t reads, waits, wait_ns, last;
+    if (stats < 0) stats = getenv("PS5C_GPU_STATS") != NULL;
+    uint64_t t0 = stats ? pal_time_ns() : 0;
     if (g->cb.sync_mem) g->cb.sync_mem(g->cb.user, a, size);
+    if (stats) {
+        uint64_t took = pal_time_ns() - t0;
+        reads++;
+        if (took > 100000) waits++, wait_ns += took; /* a flush: a quick check takes microseconds */
+        if (!last) last = t0;
+        if (t0 - last >= 1000000000ull) {
+            LOG_I(GPU, "indirect arguments: %llu read, %llu waited for GPU results (%.1f ms)", (unsigned long long)reads,
+                  (unsigned long long)waits, (double)wait_ns / 1e6);
+            reads = waits = wait_ns = 0;
+            last = t0;
+        }
+    }
     bool ok = gmem_read(g->mem, a, dst, size);
     if (trace) {
         uint32_t after[5] = {0};
@@ -581,7 +620,7 @@ static void draw_indirect(gpu *g, bool indexed, guest_addr a, uint32_t count, ui
         }
         gpu_draw d = {false, n, instances, 0, 0};
         if (indexed) {
-            uint32_t isize = (gpu_reg(g, mmVGT_INDEX_TYPE) & 3) == 1 ? 4 : 2;
+            uint32_t isize = draw_index_size(g);
             d.indexed = true;
             d.index_addr = g->index_base + (guest_addr)args[2] * isize;
             d.index_size = isize;
@@ -1415,14 +1454,14 @@ static void run_packets(gpu *g, guest_addr addr, uint32_t dwords, int32_t queue_
             break;
         case IT_DRAW_INDEX_2: /* max_size, base lo, base hi, count, initiator */
             if (len >= 6) {
-                uint32_t isize = (gpu_reg(g, mmVGT_INDEX_TYPE) & 3) == 1 ? 4 : 2;
+                uint32_t isize = draw_index_size(g);
                 gpu_draw d = {true, p[4], g->num_instances, (guest_addr)p[2] | ((guest_addr)p[3] << 32), isize};
                 draw(g, &d);
             }
             break;
         case IT_DRAW_INDEX_OFFSET_2: /* max_size, offset, count, initiator */
             if (len >= 5) {
-                uint32_t isize = (gpu_reg(g, mmVGT_INDEX_TYPE) & 3) == 1 ? 4 : 2;
+                uint32_t isize = draw_index_size(g);
                 gpu_draw d = {true, p[3], g->num_instances, g->index_base + (guest_addr)p[2] * isize, isize};
                 draw(g, &d);
             }

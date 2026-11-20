@@ -130,6 +130,45 @@ static void concatenate(hle_call *c, bool bounded) {
         d = NULL;
     hle_ret_u64(c, d ? a : 0);
 }
+/* size_t strlcpy(char *dst, const char *src, size_t size): copies at most size-1
+ * bytes, always terminates (size > 0), returns strlen(src) */
+static void lcopy_(hle_call *c) {
+    uint64_t sl, size = hle_arg(c, 2);
+    const char *src = string(c, 1, &sl);
+    if (!src) {
+        hle_ret_u64(c, 0);
+        return;
+    }
+    if (size) {
+        uint64_t n = sl < size - 1 ? sl : size - 1;
+        char *d = hle_mem(c, hle_arg_ptr(c, 0), n + 1);
+        if (d) {
+            memmove(d, src, (size_t)n);
+            d[n] = 0;
+        }
+    }
+    hle_ret_u64(c, sl);
+}
+/* size_t strlcat(char *dst, const char *src, size_t size): returns the length it
+ * tried to create, strnlen(dst, size) + strlen(src) */
+static void lconcat_(hle_call *c) {
+    uint64_t dl = 0, sl, size = hle_arg(c, 2);
+    guest_addr a = hle_arg_ptr(c, 0);
+    const char *src = string(c, 1, &sl);
+    if (!src || !string_length(c, a, size, &dl)) {
+        hle_ret_u64(c, 0);
+        return;
+    }
+    if (dl < size) {
+        uint64_t n = sl < size - dl - 1 ? sl : size - dl - 1;
+        char *d = hle_mem(c, a, dl + n + 1);
+        if (d) {
+            memmove(d + dl, src, (size_t)n);
+            d[dl + n] = 0;
+        }
+    }
+    hle_ret_u64(c, dl + sl);
+}
 static void concat_(hle_call *c) {
     concatenate(c, false);
 }
@@ -263,6 +302,36 @@ static void strtod_(hle_call *c) {
 static void strtof_(hle_call *c) {
     floating(c, true, true);
 }
+static void ldexp_(hle_call *c) {
+    double x;
+    memcpy(&x, &c->a->xmm[0][0], 8);
+    double v = ldexp(x, (int)(int32_t)hle_arg(c, 0));
+    memcpy(&c->a->ret_xmm[0][0], &v, 8);
+}
+static void frexp_(hle_call *c) {
+    double x;
+    int exponent;
+    memcpy(&x, &c->a->xmm[0][0], sizeof(x));
+    double fraction = frexp(x, &exponent);
+    int32_t guest_exponent = exponent;
+    gmem_write(c->mem, hle_arg_ptr(c, 0), &guest_exponent, sizeof(guest_exponent));
+    memcpy(&c->a->ret_xmm[0][0], &fraction, sizeof(fraction));
+}
+static void isfinite_(hle_call *c) {
+    double x;
+    memcpy(&x, &c->a->xmm[0][0], 8);
+    hle_ret_s32(c, isfinite(x) ? 1 : 0);
+}
+static void isfinitef_(hle_call *c) {
+    float x;
+    memcpy(&x, &c->a->xmm[0][0], sizeof(x));
+    hle_ret_s32(c, isfinite(x) ? 1 : 0);
+}
+static void lround_(hle_call *c) {
+    double x;
+    memcpy(&x, &c->a->xmm[0][0], sizeof(x));
+    hle_ret_u64(c, (uint64_t)llround(x));
+}
 static void lroundf_(hle_call *c) {
     float x;
     memcpy(&x, &c->a->xmm[0][0], 4);
@@ -341,8 +410,8 @@ SINCOS(sincosf, float, sinf, cosf)
     }
     MATH1(sin, double) MATH1(cos, double) MATH1(tan, double) MATH1(acos, double) MATH1(log2, double)
         MATH1(log10, double) MATH1(exp2, double) MATH1(sinf, float) MATH1(cosf, float)
-            MATH1(acosf, float) MATH1(logf, float) MATH1(log2f, float) MATH1(exp2f, float)
-                MATH2(pow, double) MATH2(powf, float) MATH2(atan2, double)
+            MATH1(acosf, float) MATH1(logf, float) MATH1(log2f, float) MATH1(exp2f, float) MATH1(round, double)
+                MATH1(exp, double) MATH1(expf, float) MATH2(pow, double) MATH2(powf, float) MATH2(atan2, double)
 #define E(name, fn) HLE_FUNC_ENTRY("libSceLibcInternal", name, fn)
                     static const hle_export exports[] = {
                         E("memcpy", copy_memory),
@@ -356,6 +425,8 @@ SINCOS(sincosf, float, sinf, cosf)
                         E("strncpy", copy_nstring),
                         E("strcat", concat_),
                         E("strncat", nconcat_),
+                        E("strlcpy", lcopy_),
+                        E("strlcat", lconcat_),
                         E("strcmp", cmp_),
                         E("strncmp", ncmp_),
                         E("strcasecmp", icmp_),
@@ -377,7 +448,13 @@ SINCOS(sincosf, float, sinf, cosf)
                         E("mbtowc", mbtowc_),
                         E("wctob", wctob_),
                         E("wcslen", wcslen_),
+                        E("lround", lround_),
                         E("lroundf", lroundf_),
+                        E("round", round_),
+                        E("ldexp", ldexp_),
+                        E("frexp", frexp_),
+                        E("__isfinite", isfinite_),
+                        E("__isfinitef", isfinitef_),
                         E("tolower", tolower_),
                         E("toupper", toupper_),
                         E("isspace", isspace_),
@@ -396,6 +473,7 @@ SINCOS(sincosf, float, sinf, cosf)
                         E("log2", log2_),
                         E("log10", log10_),
                         E("exp2", exp2_),
+                        E("exp", exp_),
                         E("sinf", sinf_),
                         E("cosf", cosf_),
                         E("acosf", acosf_),
@@ -403,6 +481,7 @@ SINCOS(sincosf, float, sinf, cosf)
                         E("logf", logf_),
                         E("log2f", log2f_),
                         E("exp2f", exp2f_),
+                        E("expf", expf_),
 };
 void hle_register_libc_memory(void) {
     hle_register_table(exports, PS5C_ARRAY_COUNT(exports));

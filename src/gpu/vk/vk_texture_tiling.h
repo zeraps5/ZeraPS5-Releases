@@ -220,11 +220,12 @@ static inline uint32_t gcn_micro_offset(uint32_t sw_mode, uint32_t x, uint32_t y
 }
 
 /* Supported swizzles: SW_256B_S (mode 1), SW_4KB_S (mode 5), SW_64KB_S (mode 9), SW_64KB_Z_X
- * (24) and SW_64KB_R_X (27). The 64 KB standard pattern is the 4 KB one plus
+ * (24), SW_64KB_S_X (25), SW_64KB_D_X (26) and SW_64KB_R_X (27). The 64 KB standard pattern is the 4 KB one plus
  * four bits that keep alternating Y, X, Y, X above it, so a 64 KB block is
  * 4x4 blocks of 4 KB; the _X modes use the same 64 KB block dimensions. */
 static inline bool std_supported(uint32_t sw_mode) {
-    return sw_mode == 0 || sw_mode == 1 || sw_mode == 5 || sw_mode == 9 || sw_mode == 22 || sw_mode == 24 || sw_mode == 27 ||
+    return sw_mode == 0 || sw_mode == 1 || sw_mode == 5 || sw_mode == 9 || sw_mode == 22 ||
+           (sw_mode >= 24 && sw_mode <= 27) ||
            sw_mode == GCN_SW_1D_THIN || sw_mode == GCN_SW_1D_DISPLAY || gcn_macro_sw(sw_mode) ||
            sw_mode == GCN_SW_LINEAR;
 }
@@ -265,7 +266,7 @@ static inline void std_block(uint32_t sw_mode, uint32_t bpe, uint32_t *bw, uint3
     }
     std4k_block(bpe, bw, bh);
     *bytes = 4096;
-    if (sw_mode == 9 || sw_mode == 24 || sw_mode == 27) {
+    if (sw_mode == 9 || (sw_mode >= 24 && sw_mode <= 27)) {
         *bw *= 4;
         *bh *= 4;
         *bytes = 65536;
@@ -287,7 +288,13 @@ static inline uint32_t std_offset(uint32_t sw_mode, uint32_t x, uint32_t y, uint
     }
     if (sw_mode == 1) return std4k_offset(x, y, bpe) & 0xFFu;
     uint32_t off = std4k_offset(x, y, bpe);
-    if (sw_mode == 9) {
+    if (sw_mode == 25) {
+        /* AMD AddrLib SW_64K_S_X_PATINFO, 16 pipes: standard low
+         * byte and 64 KiB block bits, with the same pipe XOR as SW_4KB_D_X. */
+        off = (off & 0xffu) | (display4k_x_offset(x, y, bpe) & 0xf00u);
+    }
+    if (sw_mode == 26) off = display4k_x_offset(x, y, bpe);
+    if (sw_mode == 9 || sw_mode == 25 || sw_mode == 26) {
         uint32_t tx = (x >> (bpe <= 2 ? 6u : bpe <= 8 ? 5u : 4u)) & 3u;
         uint32_t ty = (y >> (bpe == 1 ? 6u : bpe <= 4 ? 5u : 4u)) & 3u;
         off |= ((ty & 1u) << 12) | ((tx & 1u) << 13) | ((ty >> 1) << 14) | ((tx >> 1) << 15);
@@ -303,11 +310,11 @@ static inline uint32_t std_contig_elements(uint32_t sw_mode, uint32_t bpe, uint3
         mask = 1u;
     } else if (sw_mode == GCN_SW_1D_DISPLAY || sw_mode == GCN_SW_2D_DISPLAY) {
         mask = bpe <= 2 ? 7u : bpe == 4 ? 3u : bpe == 8 ? 1u : 0u;
-    } else if (sw_mode == 1 || sw_mode == 5 || sw_mode == 9) {
+    } else if (sw_mode == 1 || sw_mode == 5 || sw_mode == 9 || sw_mode == 25) {
         mask = bpe == 1 ? 15u : bpe == 2 ? 7u : bpe == 4 ? 3u : bpe == 8 ? 1u : 0u;
     } else if (sw_mode == 27) {
         mask = bpe <= 2 ? 7u : bpe == 4 ? 3u : bpe == 8 ? 1u : 0u;
-    } else if (sw_mode == 22) {
+    } else if (sw_mode == 22 || sw_mode == 26) {
         mask = bpe <= 2 ? 7u : bpe == 4 ? 3u : bpe == 8 ? 1u : 0u;
     } else if (sw_mode == 24) {
         mask = bpe <= 8 ? 1u : 0u;

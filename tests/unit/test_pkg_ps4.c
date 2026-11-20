@@ -2,7 +2,8 @@
 /* A synthetic PS4 fake package, built here with the tests' own RSA key: entry
  * keys and image key blobs, an AES-XTS outer PFS holding pfs_image.dat, a
  * PFSC stream (one stored block, the others zlib) and an inner PFS with
- * uroot/eboot.bin. It checks that pal_pkg_ps4 + pal_pkg_inner read the file
+ * uroot/eboot.bin, a file whose blocks are out of order and a file
+ * compressed on its own (its own PFSC stream). It checks that pal_pkg_ps4 + pal_pkg_inner read the file
  * back; it says nothing about real packages beyond the documented layout. */
 #include "pal/pal_pkg.h"
 #include "pal/pal_pkg_inner.h"
@@ -17,7 +18,9 @@
 
 #define BS 0x10000u
 #define PFS_AT 0x10000u
-#define IN_BLOCKS 6 /* inner: sb, dinodes, 2 dirs, a 2-block file */
+#define IN_BLOCKS 10 /* inner: sb, dinodes, 2 dirs, eboot.bin (4-5), comp.bin (6-7), scat.bin (9, 8) */
+#define FSIZE 0x18000u
+#define CSIZE 0x14000u
 
 static const char *g_dir = ".";
 
@@ -89,6 +92,87 @@ static size_t zlib_stored(const uint8_t *src, size_t len, uint8_t *dst) {
     return o + 4;
 }
 
+/* a PFSC stream of len bytes: block 0 stored, the others zlib */
+static size_t make_pfsc(const uint8_t *src, uint64_t len, uint8_t *dst) {
+    uint64_t nb = (len + BS - 1) / BS, at = 0x30 + (nb + 1) * 8;
+    memcpy(dst, "PFSC", 4);
+    le32(dst + 0xC, BS);
+    le64(dst + 0x10, BS);
+    le64(dst + 0x18, 0x30);
+    le64(dst + 0x20, at);
+    le64(dst + 0x28, len);
+    for (uint64_t b = 0; b < nb; b++) {
+        uint64_t n = len - b * BS < BS ? len - b * BS : BS;
+        le64(dst + 0x30 + 8 * b, at);
+        if (b == 0 && n == BS) { memcpy(dst + at, src, BS); at += BS; }
+        else at += zlib_stored(src + b * BS, (size_t)n, dst + at);
+    }
+    le64(dst + 0x30 + 8 * nb, at);
+    return (size_t)at;
+}
+
+/* the inner PFS: dinodes 0 root, 1 uroot, 2 eboot.bin (blocks 4-5),
+ * 3 comp.bin (flag 1, PFSC in blocks 6-7), 4 scat.bin (blocks 9 then 8);
+ * file contents are patterns, returned in eboot/comp/scat */
+static void make_inner(uint8_t *img, uint8_t *eboot, uint8_t *comp, uint8_t *scat) {
+    for (uint64_t i = 0; i < FSIZE; i++) eboot[i] = (uint8_t)(i * 7 + (i >> 9)), scat[i] = (uint8_t)(i * 13 + (i >> 11) + 1);
+    for (uint64_t i = 0; i < CSIZE; i++) comp[i] = (uint8_t)(i * 3 + (i >> 8) + 5);
+    le64(img, 1);
+    le64(img + 8, 20130315);
+    le32(img + 0x20, BS);
+    le64(img + 0x30, 5);
+    le64(img + 0x40, 1);
+    memcpy(img + 4 * BS, eboot, FSIZE);
+    uint64_t csz = make_pfsc(comp, CSIZE, img + 6 * BS);
+    memcpy(img + 9 * BS, scat, BS);
+    memcpy(img + 8 * BS, scat + BS, FSIZE - BS);
+    struct { uint16_t mode; uint32_t flags; uint64_t size, csize; uint32_t nb, db0, db1; } d[5] = {
+        {0x4000, 0, BS, BS, 1, 2, 0xFFFFFFFFu},
+        {0x4000, 0, BS, BS, 1, 3, 0xFFFFFFFFu},
+        {0x8000, 0, FSIZE, FSIZE, 2, 4, 5},
+        {0x8000, 1, CSIZE, csz, 2, 6, 7},
+        {0x8000, 0, FSIZE, FSIZE, 2, 9, 8},
+    };
+    for (int i = 0; i < 5; i++) {
+        uint8_t *x = img + BS + 0xA8 * i;
+        le16(x, d[i].mode);
+        le32(x + 4, d[i].flags);
+        le64(x + 8, d[i].size);
+        le64(x + 0x10, d[i].csize);
+        le32(x + 0x60, d[i].nb);
+        le32(x + 0x64, d[i].db0);
+        le32(x + 0x68, d[i].db1);
+        for (int k = 2; k < 12; k++) le32(x + 0x64 + 4 * k, 0xFFFFFFFFu);
+    }
+    const char *names[4] = {"uroot", "eboot.bin", "comp.bin", "scat.bin"};
+    uint8_t *e = img + 2 * BS;
+    for (int i = 0; i < 4; i++) {
+        if (i == 1) e = img + 3 * BS;
+        uint32_t len = (uint32_t)strlen(names[i]), ent = (16 + len + 7) & ~7u;
+        le32(e, (uint32_t)i + 1);
+        le32(e + 4, i ? 2 : 3);
+        le32(e + 8, len);
+        le32(e + 12, ent);
+        memcpy(e + 16, names[i], len);
+        e += ent;
+    }
+}
+
+static void check_file(pkg_inner *in, const char *name, const uint8_t *want, uint64_t size) {
+    uint32_t n = pkg_inner_lookup(in, name);
+    CHECK(n != UINT32_MAX);
+    CHECK_EQ_U64(in->nodes[n].size, size);
+    uint8_t *back = malloc((size_t)size);
+    CHECK(back);
+    CHECK(pkg_inner_read_file(in, &in->nodes[n], back, size, 0) == PS5C_OK);
+    CHECK(!memcmp(back, want, (size_t)size));
+    /* a read across a block boundary, after the first */
+    memset(back, 0, 0x100);
+    CHECK(pkg_inner_read_file(in, &in->nodes[n], back, 0x100, BS - 0x80) == PS5C_OK);
+    CHECK(!memcmp(back, want + BS - 0x80, 0x100));
+    free(back);
+}
+
 static void test_ps4_package(void) {
     char pkg[600], keys[600];
     snprintf(pkg, sizeof pkg, "%s/test.pkg", g_dir);
@@ -118,12 +202,10 @@ static void test_ps4_package(void) {
     putenv(strdup(env));
 #endif
 
-    /* inner PFS, file content a pattern */
-    const uint64_t fsize = 0x18000;
-    uint8_t *inner = calloc(IN_BLOCKS, BS);
-    CHECK(inner);
-    make_pfs(inner, 0, "eboot.bin", fsize, NULL);
-    for (uint64_t i = 0; i < fsize; i++) inner[4 * BS + i] = (uint8_t)(i * 7 + (i >> 9));
+    /* inner PFS, file contents patterns */
+    uint8_t *inner = calloc(IN_BLOCKS, BS), *eboot = malloc(FSIZE), *comp = malloc(CSIZE), *scat = malloc(FSIZE);
+    CHECK(inner && eboot && comp && scat);
+    make_inner(inner, eboot, comp, scat);
     /* PFSC: block 0 stored, the rest zlib (stored deflate) */
     uint8_t *pfsc = calloc(1, 0x30 + (IN_BLOCKS + 1) * 8 + IN_BLOCKS * (BS + 64));
     CHECK(pfsc);
@@ -211,18 +293,14 @@ static void test_ps4_package(void) {
     CHECK(in->tree_err == PS5C_OK);
     CHECK_EQ_U64(in->nblocks, IN_BLOCKS);
     CHECK(in->blocks[0].kind == PKG_SPAN_STORED && in->blocks[1].kind == PKG_SPAN_ZLIB);
-    uint32_t n = pkg_inner_lookup(in, "eboot.bin");
-    CHECK(n != UINT32_MAX);
-    CHECK_EQ_U64(in->nodes[n].size, fsize);
-    uint8_t *back = malloc((size_t)fsize);
-    CHECK(back);
-    CHECK(pkg_inner_read_file(in, &in->nodes[n], back, fsize, 0) == PS5C_OK);
-    CHECK(!memcmp(back, inner + 4 * BS, (size_t)fsize));
+    check_file(in, "eboot.bin", eboot, FSIZE);
+    CHECK(!in->nodes[pkg_inner_lookup(in, "eboot.bin")].pfs);
+    check_file(in, "comp.bin", comp, CSIZE);
+    check_file(in, "scat.bin", scat, FSIZE);
     CHECK_EQ_U64(in->bad_blocks, 0);
-    free(back);
     pkg_inner_close(in);
     pkg_info_free(&info);
-    free(inner);
+    free(inner), free(eboot), free(comp), free(scat);
 
     /* a key file whose keys are wrong: not found, nothing opened */
     kf = fopen(keys, "w");

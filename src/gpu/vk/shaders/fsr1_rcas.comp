@@ -1,0 +1,39 @@
+#version 450
+// FSR 1 RCAS (robust contrast adaptive sharpening), after AMD FidelityFX Super Resolution 1.
+// The algorithm and its constants: Copyright (c) 2021 Advanced Micro Devices, Inc., MIT license
+// (see fsr1_LICENSE.txt). This port: one pixel per invocation, 32-bit floats, noise removal on.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform Con { uvec4 con; uvec4 out_size; } pc;
+
+#define RCAS_LIMIT (0.25 - 1.0 / 16.0)
+
+vec3 load(ivec2 p) { return imageLoad(src, clamp(p, ivec2(0), ivec2(pc.out_size.xy) - 1)).rgb; }
+
+void main() {
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= int(pc.out_size.x) || ip.y >= int(pc.out_size.y)) return;
+    //    b
+    //  d e f
+    //    h
+    vec3 b = load(ip + ivec2(0, -1)), d = load(ip + ivec2(-1, 0)), e = load(ip);
+    vec3 f = load(ip + ivec2(1, 0)), h = load(ip + ivec2(0, 1));
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g), dL = d.b * 0.5 + (d.r * 0.5 + d.g), eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g), hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    // noise detection: less sharpening on grain
+    float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+    float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+    nz = clamp(abs(nz) / max(range, 1.0 / 32768.0), 0.0, 1.0);
+    nz = -0.5 * nz + 1.0;
+    vec3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
+    vec2 peakC = vec2(1.0, -1.0 * 4.0);
+    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0 / 32768.0));
+    vec3 hitMax = (peakC.x - max(mx4, e)) / min(4.0 * mn4 + peakC.y, vec3(-1.0 / 32768.0));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * uintBitsToFloat(pc.con.x);
+    lobe *= nz;
+    float rcpL = 1.0 / (4.0 * lobe + 1.0);
+    vec3 pix = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
+    imageStore(dst, ip, vec4(clamp(pix, 0.0, 1.0), 1.0));
+}

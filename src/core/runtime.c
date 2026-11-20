@@ -13,6 +13,7 @@
 #include "cpu/x64_compat.h"
 #include "hle/equeue.h"
 #include "hle/acm.h"
+#include "hle/kernel_objects.h"
 #include "loader/nid.h"
 #include "pal/pal.h"
 
@@ -619,6 +620,100 @@ static bool watch_hit(ps5_runtime *rt, pal_fault_info *info) {
 /* The OS is about to write into guest memory (file reads): pages the GPU caches watch first. */
 static void watch_prepare_write(void *buf, uint64_t size) { gpu_watch_prepare_write((guest_addr)(uintptr_t)buf, size); }
 
+/* gmem_set_world_hooks, with the map lock held: every other guest thread suspended, its registers
+ * read back so that the suspension has taken effect. threads_lock stays held until world_resume,
+ * so no thread starts or ends meanwhile. A thread holding threads_lock may wait for the map lock:
+ * after ~50 ms of trying, the release goes ahead without stopping anyone (as before). */
+static struct { uintptr_t *handles; size_t len, cap; uint64_t stops, skipped, ns; } g_world;
+static bool world_stop(void *user) {
+    ps5_runtime *rt = (ps5_runtime *)user;
+    uint64_t t0 = pal_time_ns();
+    while (!pal_mutex_trylock(rt->threads_lock)) {
+        if (pal_time_ns() - t0 > 50000000ull) {
+            if (g_world.skipped++ < 8) /* nobody stands still yet: logging is safe */
+                LOG_W(CORE, "copy-on-write release: the thread list stayed busy, guest threads keep running");
+            return false;
+        }
+        pal_thread_yield();
+    }
+    if (g_world.cap < rt->threads.len) { /* allocated before anyone stands still (heap lock) */
+        uintptr_t *h = (uintptr_t *)realloc(g_world.handles, rt->threads.len * 2 * sizeof(*h));
+        if (!h) {
+            pal_mutex_unlock(rt->threads_lock);
+            g_world.skipped++;
+            return false;
+        }
+        g_world.handles = h, g_world.cap = rt->threads.len * 2;
+    }
+    guest_thread *self = (guest_thread *)pal_tls_get(rt->thread_slot);
+    for (;;) {
+        g_world.len = 0;
+        for (size_t i = 0; i < rt->threads.len; i++) {
+            guest_thread *t = rt->threads.data[i];
+            if (t == self || t == guest_thread_identity(self) || t->finished || !t->sample_handle) continue;
+            if (!pal_thread_suspend(t->sample_handle)) continue;
+            pal_cpu_regs regs;
+            pal_thread_get_regs(t->sample_handle, &regs); /* SuspendThread is asynchronous */
+            g_world.handles[g_world.len++] = t->sample_handle;
+        }
+        /* A thread stopped inside the tracker (a lock of it held) would leave the release
+         * spinning: let everyone go and try again; after ~50 ms, release without stopping. */
+        if (gpu_watch_locks_free()) break;
+        for (size_t i = 0; i < g_world.len; i++) pal_thread_resume(g_world.handles[i]);
+        g_world.len = 0;
+        if (pal_time_ns() - t0 > 50000000ull) {
+            pal_mutex_unlock(rt->threads_lock);
+            g_world.skipped++;
+            return false;
+        }
+        pal_thread_yield();
+    }
+    g_world.stops++;
+    g_world.ns += pal_time_ns() - t0;
+    return true;
+}
+
+static void world_resume(void *user) {
+    ps5_runtime *rt = (ps5_runtime *)user;
+    for (size_t i = 0; i < g_world.len; i++) pal_thread_resume(g_world.handles[i]);
+    g_world.len = 0;
+    pal_mutex_unlock(rt->threads_lock);
+    uint64_t n = g_world.stops;
+    if (!(n & (n - 1)) && n >= 4) /* 4, 8, 16, ... */
+        LOG_I(CORE, "copy-on-write releases: guest threads stopped %llu times, %llu us each on average",
+              (unsigned long long)n, (unsigned long long)(g_world.ns / n / 1000));
+}
+
+bool runtime_longshot_commit(ps5_runtime *rt, guest_addr addr, uint64_t size) {
+    static _Thread_local bool committing;
+    const uint64_t granule = 0x10000, max_commit = 32ull << 20;
+    if (!rt || !rt->longshot_allocator || committing || !size ||
+        addr < LONGSHOT_WINDOW_START + 0x100000 || addr >= LONGSHOT_WINDOW_END ||
+        size > LONGSHOT_WINDOW_END - addr)
+        return false;
+    const guest_addr end = PS5C_ALIGN_UP(addr + size, granule);
+    for (guest_addr cur = PS5C_ALIGN_DOWN(addr, granule); cur < end;) {
+        gmem_vma v;
+        if (!gmem_query_vma(&rt->mem, cur, false, &v)) return false;
+        guest_addr next = PS5C_MIN(end, v.start + v.size);
+        if (v.reserved) {
+            next = PS5C_MIN(next, cur + max_commit);
+            /* Keep Longshot's direct-memory bookkeeping in sync. It
+             * deliberately leaves large regions unbacked for first touch. */
+            if (next % granule) return false;
+            uint64_t actual = 0;
+            committing = true;
+            bool ok = runtime_call_nested4(rt, rt->longshot_allocator, cur, next - cur, 0x1000, 4, &actual);
+            committing = false;
+            if (!ok || actual != cur || !gmem_is_mapped(&rt->mem, cur, next - cur)) return false;
+        } else if (!(v.prot & GPROT_WRITE)) {
+            return false;
+        }
+        cur = next;
+    }
+    return true;
+}
+
 static bool fault_handler(void *user, pal_fault_info *info) {
     ps5_runtime *rt = (ps5_runtime *)user;
 #ifdef _WIN32
@@ -660,6 +755,14 @@ static bool fault_handler(void *user, pal_fault_info *info) {
             gpu_watch_log_page(info->addr);
         }
         return true;
+    }
+    if (info->kind == PAL_FAULT_ACCESS && !info->execute && rt->longshot_allocator &&
+        info->addr >= LONGSHOT_WINDOW_START && info->addr < LONGSHOT_WINDOW_END &&
+        runtime_find_module(rt, info->pc) == module_set_main(rt->ms)) {
+        gmem_vma v;
+        if (gmem_query_vma(&rt->mem, info->addr, false, &v) && v.reserved &&
+            runtime_longshot_commit(rt, info->addr, 1))
+            return true;
     }
     /* One report: the process ends after it, and threads faulting meanwhile
      * (often because of the first fault) would interleave their lines. */
@@ -781,8 +884,18 @@ static void on_relocated(void *user, loaded_module *m) {
         const elf64_phdr *ph = &img->segments[i].h;
         if ((ph->p_type == PT_LOAD || ph->p_type == PT_SCE_RELRO) && (ph->p_flags & PF_X) && ph->p_filesz) {
             rt->tls_patches += x64_native_patch_tls(&rt->cpu, m->bias + ph->p_vaddr, ph->p_filesz);
+            guest_addr first = 0;
+            uint32_t other = x64_native_count_fs(&rt->cpu, m->bias + ph->p_vaddr, ph->p_filesz, &first);
+            if (other)
+                LOG_I(CPU, "%s: %u fs:[disp] accesses left unpatched, first at 0x%llx", m->name, other,
+                      (unsigned long long)first);
             x64_compat_patch(&rt->mem, m->name, m->bias + ph->p_vaddr, ph->p_filesz, m->base + m->map_size);
         }
+    }
+    guest_addr longshot_allocator = game_longshot_allocator_rva(m);
+    if (longshot_allocator) {
+        rt->longshot_allocator = m->bias + longshot_allocator;
+        LOG_I(CORE, "Longshot: backing reserved pages through the guest allocator");
     }
     game_fixes_apply(&rt->mem, m);
 }
@@ -803,6 +916,7 @@ ps5c_err runtime_init(ps5_runtime *rt, module_set *ms, const runtime_options *op
     if (rt->mem.identity && gpu_watch_enabled()) { /* PS5C_GPU_WATCH: see gpu_watch.h */
         gmem_set_change_hook(gpu_watch_mapping_changed);
         pal_set_write_prepare(watch_prepare_write);
+        gmem_set_world_hooks(world_stop, world_resume, rt);
         gpu_watch_start(&rt->mem);
     }
     if ((err = pal_tls_alloc(&rt->tcb_slot)) != PS5C_OK) return err;
@@ -1159,6 +1273,24 @@ bool runtime_call_nested(ps5_runtime *rt, guest_addr fn, uint64_t arg0, uint64_t
     return runtime_call_nested4(rt, fn, arg0, arg1, arg2, 0, rax);
 }
 
+/* Room a nested guest call needs below its rsp. The callee runs on the
+ * caller's stack, as on the console, so a 64 KiB stack (the libkernel default)
+ * or a fiber's stack outside the thread's own range must still be accepted. */
+#define NESTED_STACK_HEADROOM 0x2000ull
+
+/* True if [lo, hi) lies in the thread's stack or in writable guest memory
+ * (fibers and job systems run on stacks of their own). */
+static bool nested_stack_ok(ps5_runtime *rt, const guest_thread *t, uint64_t lo, uint64_t hi) {
+    if (lo >= hi || lo < rt->mem.res_start || hi > rt->mem.res_end) return false;
+    if (lo >= t->stack_base && hi <= t->stack_base + t->stack_size) return true;
+    for (uint64_t cur = lo; cur < hi;) {
+        gmem_vma v;
+        if (!gmem_query_vma(&rt->mem, cur, false, &v) || v.reserved || !(v.prot & GPROT_WRITE)) return false;
+        cur = v.start + v.size;
+    }
+    return true;
+}
+
 bool runtime_call_nested4(ps5_runtime *rt, guest_addr fn, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                           uint64_t *rax) {
     guest_thread *t = runtime_current_thread(rt);
@@ -1166,11 +1298,29 @@ bool runtime_call_nested4(ps5_runtime *rt, guest_addr fn, uint64_t arg0, uint64_
     /* HLE code runs on the guest stack: continue below this frame */
     volatile uint8_t marker = 0;
     uint64_t here = (uint64_t)(uintptr_t)&marker;
-    if (here < t->stack_base + 0x10000 || here > t->stack_base + t->stack_size) return false;
+    uint64_t rsp = PS5C_ALIGN_DOWN(here - 0x1000, 16);
+    if (!nested_stack_ok(rt, t, rsp - NESTED_STACK_HEADROOM, here)) {
+        static uint32_t refused;
+        uint32_t n = __atomic_add_fetch(&refused, 1, __ATOMIC_RELAXED);
+        if (n <= 8 || (n & 1023) == 0)
+            LOG_W(CORE, "nested guest call 0x%llx refused (%u): rsp 0x%llx has under %u KiB of writable stack "
+                        "(thread stack 0x%llx+0x%llx)",
+                  (unsigned long long)fn, n, (unsigned long long)rsp, (unsigned)(NESTED_STACK_HEADROOM >> 10),
+                  (unsigned long long)t->stack_base, (unsigned long long)t->stack_size);
+        return false;
+    }
+    if (here < t->stack_base + 0x10000 || here > t->stack_base + t->stack_size) {
+        /* Refused before 2026-11: 64 KiB thread stacks and fibers. */
+        static uint32_t small;
+        uint32_t n = __atomic_add_fetch(&small, 1, __ATOMIC_RELAXED);
+        if (n == 1 || (n & (n - 1)) == 0)
+            LOG_I(CORE, "nested guest call 0x%llx on a %s stack (%u so far)", (unsigned long long)fn,
+                  here > t->stack_base + t->stack_size || here < t->stack_base ? "fiber" : "small thread", n);
+    }
     x64_enter_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.fn = fn;
-    ctx.rsp = PS5C_ALIGN_DOWN(here - 0x1000, 16);
+    ctx.rsp = rsp;
     ctx.arg0 = arg0;
     ctx.arg1 = arg1;
     ctx.arg2 = arg2;
@@ -1236,6 +1386,63 @@ uint32_t runtime_running_threads(ps5_runtime *rt) {
     return n;
 }
 
+/* exit() on a secondary thread ends the process. */
+static void thread_check_process_exit(ps5_runtime *rt, guest_thread *t) {
+    if (!t->exit_requested || t->thread_exit) return;
+    LOG_I(CORE, "thread %u '%s' ended the process with code %lld", t->id, t->name, (long long)t->exit_code);
+    report_missing_calls(rt);
+    pal_exit_process((int)t->exit_code);
+}
+
+/* The thread is over (returned, or pthread_exit after its cleanup handlers):
+ * as libthr does, run libc's thread-exit hook (C++ thread_local destructors)
+ * and then the pthread key destructors, in up to 4 passes
+ * (PTHREAD_DESTRUCTOR_ITERATIONS) since a destructor may set values again.
+ * Each runs from the top of the thread's own stack, which is free now.
+ * PS5C_THREAD_DTORS=0 skips them all (as before 2026-11). */
+static void thread_exit_dtors(ps5_runtime *rt, guest_thread *t) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *s = getenv("PS5C_THREAD_DTORS");
+        enabled = !(s && s[0] == '0');
+    }
+    if (!enabled) return;
+    uint64_t rax;
+    if (rt->thread_dtors) {
+        t->thread_exit = false;
+        call_guest(rt, t, rt->thread_dtors, 0, 0, 0, &rax);
+        thread_check_process_exit(rt, t);
+    }
+    /* thread_local destructors the HLE libc took (_sceLibcInternalThreadAtexit) and the
+     * thread did not run itself through _sceLibcInternalThreadDtors */
+    uint32_t atexit_dtors = 0;
+    uint64_t dfn, dobj;
+    while (atexit_dtors < 4096 && libc_thread_take_dtor(t->id, &dfn, &dobj)) {
+        atexit_dtors++;
+        t->thread_exit = false;
+        call_guest(rt, t, dfn, dobj, 0, 0, &rax);
+        thread_check_process_exit(rt, t);
+    }
+    uint32_t keys = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        uint32_t cursor = 0;
+        uint64_t fn, value;
+        bool any = false;
+        while (kernel_thread_take_specific(t, &cursor, &fn, &value)) {
+            any = true;
+            keys++;
+            t->thread_exit = false;
+            call_guest(rt, t, fn, value, 0, 0, &rax);
+            thread_check_process_exit(rt, t);
+        }
+        if (!any) break;
+    }
+    static uint32_t logged;
+    if ((keys || atexit_dtors || rt->thread_dtors) && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 8)
+        LOG_I(CORE, "thread %u '%s' exit: libc hook %s, %u thread_local destructor(s), %u key destructor(s)",
+              t->id, t->name, rt->thread_dtors ? "run" : "none", atexit_dtors, keys);
+}
+
 static int32_t guest_thread_main(void *arg) {
     guest_thread *t = (guest_thread *)arg;
     ps5_runtime *rt = t->rt;
@@ -1249,15 +1456,13 @@ static int32_t guest_thread_main(void *arg) {
 
     uint64_t rax = 0;
     call_guest(rt, t, t->entry, t->arg, 0, 0, &rax);
-    if (t->exit_requested && !t->thread_exit) {
-        LOG_I(CORE, "thread %u '%s' ended the process with code %lld", t->id, t->name, (long long)t->exit_code);
-        report_missing_calls(rt);
-        pal_exit_process((int)t->exit_code);
-    }
+    thread_check_process_exit(rt, t);
+    uint64_t retval = t->exit_requested ? (uint64_t)t->exit_code : rax;
+    thread_exit_dtors(rt, t);
     LOG_D(CORE, "thread %u '%s' finished", t->id, t->name);
 
     pal_mutex_lock(rt->threads_lock);
-    t->retval = t->exit_requested ? (uint64_t)t->exit_code : rax;
+    t->retval = retval;
     t->finished = true;
     bool release = t->detached;
     if (release) thread_unregister(rt, t);

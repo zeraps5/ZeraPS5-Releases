@@ -10,7 +10,7 @@
 
 *Windows application ZIP downloads for the latest release, including updates and tests; not unique users. Updated automatically on an hourly schedule and after a release. GitHub may delay refreshes or cache the image.*
 
-**[Download the latest Windows build](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)** · **[Browse release source](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1080)** · **[Build and contribute](CONTRIBUTING.md)** · **[Game compatibility](COMPATIBILITY.md)**
+**[Download the latest Windows build](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)** · **[Browse source](src/)** · **[Build and contribute](CONTRIBUTING.md)** · **[Game compatibility](COMPATIBILITY.md)**
 
 ## Download and run
 
@@ -38,7 +38,7 @@
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 
-This repository hosts the emulator source, tests and packaged releases. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
+The default branch includes the b1080 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1080) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
 
 ## Experimental software
 

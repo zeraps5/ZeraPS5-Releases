@@ -7,6 +7,6 @@ Windows archive SHA-256: 6451a63cd7bad88793d7c7637abbdd9b07dd5fe883b98e6b37a7769
 
 The release tag points to the tested b1080 source integration.
 The current release archive contains the build number and exact packaged source.
-The default branch retains the b984 code snapshot for contribution history.
+The default branch includes the b1080 emulator source and tests for contributions.
 Historical b984 release: https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b984
 Contribution instructions: CONTRIBUTING.md

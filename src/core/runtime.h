@@ -119,6 +119,7 @@ typedef struct ps5_runtime {
     guest_addr exit_handler;       /* guest-callable address passed to the entry point */
     guest_addr process_params;
     guest_addr sandbox_word;
+    guest_addr longshot_allocator; /* validated address of this build's VirtualAlloc */
     uint32_t next_thread_id;
     uint32_t tls_patches;
     uint64_t hle_calls;
@@ -156,6 +157,8 @@ bool runtime_call_nested(ps5_runtime *rt, guest_addr fn, uint64_t arg0, uint64_t
 /* The same with a fourth argument */
 bool runtime_call_nested4(ps5_runtime *rt, guest_addr fn, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
                           uint64_t *rax);
+/* Back a reserved Longshot I/O buffer through the title's own allocator. */
+bool runtime_longshot_commit(ps5_runtime *rt, guest_addr addr, uint64_t size);
 /* Ends the process with `code` (exit/_exit, fatal guest errors). On the main
  * thread runtime_run_main returns `code`; elsewhere the host process exits. */
 void runtime_exit_thread(ps5_runtime *rt, int64_t code);

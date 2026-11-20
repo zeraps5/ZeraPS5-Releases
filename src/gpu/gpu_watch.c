@@ -50,14 +50,23 @@ static _Atomic uint64_t g_map_epoch; /* mapping changes seen: invalidates the el
 static int g_cow_mode = -1;
 static bool cow(void) { return g_cow_mode > 0; }
 static atomic_flag g_cow_gate = ATOMIC_FLAG_INIT; /* arming against cow_release / cow_aliased */
+/* Threads holding (or waiting for) the gate or a region lock: one suspended among them while
+ * guest threads stand still would leave cow_release spinning (gpu_watch_locks_free). */
+static atomic_uint g_lock_users;
 static void gate_lock(void) {
+    atomic_fetch_add_explicit(&g_lock_users, 1, memory_order_acq_rel);
     while (atomic_flag_test_and_set_explicit(&g_cow_gate, memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
         __builtin_ia32_pause();
 #endif
     }
 }
-static void gate_unlock(void) { atomic_flag_clear_explicit(&g_cow_gate, memory_order_release); }
+static void gate_unlock(void) {
+    atomic_flag_clear_explicit(&g_cow_gate, memory_order_release);
+    atomic_fetch_sub_explicit(&g_lock_users, 1, memory_order_acq_rel);
+}
+
+bool gpu_watch_locks_free(void) { return !atomic_load_explicit(&g_lock_users, memory_order_acquire); }
 static _Atomic uint64_t g_cow_flushed;
 static atomic_bool g_sweeper; /* the sweeper thread runs (gpu_watch_sweep) */
 
@@ -82,6 +91,9 @@ bool gpu_watch_enabled(void) {
 }
 
 static void cow_release(guest_addr addr, uint64_t size, uint8_t *phys_copy);
+static struct { guest_addr addr; uint64_t size, ms, pages; _Atomic bool pending; } g_slow; /* last slow release */
+static void report_slow_release(void);
+
 static bool cow_aliased(guest_addr addr, uint64_t size);
 static int32_t sweeper_main(void *arg);
 
@@ -337,6 +349,7 @@ bool gpu_watch_eligible(guest_addr addr, uint64_t size) {
 }
 
 static void lock(region *g) {
+    atomic_fetch_add_explicit(&g_lock_users, 1, memory_order_acq_rel);
     while (atomic_flag_test_and_set_explicit(&g->lock, memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
         __builtin_ia32_pause();
@@ -344,7 +357,10 @@ static void lock(region *g) {
     }
 }
 
-static void unlock(region *g) { atomic_flag_clear_explicit(&g->lock, memory_order_release); }
+static void unlock(region *g) {
+    atomic_flag_clear_explicit(&g->lock, memory_order_release);
+    atomic_fetch_sub_explicit(&g_lock_users, 1, memory_order_acq_rel);
+}
 
 static region *find_region(guest_addr addr) {
     if (addr >> SPACE_BITS) return NULL;
@@ -461,6 +477,7 @@ static int32_t sweeper_main(void *arg) {
     for (;;) {
         uint64_t t0 = pal_time_ns();
         gpu_watch_sweep();
+        report_slow_release();
         uint64_t took = pal_time_ns() - t0;
         atomic_fetch_add_explicit(&g_sweeps, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_sweep_ns, took, memory_order_relaxed);
@@ -570,10 +587,20 @@ static void cow_release(guest_addr addr, uint64_t size, uint8_t *phys_copy) {
         }
     });
     uint64_t took = pal_time_ns() - t0;
-    if (took > 20000000ull)
-        LOG_W(GPU, "page watch: releasing 0x%llx+0x%llx took %llu ms (%llu tracked pages)", (unsigned long long)addr,
-              (unsigned long long)size, (unsigned long long)(took / 1000000ull), (unsigned long long)pages);
+    if (took > 20000000ull && !atomic_load_explicit(&g_slow.pending, memory_order_acquire)) {
+        /* no logging here: the guest threads may stand still (gmem_set_world_hooks), one of them
+         * holding the log lock; the sweeper reports it */
+        g_slow.addr = addr, g_slow.size = size, g_slow.ms = took / 1000000ull, g_slow.pages = pages;
+        atomic_store_explicit(&g_slow.pending, true, memory_order_release);
+    }
     atomic_fetch_add_explicit(&g_generation, 1, memory_order_release);
+}
+
+static void report_slow_release(void) {
+    if (!atomic_load_explicit(&g_slow.pending, memory_order_acquire)) return;
+    LOG_W(GPU, "page watch: releasing 0x%llx+0x%llx took %llu ms (%llu tracked pages)", (unsigned long long)g_slow.addr,
+          (unsigned long long)g_slow.size, (unsigned long long)g_slow.ms, (unsigned long long)g_slow.pages);
+    atomic_store_explicit(&g_slow.pending, false, memory_order_release);
 }
 
 /* gmem hook (map lock held): another view of this view's physical memory is about to be mapped.

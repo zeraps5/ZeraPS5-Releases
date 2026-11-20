@@ -5,7 +5,8 @@
 int main(void) {
     uint8_t source[4*513+3]; uint32_t result[515];
     const uint32_t values[]={0,1,0x7fff,0x8000,0xffff,0x80000000u,0xffffffffu};
-    for (uint32_t width=2;width<=4;width+=2) {
+    for (uint32_t width=1;width<=4;width*=2) {
+        uint32_t mask = width == 1 ? UINT8_MAX : width == 2 ? UINT16_MAX : UINT32_MAX;
         for (uint32_t offset=0;offset<3;offset++) {
             memset(source,0x57,sizeof(source));
             for (uint32_t i=0;i<513;i++) {
@@ -15,7 +16,7 @@ int main(void) {
                 for(unsigned i=0;i<515;i++) result[i]=0x5aa55aa5;
                 CHECK(mesh_indices_expand(result+1,source+offset,count,width));
                 CHECK(result[0]==0x5aa55aa5 && result[count+1]==0x5aa55aa5);
-                for(uint32_t i=0;i<count;i++)CHECK(result[i+1]==(values[i%7]&(width==2?0xffffu:0xffffffffu)));
+                for(uint32_t i=0;i<count;i++)CHECK(result[i+1]==(values[i%7]&mask));
             }
         }
     }
@@ -24,6 +25,6 @@ int main(void) {
     CHECK(!mesh_indices_expand(NULL,source,1,2));
     CHECK(!mesh_indices_expand(result,NULL,1,4));
     CHECK(mesh_indices_expand(NULL,NULL,0,2));
-    puts("mesh indices: 16/32-bit values, unaligned input, tails and sentinels verified");
+    puts("mesh indices: 8/16/32-bit values, unaligned input, tails and sentinels verified");
     return 0;
 }

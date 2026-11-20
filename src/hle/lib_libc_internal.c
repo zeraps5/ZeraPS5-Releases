@@ -8,6 +8,7 @@
 #include "core/runtime.h"
 #include "hle/guest_printf.h"
 #include "hle/hle.h"
+#include "hle/kernel_objects.h"
 
 void hle_register_table(const hle_export *table, size_t count);
 
@@ -80,7 +81,9 @@ static void vsnprintf_(hle_call *c) { print_to_guest(c, hle_arg_ptr(c, 0), hle_a
  * int _sceLibcInternalThreadAtexit(void (*dtor)(void *), void *obj, void *dso) adds one for the
  * calling thread (the game's libc forwards __cxa_thread_atexit here), and
  * void _sceLibcInternalThreadDtors(void), called by the exiting thread, runs its own in
- * reverse order. */
+ * reverse order. A thread that ends without calling it gets them from the runtime's exit
+ * path (libc_thread_take_dtor): Scott Pilgrim EX's runtime unlinks each thread from its
+ * thread list in one, and a list still holding an ended thread was walked into freed memory. */
 typedef struct thread_dtor {
     uint32_t thread;
     guest_addr fn, obj;
@@ -112,21 +115,28 @@ static void thread_atexit(hle_call *c) {
     hle_ret_s32(c, ok ? 0 : -1);
 }
 
+/* The thread's most recently registered destructor, removed from the list. */
+bool libc_thread_take_dtor(uint32_t thread, uint64_t *fn, uint64_t *obj) {
+    thread_dtor d = {0};
+    dtor_lock();
+    for (uint32_t i = g_dtor_count; i-- > 0;) {
+        if (g_dtors[i].thread != thread) continue;
+        d = g_dtors[i];
+        memmove(&g_dtors[i], &g_dtors[i + 1], (g_dtor_count - i - 1) * sizeof(*g_dtors));
+        g_dtor_count--;
+        break;
+    }
+    dtor_unlock();
+    *fn = d.fn;
+    *obj = d.obj;
+    return d.fn != 0;
+}
+
 static void thread_dtors(hle_call *c) {
-    for (;;) {
-        thread_dtor d = {0};
-        dtor_lock();
-        for (uint32_t i = g_dtor_count; c->thread && i-- > 0;) {
-            if (g_dtors[i].thread != c->thread->id) continue;
-            d = g_dtors[i];
-            memmove(&g_dtors[i], &g_dtors[i + 1], (g_dtor_count - i - 1) * sizeof(*g_dtors));
-            g_dtor_count--;
-            break;
-        }
-        dtor_unlock();
-        if (!d.fn) break;
+    uint64_t fn, obj;
+    while (c->thread && libc_thread_take_dtor(c->thread->id, &fn, &obj)) {
         uint64_t rax;
-        runtime_call_nested(c->rt, d.fn, d.obj, 0, 0, &rax); /* may register more */
+        runtime_call_nested(c->rt, fn, obj, 0, 0, &rax); /* may register more */
     }
     hle_ret_u64(c, 0);
 }

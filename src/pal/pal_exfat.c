@@ -4,9 +4,12 @@
  * Metadata and coalesced extents are cached; file data stays in the image.
  * All data I/O is positional. Metadata is immutable after publication.
  * A fake PS5 package (.pkg) is exposed the same way: its inner file system
- * is decoded on demand by pal_pkg_inner, nothing is extracted. */
+ * is decoded on demand by pal_pkg_inner, nothing is extracted. So is a raw
+ * PFS image (.ffpfsc, through pal_pfs_volume); an exFAT .ffpfsc is read as
+ * exFAT. */
 #include "pal/pal_exfat.h"
 #include "pal/pal_pkg_inner.h"
+#include "pal/pal_pfs_volume.h"
 #include "base/endian.h"
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +27,8 @@ typedef struct node {
     uint64_t size, valid;
     uint64_t pkg_offset; /* .pkg: start in the inner image, or in the .pkg file for an entry */
     bool pkg_entry;      /* .pkg: a metadata entry (param.json, ...) read from the file itself */
+    uint32_t pkg_file;   /* .pkg: inner node + 1 of a file read through its block list (PS4), 0 = at pkg_offset */
+    uint32_t pfs_file;   /* PFS image: tree node + 1 of a file */
     extent *runs;
     uint32_t nruns, run_cap;
 } node;
@@ -39,6 +44,7 @@ typedef struct volume {
     node *nodes;
     uint32_t nnodes, cap;
     pkg_inner *pkg;      /* a .pkg volume: reads go through its span decoder */
+    pfs_volume *pfs;     /* a PFS image (.ffpfsc): reads go through it */
     struct volume *next;
 } volume;
 struct exfat_file { volume *v; uint32_t id; uint64_t pos; pal_mutex *lock; };
@@ -46,7 +52,7 @@ static volume *g_volumes;
 static pal_mutex *g_lock;
 
 static bool sep(char c) { return c == '/' || c == '\\'; }
-static const char *const g_exts[] = {".exfat", ".pkg"};
+static const char *const g_exts[] = {".exfat", ".pkg", ".ffpfsc"};
 /* length of the image extension at q, 0 if none */
 static size_t ext_at(const char *q) {
     for (size_t e = 0; e < PS5C_ARRAY_COUNT(g_exts); e++) {
@@ -61,11 +67,21 @@ static size_t ext_at(const char *q) {
     }
     return 0;
 }
+/* a host folder named like an image (the user folder of a game run from a
+ * .pkg is named after the package) holds host files, not an image */
+static bool host_dir(const char *p, size_t len) {
+    char dir[1024];
+    if (len >= sizeof dir) return false;
+    memcpy(dir, p, len);
+    dir[len] = 0;
+    pal_path_info info;
+    return pal_path_stat(dir, &info) == PS5C_OK && info.is_dir;
+}
 static const char *boundary(const char *p) {
     for (const char *q = p; *q; q++) {
         if (*q != '.') continue;
         size_t k = ext_at(q);
-        if (k && sep(q[k])) return q + k;
+        if (k && sep(q[k]) && !host_dir(p, (size_t)(q + k - p))) return q + k;
     }
     return NULL;
 }
@@ -84,6 +100,7 @@ static void free_volume(volume *v) {
     free(v->nodes); free(v->fat); free(v->path);
     if (v->file) pal_file_close(v->file);
     pkg_inner_close(v->pkg);
+    pfs_volume_close(v->pfs);
     free(v);
 }
 void exfat_shutdown(void) {
@@ -147,9 +164,15 @@ static ps5c_err read_node(volume *v, const node *n, void *buf, uint64_t bytes, u
     if (off >= n->size) return PS5C_OK;
     bytes = PS5C_MIN(bytes, n->size - off);
     if (bytes > SIZE_MAX) return PS5C_ERR_OUT_OF_RANGE;
+    if (v->pfs) {
+        ps5c_err err = n->pfs_file ? pfs_volume_read(v->pfs, n->pfs_file - 1, buf, bytes, off) : PS5C_ERR_INVALID;
+        if (!err && got) *got = bytes;
+        return err;
+    }
     if (v->pkg) {
         ps5c_err err = n->pkg_entry ? raw(v, n->pkg_offset + off, buf, bytes)
-                                    : pkg_inner_read(v->pkg, buf, bytes, n->pkg_offset + off);
+                       : n->pkg_file ? pkg_inner_read_file(v->pkg, &v->pkg->nodes[n->pkg_file - 1], buf, bytes, off)
+                                     : pkg_inner_read(v->pkg, buf, bytes, n->pkg_offset + off);
         if (!err && got) *got = bytes;
         return err;
     }
@@ -394,6 +417,7 @@ static ps5c_err load_pkg(volume *v) {
         n.parent = p->parent; n.child = p->child; n.sibling = p->sibling; n.dir = p->dir;
         n.size = n.valid = p->dir ? 0 : p->size;
         n.pkg_offset = p->offset;
+        n.pkg_file = p->pfs ? i + 1 : 0;
         if (i && !wide_name(n.wide, p->name)) n.wide[0] = 0xfffe; /* unmatchable */
         size_t len = strlen(p->name);
         n.name = (char *)malloc(len + 1);
@@ -410,9 +434,41 @@ static ps5c_err load_pkg(volume *v) {
     LOG_I(CORE, "pkg: %s, %u entries, %u spans, read-only; nothing extracted", v->path, v->nnodes, in->nblocks);
     return PS5C_OK;
 }
+/* a raw PFS image: its tree (or the one of the image it holds) becomes the node table, node ids match */
+static ps5c_err load_pfs(volume *v) {
+    const pfs_image *t = pfs_volume_tree(v->pfs);
+    for (uint32_t i = 0; i < 65536; i++) v->upcase[i] = (uint16_t)(i >= 'a' && i <= 'z' ? i-'a'+'A' : i);
+    v->have_upcase = true;
+    ps5c_err err = PS5C_OK;
+    for (uint32_t i = 0; !err && i < t->count; i++) {
+        const pfs_node *p = &t->nodes[i];
+        node n = {0};
+        n.parent = p->parent; n.child = p->child; n.sibling = p->sibling; n.dir = p->dir;
+        n.size = n.valid = p->dir ? 0 : pfs_volume_size(v->pfs, i);
+        n.pfs_file = p->dir ? 0 : i + 1;
+        if (i && !wide_name(n.wide, p->name)) n.wide[0] = 0xfffe; /* unmatchable */
+        size_t len = strlen(p->name);
+        n.name = (char *)malloc(len + 1);
+        if (!n.name) { err = PS5C_ERR_NOMEM; break; }
+        memcpy(n.name, p->name, len + 1);
+        uint32_t id;
+        if ((err = push_node(v, &n, &id))) free(n.name);
+    }
+    if (err) return err;
+    v->have_game = true;
+    v->game_root = t->uroot;
+    for (uint32_t c = v->nodes[t->uroot].child; c; c = v->nodes[c].sibling)
+        if (v->nodes[c].dir && equal_name(v, v->nodes[c].wide, "decrypted", 9)) v->decrypted_root = c;
+    return PS5C_OK;
+}
 static ps5c_err load_volume(volume *v) {
     const char *dot = strrchr(v->path, '.');
     if (dot && ext_at(dot) == 4) return load_pkg(v);
+    if (dot && ext_at(dot) == 7) { /* .ffpfsc: a PFS image, or else exFAT */
+        ps5c_err err = pfs_volume_open(v->path, &v->pfs);
+        if (!err) return load_pfs(v);
+        if (err != PS5C_ERR_INVALID) return err;
+    }
     ps5c_err err = pal_file_open(v->path, PAL_FILE_READ, &v->file);
     if (err) return err;
     if ((err = pal_file_size(v->file, &v->size))) return err;

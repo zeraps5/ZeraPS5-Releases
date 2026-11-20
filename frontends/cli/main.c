@@ -6,6 +6,7 @@
 #include "base/json.h"
 #include "base/log.h"
 #include "core/game_patch.h"
+#include "core/game_fixes.h"
 #include "base/log_record.h"
 #include "base/log_record_file.h"
 #ifdef _WIN32
@@ -1272,6 +1273,7 @@ static int cmd_run(const options *o, const nid_db *db) {
         gmem_set_shared_area_base(0x1000000000ull) != PS5C_OK) {
         LOG_W(MEM, "cannot move the shared-memory area: PSP memory mirrors will diverge");
     }
+    const bool longshot = game_longshot_allocator_rva(main_module) != 0;
     /* t1x places direct-memory views and CPU/GPU aliases at 0x10_0000_0000.
      * Leaving these below the placeholder area makes independent private
      * copies instead of shared physical pages. */
@@ -1288,14 +1290,25 @@ static int cmd_run(const options *o, const nid_db *db) {
     runtime_options ro;
     memset(&ro, 0, sizeof(ro));
     char compatibility_title[64]={0};
+    bool quake3=false;
     if(settings_param_string("titleId",compatibility_title,sizeof(compatibility_title)) &&
-        !strcmp(compatibility_title,"PPSA99319")) {
+        ((quake3=!strcmp(compatibility_title,"PPSA99319")) || !strcmp(compatibility_title,"PPSA99902"))) {
         /* Quake3e's bundled RADV uses address32_hi=2 for shader/ring memory.
-         * Keep this measured homebrew profile isolated from other titles. */
+         * Keep this measured homebrew profile isolated from other titles.
+         * UnleashedRecomp (PPSA99902) bundles the same RADV port: its device
+         * probe maps direct memory with no address and wants it in 8-12 GiB. */
         ro.direct_memory_window=true;
         if(gmem_set_shared_area_base(0x280000000ull)!=PS5C_OK)
             LOG_W(MEM,"cannot reserve the PS5 shader address32 window");
-        else LOG_I(MEM,"Quake III homebrew: PS5 shader address32 memory window enabled");
+        else if(quake3) LOG_I(MEM,"Quake III homebrew: PS5 shader address32 memory window enabled");
+        else LOG_I(MEM,"Unleashed Recompiled homebrew: PS5 shader address32 memory window enabled");
+    }
+    if (longshot) {
+        /* The bundled PS5 RADV probes a low address32 pool as well as the
+         * high guest window. The same placeholder split supports both. */
+        ro.direct_memory_window = true;
+        if (gmem_set_shared_area_base(0x280000000ull) != PS5C_OK)
+            LOG_W(MEM, "cannot reserve Longshot's shared memory and RADV address32 window");
     }
     ro.stop_on_missing = o->stop_on_missing;
     ro.trace_hle = o->trace_hle;

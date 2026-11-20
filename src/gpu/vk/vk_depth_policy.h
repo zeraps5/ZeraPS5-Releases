@@ -14,7 +14,7 @@
 static inline bool vk_htile_masked_depth_clear(const sh_program *p, const sh_eval *e, const sh_stage_info *info) {
     if (!p || !e || !info || p->count != 10 || info->cs_tgid_sgpr > 123 ||
         info->local_size[0] != 64 || info->local_size[1] != 1 || info->local_size[2] != 1 ||
-        info->cs_tgid_enable != 1 || info->cs_tid_components != 1) return false;
+        (info->cs_tgid_enable & 7) != 1 || info->cs_tid_components != 1) return false;
     const rdna2_inst *in = p->insts, *ld = in + 2, *st = in + 8;
     uint32_t user = info->cs_tgid_sgpr;
     if (strcmp(in[0].name, "v_lshl_add_u32") || in[0].dst != 256 ||

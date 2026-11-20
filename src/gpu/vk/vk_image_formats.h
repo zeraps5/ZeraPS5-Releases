@@ -42,6 +42,11 @@ static inline uint32_t vk_image_alias_formats(VkFormat f, uint32_t bytes, VkForm
                                        VK_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_SRGB};
     for (uint32_t i = 0; vk_image_rgba8_family(f) && i < 5 && n < VK_IMAGE_ALIAS_CAPACITY; i++)
         if (k_rgba8[i] != f) out[n++] = k_rgba8[i];
+    /* The other way round: texels a copy shader stored as 32-bit words, sampled
+     * through an RGBA8 T# (Scott Pilgrim EX's SDL GPU uploads every texture so;
+     * read as R32_UINT, the menu sprites came out black). */
+    bool r32 = f == VK_FORMAT_R32_UINT || f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R32_SINT;
+    for (uint32_t i = 0; r32 && i < 5 && n < VK_IMAGE_ALIAS_CAPACITY; i++) out[n++] = k_rgba8[i];
     /* NV12 copy shaders store UV as integers, then sample the same bytes as
      * normalized R/G channels. These are compatible 16-bit image formats. */
     static const VkFormat k_rg8[5] = {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM,

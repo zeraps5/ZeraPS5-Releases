@@ -92,6 +92,7 @@ typedef struct ajm_instance {
     uint8_t *at9_sf;    /* the superframe being gathered */
     uint32_t at9_sf_have;
     bool at9_direct;    /* the current superframe was decoded straight from the input */
+    uint32_t at9_rejected; /* superframes FFmpeg refused, played as silence */
     uint8_t *at9_cache; /* AT9_CACHE_FRAMES decoded frames */
     uint32_t at9_cache_head, at9_cache_count;
     /* AAC */
@@ -458,6 +459,23 @@ static bool at9_decode_superframe(ajm_instance *in, const uint8_t *sf, job_resul
     int ret = avcodec_send_packet(in->ctx, in->pkt);
     av_packet_unref(in->pkt);
     if (ret >= 0) ret = avcodec_receive_frame(in->ctx, in->frame);
+    if (ret == AVERROR_INVALIDDATA) {
+        /* FFmpeg's ATRAC9 decoder refuses some superframes the console plays (R-Type Delta HD:
+         * SELECT_00001.wav, frame 34, bytes as in the bank); the game takes a codec error as
+         * fatal. Its samples become silence and the decoder starts over at the next one. */
+        if (getenv("PS5C_AJM_TRACE"))
+            LOG_I(HLE, "ajm 0x%x: refused superframe %u after %llu samples", in->id, in->at9_rejected, (unsigned long long)in->total_samples);
+        if (!in->at9_rejected++)
+            LOG_W(HLE, "ajm 0x%x: FFmpeg refused an ATRAC9 superframe; its samples are silence", in->id);
+        avcodec_flush_buffers(in->ctx);
+        uint32_t bytes = at9_frame_pcm_bytes(in);
+        for (uint32_t k = 0; k < in->at9_frames_per_superframe && in->at9_cache_count < AT9_CACHE_FRAMES; k++) {
+            uint32_t slot = (in->at9_cache_head + in->at9_cache_count) % AT9_CACHE_FRAMES;
+            memset(in->at9_cache + (size_t)slot * bytes, 0, bytes);
+            in->at9_cache_count++;
+        }
+        return true;
+    }
     if (ret < 0) {
         r->result = RES_CODEC_ERROR | RES_INVALID_DATA;
         r->internal = ret;
@@ -553,6 +571,11 @@ static void decode(ajm_instance *in, const uint8_t *data, uint64_t size, uint8_t
     }
     if (in->codec == CODEC_AT9) {
         at9_decode(in, data, size, off, out, out_size, multiple, r);
+        if ((r->result & ~(RES_PARTIAL_INPUT | RES_NOT_ENOUGH_ROOM)) && getenv("PS5C_AJM_TRACE"))
+            LOG_I(HLE, "ajm 0x%x: AT9 decode 0x%x (internal %d): size %llu consumed %llu written %llu frames %u, total %llu, sf have %u, frame %u/%u, gapless total %u skip %u",
+                  in->id, r->result, r->internal, (unsigned long long)size, (unsigned long long)r->consumed,
+                  (unsigned long long)r->written, r->frames, (unsigned long long)in->total_samples, in->at9_sf_have,
+                  in->at9_frame_in_superframe, in->at9_frames_per_superframe, in->g_cur.total, in->g_cur.skip);
         return;
     }
     while (off < size && !gapless_end(in)) {
@@ -790,6 +813,47 @@ static void ajm_job_initialize(hle_call *c) {
     hle_ret_s32(c, reserve_job(c, hle_arg_ptr(c, 0), JOB_CONTROL_SIZE));
 }
 
+/* int sceAjmBatchJobControl(info, instance, uint64_t flags, const void *in, size_t in_size, void *out, size_t out_size):
+ * the generic control job the specific ones are made of. flags: bits 13-15 reset, initialize, resample;
+ * bits 45-47 sideband gapless, format, stream. The input holds (gapless flag) the gapless state to set
+ * {u32 total, u16 skip, u16}, then the codec's initialize parameters (R-Type Delta HD: 25 0c 00 00 40 00 00 00
+ * fe 10 05 e0 00 00 00 00); the output gets the result, then the gapless state. */
+static void ajm_job_control(hle_call *c) {
+    job_result r = {0};
+    uint64_t flags = hle_arg(c, 2), in_size = hle_arg(c, 4), out_size = hle_arg(c, 6);
+    bool reset = flags >> 13 & 1, init = flags >> 14 & 1, gapless = flags >> 45 & 1;
+    const uint8_t *params = in_size ? (const uint8_t *)gmem_host(c->mem, hle_arg_ptr(c, 3), in_size) : NULL;
+    uint8_t buf[16];
+    memset(buf, 0, sizeof(buf));
+    pal_mutex_lock(g_ajm.lock);
+    ajm_instance *in = find(hle_arg_u32(c, 1));
+    if (!in || (in_size && !params)) {
+        r.result = RES_INVALID_PARAMETER;
+    } else {
+        uint64_t skip = gapless && in_size >= 8 ? 8 : 0;
+        if (reset) clear_context(in);
+        if (init) r.result = initialize(in, params ? params + skip : NULL, in_size - skip);
+        if (skip && !r.result) {
+            const uint8_t *g = params;
+            memcpy(&in->g_init.total, g, 4);
+            memcpy(&in->g_init.skip, g + 4, 2);
+            in->has_limit = in->g_init.total != 0 && in->g_init.total != 0xFFFFFFFFu;
+            gapless_reset(in);
+        }
+        memcpy(buf + 8, &in->g_cur.total, 4);
+        memcpy(buf + 12, &in->g_cur.skip, 2);
+        memcpy(buf + 14, &in->g_cur.skipped, 2);
+    }
+    LOG_D(HLE, "sceAjmBatchJobControl(0x%x, flags 0x%llx, in %llu, out %llu) -> 0x%x", hle_arg_u32(c, 1),
+          (unsigned long long)flags, (unsigned long long)in_size, (unsigned long long)out_size, r.result);
+    pal_mutex_unlock(g_ajm.lock);
+    memcpy(buf, &r.result, 4);
+    memcpy(buf + 4, &r.internal, 4);
+    if (hle_arg_ptr(c, 5) && out_size)
+        gmem_write(c->mem, hle_arg_ptr(c, 5), buf, out_size < sizeof(buf) ? out_size : sizeof(buf));
+    hle_ret_s32(c, reserve_job(c, hle_arg_ptr(c, 0), JOB_CONTROL_SIZE));
+}
+
 /* int sceAjmBatchJobClearContext(info, instance, result *) */
 static void ajm_job_clear_context(hle_call *c) {
     job_result r = {0};
@@ -910,6 +974,13 @@ static void ajm_job_run_split(hle_call *c) {
     ajm_instance *in=find(hle_arg_u32(c,1));
     if(in){decode(in,src,in_bytes,dst,out_bytes,(flags&multiple)!=0,&r);samples=in->total_samples;}
     else r.result=RES_INVALID_PARAMETER;
+    if(in && in->codec==CODEC_AT9 && getenv("PS5C_AJM_TRACE")) {
+        char line[512];int n=snprintf(line,sizeof(line),"ajm 0x%x runsplit: %llu in (",in->id,(unsigned long long)ni);
+        for(uint64_t i=0;i<ni && n<400;i++) n+=snprintf(line+n,sizeof(line)-n," 0x%llx+%llu",(unsigned long long)input[i][0],(unsigned long long)input[i][1]);
+        n+=snprintf(line+n,sizeof(line)-n," ) %llu out -> 0x%x consumed %llu written %llu frames %u; heads",(unsigned long long)out_bytes,r.result,(unsigned long long)r.consumed,(unsigned long long)r.written,r.frames);
+        for(uint64_t o=0;o+4<=in_bytes && n<500;o+=in->at9_frame_bytes?in->at9_frame_bytes:64) n+=snprintf(line+n,sizeof(line)-n," %02x%02x",src[o],src[o+1]);
+        LOG_I(HLE,"%s",line);
+    }
     pal_mutex_unlock(g_ajm.lock);
     offset=0;
     for(uint64_t i=0;i<no && offset<r.written;i++) {
@@ -1143,6 +1214,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(A, "sceAjmBatchInitialize", ajm_batch_initialize),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobInitialize", ajm_job_initialize),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobClearContext", ajm_job_clear_context),
+    HLE_FUNC_ENTRY(A, "sceAjmBatchJobControl", ajm_job_control),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobDecode", ajm_job_decode),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobDecodeSingle", ajm_job_decode_single),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobDecodeSplit", ajm_job_decode_split),

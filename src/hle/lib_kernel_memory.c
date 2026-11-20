@@ -808,41 +808,142 @@ static void kernel_mmap(hle_call *c) {
     hle_ret_s32(c, ret);
 }
 
-/* int sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align) */
-static void reserve_virtual_range(hle_call *c) {
-    uint64_t *inout = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 0), 8);
-    uint64_t len = hle_arg(c, 1), align = hle_arg(c, 3);
-    uint32_t flags = hle_arg_u32(c, 2);
-    if (!inout || !len || len % GUEST_PAGE_SIZE || (align && (!is_pow2(align) || align % GUEST_PAGE_SIZE))) {
-        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-        return;
-    }
-    guest_addr addr = *inout;
+/* Reserves address space only (GMAP_RESERVE placeholders). `*addr` is in/out. */
+static int32_t do_reserve(hle_call *c, guest_addr *addr, uint64_t len, uint32_t flags, uint64_t align) {
+    if (!len || len % GUEST_PAGE_SIZE || (align && (!is_pow2(align) || align % GUEST_PAGE_SIZE)))
+        return SCE_KERNEL_ERROR_EINVAL;
     /* ranges of our choosing go to the shared-memory area, where direct
      * memory mapped into them can alias */
     uint32_t gflags = GMAP_RESERVE | GMAP_SHARED_AREA;
     if (flags & MAP_FIXED) {
-        if (addr % GUEST_PAGE_SIZE) {
-            hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-            return;
-        }
+        if (*addr % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
         gflags |= GMAP_FIXED | (flags & MAP_NO_OVERWRITE ? 0u : (uint32_t)GMAP_REPLACE);
         pal_mutex_lock(g_lock);
         if (!(flags & MAP_NO_OVERWRITE)) {
-            phys_save(c->mem, addr, len);
-            dmaps_forget(addr, len);
+            phys_save(c->mem, *addr, len);
+            dmaps_forget(*addr, len);
         }
         pal_mutex_unlock(g_lock);
     }
     guest_addr out = 0;
-    if (gmem_map_aligned(c->mem, addr, len, align ? align : GUEST_PAGE_SIZE, GPROT_NONE, gflags, "reserved", &out) !=
+    if (gmem_map_aligned(c->mem, *addr, len, align ? align : GUEST_PAGE_SIZE, GPROT_NONE, gflags, "reserved", &out) !=
         PS5C_OK) {
         LOG_W(KERNEL, "sceKernelReserveVirtualRange(0x%llx, 0x%llx, flags 0x%x, align 0x%llx): no room",
-              (unsigned long long)addr, (unsigned long long)len, flags, (unsigned long long)align);
-        hle_ret_s32(c, SCE_KERNEL_ERROR_ENOMEM);
+              (unsigned long long)*addr, (unsigned long long)len, flags, (unsigned long long)align);
+        return SCE_KERNEL_ERROR_ENOMEM;
+    }
+    *addr = out;
+    return 0;
+}
+
+/* int sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align) */
+static void reserve_virtual_range(hle_call *c) {
+    uint64_t *inout = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 0), 8);
+    if (!inout) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    *inout = out;
+    guest_addr addr = *inout;
+    int32_t ret = do_reserve(c, &addr, hle_arg(c, 1), hle_arg_u32(c, 2), hle_arg(c, 3));
+    if (ret == 0) *inout = addr;
+    hle_ret_s32(c, ret);
+}
+
+/* ---- Memory pools (reference: KytyPS5 kernel/memory.cpp) ----
+ * Reserve takes 2 MiB-granular address space; Commit backs 64 KiB-granular
+ * parts of it with memory, Decommit turns them back into reservation. There
+ * is no separate physical pool here: committed pages are plain anonymous
+ * memory, counted against POOL_BUDGET only for GetBlockStats. */
+#define POOL_RESERVE_ALIGN 0x200000ull
+#define POOL_BLOCK 0x10000ull
+#define POOL_BUDGET (2ull << 30)
+#define SCE_KERNEL_ERROR_EBUSY ((int32_t)0x80020010)
+static uint64_t g_pool_committed;
+
+/* int sceKernelMemoryPoolReserve(void *addr_in, size_t len, size_t align, int flags, void **addr_out) */
+static void memory_pool_reserve(hle_call *c) {
+    uint64_t len = hle_arg(c, 1), align = hle_arg(c, 2);
+    uint32_t flags = hle_arg_u32(c, 3);
+    uint64_t *out = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 4), 8);
+    if (!out || !len || len % POOL_RESERVE_ALIGN || (align && (!is_pow2(align) || align % POOL_RESERVE_ALIGN))) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    guest_addr addr = hle_arg_ptr(c, 0);
+    int32_t ret = do_reserve(c, &addr, len, flags, align ? align : POOL_RESERVE_ALIGN);
+    if (ret == 0) *out = addr;
+    LOG_D(KERNEL, "sceKernelMemoryPoolReserve(0x%llx, 0x%llx, align 0x%llx, flags 0x%x) = 0x%x -> 0x%llx",
+          (unsigned long long)hle_arg_ptr(c, 0), (unsigned long long)len, (unsigned long long)align, flags,
+          (unsigned)ret, (unsigned long long)addr);
+    hle_ret_s32(c, ret);
+}
+
+/* int sceKernelMemoryPoolCommit(void *addr, size_t len, int type, int prot, int flags) */
+static void memory_pool_commit(hle_call *c) {
+    guest_addr addr = hle_arg_ptr(c, 0);
+    uint64_t len = hle_arg(c, 1);
+    uint32_t prot = hle_arg_u32(c, 3);
+    if (!addr || !len || len % POOL_BLOCK || addr % POOL_BLOCK || addr > UINT64_MAX - len || (prot & 0x04)) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    /* already committed pages: the console reports EBUSY */
+    for (guest_addr p = addr; p < addr + len; p += GUEST_PAGE_SIZE) {
+        if (gmem_is_mapped(c->mem, p, 1)) {
+            hle_ret_s32(c, SCE_KERNEL_ERROR_EBUSY);
+            return;
+        }
+    }
+    guest_addr at = addr;
+    int32_t ret = map_memory(c, &at, len, prot, MAP_FIXED, 0, "pool", false, false);
+    if (ret == 0) __atomic_fetch_add(&g_pool_committed, len, __ATOMIC_RELAXED);
+    LOG_D(KERNEL, "sceKernelMemoryPoolCommit(0x%llx, 0x%llx, type %d, prot 0x%x) = 0x%x", (unsigned long long)addr,
+          (unsigned long long)len, hle_arg_s32(c, 2), prot, (unsigned)ret);
+    hle_ret_s32(c, ret);
+}
+
+/* int sceKernelMemoryPoolDecommit(void *addr, size_t len, int flags) */
+static void memory_pool_decommit(hle_call *c) {
+    guest_addr addr = hle_arg_ptr(c, 0);
+    uint64_t len = hle_arg(c, 1);
+    if (!addr || !len || len % POOL_BLOCK || addr % POOL_BLOCK || addr > UINT64_MAX - len) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    uint64_t was = 0;
+    for (guest_addr p = addr; p < addr + len; p += GUEST_PAGE_SIZE)
+        if (gmem_is_mapped(c->mem, p, 1)) was += GUEST_PAGE_SIZE;
+    /* back to a reservation in one step, so nothing else takes the range */
+    guest_addr at = addr;
+    int32_t ret = do_reserve(c, &at, len, MAP_FIXED, 0);
+    if (ret == 0) {
+        uint64_t cur = __atomic_load_n(&g_pool_committed, __ATOMIC_RELAXED), next;
+        do next = cur > was ? cur - was : 0;
+        while (!__atomic_compare_exchange_n(&g_pool_committed, &cur, next, false, __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED));
+    } else {
+        ret = SCE_KERNEL_ERROR_EACCES;
+    }
+    hle_ret_s32(c, ret);
+}
+
+/* int sceKernelMemoryPoolGetBlockStats(SceKernelMemoryPoolBlockStats *out, size_t size):
+ * {available flushed, available cached, allocated flushed, allocated cached} in 64 KiB blocks */
+static void memory_pool_get_block_stats(hle_call *c) {
+    guest_addr out = hle_arg_ptr(c, 0);
+    uint64_t size = hle_arg(c, 1);
+    if (!out && size) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EFAULT);
+        return;
+    }
+    uint64_t used = __atomic_load_n(&g_pool_committed, __ATOMIC_RELAXED);
+    int32_t stats[4] = {(int32_t)((used < POOL_BUDGET ? POOL_BUDGET - used : 0) / POOL_BLOCK), 0,
+                        (int32_t)(used / POOL_BLOCK), 0};
+    if (size > sizeof(stats)) size = sizeof(stats);
+    if (size && !gmem_write(c->mem, out, stats, size)) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EFAULT);
+        return;
+    }
     hle_ret_s32(c, 0);
 }
 
@@ -1106,6 +1207,10 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "sceKernelVirtualQuery", virtual_query),
     HLE_FUNC_ENTRY(K, "sceKernelSetVirtualRangeName", set_virtual_range_name),
     HLE_FUNC_ENTRY(K, "sceKernelReserveVirtualRange", reserve_virtual_range),
+    HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolReserve", memory_pool_reserve),
+    HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolCommit", memory_pool_commit),
+    HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolDecommit", memory_pool_decommit),
+    HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolGetBlockStats", memory_pool_get_block_stats),
     HLE_FUNC_ENTRY(K, "sceKernelBatchMap", kernel_batch_map),
     HLE_FUNC_ENTRY(K, "sceKernelBatchMap2", kernel_batch_map2),
     POSIX_ENTRY("mmap", posix_mmap),

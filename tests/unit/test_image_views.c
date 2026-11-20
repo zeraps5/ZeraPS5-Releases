@@ -122,6 +122,8 @@ static void test_rgba_number_interpretation(void) {
     CHECK(view(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(view(VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(view(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, false, 1) == VK_FORMAT_R8G8B8A8_UINT);
+    CHECK(view(VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK(view(VK_FORMAT_R32_UINT, VK_FORMAT_B8G8R8A8_UNORM, false, 0) == VK_FORMAT_R32_UINT);
 }
 
 static void test_uv_number_interpretation(void) {
@@ -242,13 +244,14 @@ static void test_gpu_residency(void) {
         if (k == 5 || k == 7) {
             /* Reject a different texel size and an unlisted same-size alias.
              * Neither request may consume the original backing record. */
-            vk_image *wrong = vk_image_get(r, a + k * 0x100, 2, 2, VK_FORMAT_R8G8B8A8_UNORM);
+            VkFormat wrong_format = k == 5 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+            vk_image *wrong = vk_image_get(r, a + k * 0x100, 2, 2, wrong_format);
             CHECK(wrong && !wrong->gpu_written);
         }
         /* Spill in the writer's integer format, restore through the sampler's
          * compatible normalized format. There is no CPU copy to reconstruct. */
         VkFormat restored = k == 5   ? VK_FORMAT_R8_UNORM
-                            : k == 6 ? VK_FORMAT_R8G8B8A8_UNORM
+                            : k == 6 || k == 7 ? VK_FORMAT_R8G8B8A8_UNORM
                                      : fixtures[k].format;
         vk_image *img =
             fixtures[k].depth
@@ -1879,6 +1882,7 @@ static void test_gpu_scalar_snapshot_writeback(void) {
     u[12]=(uint32_t)out;u[13]=(uint32_t)(out>>32);u[14]=4;u[15]=0x16204;
     bool correct=true;
     uint32_t rounds=getenv("PS5C_EVAL_CACHE_CHECK")?6:3;
+    bool saw_rotation=false;
     for(uint32_t round=0;round<rounds;round++) {
         CHECK(gmem_write(&m,input,&one,4));u[4]=(uint32_t)(input+(round==2?16:0));u[8]=2;
         guest_addr read_program=a+(round>=4?0x200:0);
@@ -1894,27 +1898,38 @@ static void test_gpu_scalar_snapshot_writeback(void) {
         }
         g.regs[mmCOMPUTE_PGM_LO]=(uint32_t)(read_program>>8);renderer_dispatch(r,&g,1,1,1);
         if(round>=3)renderer_dispatch(r,&g,1,1,1); /* refreshed entry remains reusable */
-        /* A CPU-visible writeback must keep its owning resource slot even
-         * when overlap is configured. This checks the conservative gate. */
-        CHECK(!vk_work_can_overlap(r));
-        if(getenv("PS5C_WORK_OVERLAP")) {
-            guest_addr label=a+0x3000;uint32_t zero=0,seen=0;
-            CHECK(gmem_write(&m,label,&zero,4));
-            gpu_release release={.addr=label,.data=round+1,.data_sel=1};
-            CHECK(renderer_release(r,&g,&release));
-            CHECK(gmem_read(&m,label,&seen,4) && seen==0);
-            uint32_t slot=r->work_index;
-            vk_flush(r);vk_begin(r);
-            CHECK(r->work_index==slot); /* wait/apply before reusing its arena */
-            CHECK(gmem_read(&m,label,&seen,4) && seen==round+1);
-        }
+        /* The result remains in its owner slot; timeline retirement permits
+         * the next batch to use the other slot. Exercise that slot before
+         * demanding the original results, rather than requiring serialization. */
+        guest_addr label=a+0x3000,scratch=a+0x5000;uint32_t zero=0,seen=0;
+        CHECK(gmem_write(&m,label,&zero,4));
+        gpu_release release={.addr=label,.data=round+1,.data_sel=1};
+        CHECK(renderer_release(r,&g,&release));
+        CHECK(gmem_read(&m,label,&seen,4) && seen==0);
+        bool rotate=vk_work_can_overlap(r);
+        saw_rotation|=rotate;
+        const char *retire=getenv("PS5C_VK_RETIRE"),*overlap=getenv("PS5C_WORK_OVERLAP");
+        if(!r->work_timeline || (retire && !strcmp(retire,"0")) || (overlap && !strcmp(overlap,"0")))CHECK(!rotate);
+        uint32_t slot=r->work_index;
+        vk_flush(r);vk_begin(r);
+        CHECK(r->work_index==(rotate?(slot^1):slot));
+        uint32_t saved[3]={u[4],u[5],u[8]},program=g.regs[mmCOMPUTE_PGM_LO];
+        u[4]=(uint32_t)scratch;u[5]=(uint32_t)(scratch>>32);u[8]=0x12345678;
+        g.regs[mmCOMPUTE_PGM_LO]=(uint32_t)((a+0x100)>>8);renderer_dispatch(r,&g,1,1,1);
+        u[4]=saved[0];u[5]=saved[1];u[8]=saved[2];g.regs[mmCOMPUTE_PGM_LO]=program;
         renderer_sync_mem(r,out,4);uint32_t value=0;CHECK(gmem_read(&m,out,&value,4));
         uint32_t expected=round==0?2:round==1?3:round==2?1:4;
         uint32_t written=0;CHECK(gmem_read(&m,input+(round==2?16:0),&written,4));
         fprintf(stderr,"scalar snapshot after compute write %u: %u (expected %u)\n",round,value,expected);
         correct&=value==expected && written==(round>=3?4u:round==1?3u:2u);
+        renderer_wait_idle(r);
+        CHECK(gmem_read(&m,label,&seen,4) && seen==round+1);
+        CHECK(gmem_read(&m,scratch,&seen,4) && seen==0x12345678);
     }
+    const char *retire=getenv("PS5C_VK_RETIRE"),*overlap=getenv("PS5C_WORK_OVERLAP");
+    bool require_rotation=r->work_timeline && retire && !strcmp(retire,"1") && overlap && !strcmp(overlap,"1");
     renderer_destroy(r);free(g.regs);pal_mutex_destroy(g.lock);pal_window_destroy(window);gmem_free(&m);pal_shutdown();
+    if(require_rotation)CHECK(saw_rotation);
     CHECK(correct);
 }
 

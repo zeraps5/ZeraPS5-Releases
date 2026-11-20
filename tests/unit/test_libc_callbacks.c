@@ -33,13 +33,31 @@ static uint64_t u64(guest_addr a) {
     CHECK(gmem_read_u64(&rt->mem, a, &v));
     return v;
 }
-static void run(guest_addr code, guest_addr arg) {
+static void run_stack(guest_addr code, guest_addr arg, uint64_t stack_size) {
     pal_icache_flush(gmem_host(&rt->mem, page, GUEST_PAGE_SIZE), GUEST_PAGE_SIZE);
     guest_thread *t;
-    CHECK(runtime_start_thread(rt, code, arg, 0, 0x200000, false, "libc callbacks", &t) == 0);
+    CHECK(runtime_start_thread(rt, code, arg, 0, stack_size, false, "libc callbacks", &t) == 0);
     uint64_t handle = (uint64_t)(uintptr_t)t, result;
     runtime_release_thread(rt, t);
     CHECK(runtime_join_thread(rt, handle, &result) == 0 && result == 0);
+}
+static void run(guest_addr code, guest_addr arg) { run_stack(code, arg, 0x200000); }
+/* Guest callbacks from a 64 KiB stack (the libkernel default) and from a
+ * fiber's stack outside the thread's own range must still run. */
+static uint64_t small_stack_driver(void) {
+    int values[] = {5, -1, 3, INT32_MAX, 0};
+    put(page + 0xb00, values, sizeof(values));
+    call("libSceLibcInternal", "qsort", page + 0xb00, 5, 4, page + 0x300, 0);
+    const int expected[] = {-1, 0, 3, 5, INT32_MAX};
+    int sorted[5];
+    CHECK(gmem_read(&rt->mem, page + 0xb00, sorted, sizeof(sorted)) &&
+          !memcmp(sorted, expected, sizeof(expected)));
+    uint64_t zero[2] = {0, 0};
+    put(page + 0xa00, zero, sizeof(zero));
+    CHECK(call("libkernel", "scePthreadOnce", page + 0xa00, page + 0x380, 0, 0, 0) == 0);
+    CHECK(call("libkernel", "scePthreadOnce", page + 0xa00, page + 0x380, 0, 0, 0) == 0);
+    CHECK(u64(page + 0xa08) == 1);
+    return 0;
 }
 static uint64_t guest_driver(void) {
     int values[] = {9, -2, 9, 0, INT32_MIN, INT32_MAX, 7};
@@ -128,6 +146,27 @@ int main(void) {
     memcpy(adapter + 6, &driver, 8);
     put(page + 0x100, adapter, sizeof(adapter));
     run(page + 0x100, 0);
+    /* init for scePthreadOnce: mov rax, counter; inc qword [rax]; ret */
+    uint8_t once_init[] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0xff, 0x00, 0xc3};
+    uint64_t counter = page + 0xa08;
+    memcpy(once_init + 2, &counter, 8);
+    put(page + 0x380, once_init, sizeof(once_init));
+    uint64_t small = (uint64_t)(uintptr_t)small_stack_driver;
+    memcpy(adapter + 6, &small, 8);
+    put(page + 0x100, adapter, sizeof(adapter));
+    run_stack(page + 0x100, 0, 0x10000);
+    /* The same driver on a fiber: mov rax, rsp; mov rsp, top; push rax;
+     * sub rsp, 0x28; mov rax, driver; call rax; add rsp, 0x28; pop rsp; ret */
+    guest_addr fiber;
+    CHECK(gmem_map(&rt->mem, 0, 0x10000, GPROT_RW, 0, "fiber stack", &fiber) == PS5C_OK);
+    uint8_t to_fiber[] = {0x48, 0x89, 0xe0, 0x48, 0xbc, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x48, 0x83, 0xec,
+                          0x28, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0x48, 0x83, 0xc4, 0x28,
+                          0x5c, 0xc3};
+    uint64_t fiber_top = fiber + 0x10000;
+    memcpy(to_fiber + 5, &fiber_top, 8);
+    memcpy(to_fiber + 20, &small, 8);
+    put(page + 0x140, to_fiber, sizeof(to_fiber));
+    run_stack(page + 0x140, 0, 0x10000);
     uint32_t keyboard = hle_library_handle("libSceKeyboard");
     CHECK(keyboard && !hle_library_handle("libMissing"));
     CHECK(runtime_resolve_symbol_in(rt, keyboard, "sceKeyboardInit") != 0 &&
@@ -137,6 +176,7 @@ int main(void) {
     module_set_free(&ms);
     pal_shutdown();
     puts("libc native ABI: jumps, integer returns, saved registers, FP controls, signal masks, "
-         "comparator callbacks, DSO destructors and scoped modules verified");
+         "comparator callbacks on 64 KiB and fiber stacks, pthread_once, DSO destructors and scoped "
+         "modules verified");
     return 0;
 }

@@ -457,12 +457,41 @@ static int do_key_create(hle_call *c, guest_addr key_out, guest_addr destructor)
     return 0;
 }
 
-static int do_key_delete(int32_t key) {
+static void key_clear_values(ps5_runtime *rt, int32_t key);
+
+static int do_key_delete(ps5_runtime *rt, int32_t key) {
     if (key < 0 || key >= GUEST_THREAD_KEYS || !g_keys[key].used) return G_EINVAL;
     kobj_lock();
     g_keys[key].used = false;
+    g_keys[key].destructor = 0;
     kobj_unlock();
+    key_clear_values(rt, key);
     return 0;
+}
+
+bool kernel_thread_take_specific(guest_thread *t, uint32_t *cursor, uint64_t *destructor, uint64_t *value) {
+    for (uint32_t i = *cursor; t && i < GUEST_THREAD_KEYS; i++) {
+        kobj_lock();
+        guest_addr fn = g_keys[i].used ? g_keys[i].destructor : 0;
+        kobj_unlock();
+        uint64_t v = t->specific[i];
+        if (!fn || !v) continue;
+        t->specific[i] = 0;
+        *cursor = i + 1;
+        *destructor = fn;
+        *value = v;
+        return true;
+    }
+    return false;
+}
+
+/* A deleted key's values are gone in every thread: a key created later in the
+ * same slot starts at NULL, not at an old thread's value. */
+static void key_clear_values(ps5_runtime *rt, int32_t key) {
+    if (!rt || !rt->threads_lock) return;
+    pal_mutex_lock(rt->threads_lock);
+    for (size_t i = 0; i < rt->threads.len; i++) rt->threads.data[i]->specific[key] = 0;
+    pal_mutex_unlock(rt->threads_lock);
 }
 
 static void getspecific(hle_call *c) {
@@ -480,10 +509,10 @@ static int do_setspecific(hle_call *c, int32_t key, uint64_t value) {
 }
 
 static void px_key_create(hle_call *c) { RET_POSIX(do_key_create(c, hle_arg_ptr(c, 0), hle_arg_ptr(c, 1))); }
-static void px_key_delete(hle_call *c) { RET_POSIX(do_key_delete(hle_arg_s32(c, 0))); }
+static void px_key_delete(hle_call *c) { RET_POSIX(do_key_delete(c->rt, hle_arg_s32(c, 0))); }
 static void px_setspecific(hle_call *c) { RET_POSIX(do_setspecific(c, hle_arg_s32(c, 0), hle_arg(c, 1))); }
 static void sce_key_create(hle_call *c) { RET_SCE(do_key_create(c, hle_arg_ptr(c, 0), hle_arg_ptr(c, 1))); }
-static void sce_key_delete(hle_call *c) { RET_SCE(do_key_delete(hle_arg_s32(c, 0))); }
+static void sce_key_delete(hle_call *c) { RET_SCE(do_key_delete(c->rt, hle_arg_s32(c, 0))); }
 static void sce_setspecific(hle_call *c) { RET_SCE(do_setspecific(c, hle_arg_s32(c, 0), hle_arg(c, 1))); }
 
 #define K "libkernel"
@@ -539,6 +568,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "scePthreadGetaffinity", get_affinity),
     HLE_FUNC_ENTRY(K, "scePthreadSetaffinity", set_affinity),
     HLE_FUNC_ENTRY(K, "scePthreadGetthreadid", get_thread_id),
+    POSIX_ENTRY("pthread_getthreadid_np", get_thread_id),
     HLE_FUNC_ENTRY(K, "scePthreadGetschedparam", get_schedparam),
     HLE_FUNC_ENTRY(K, "scePthreadSetschedparam", set_schedparam),
     HLE_FUNC_ENTRY("libScePosix", "pthread_setschedparam", set_schedparam), /* priority only */

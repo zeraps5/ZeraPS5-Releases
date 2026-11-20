@@ -8,11 +8,12 @@
 #include <string.h>
 #include <math.h>
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"line %d: %s\n",__LINE__,#x);return 1;}}while(0)
-static int32_t call(gmem *m,const char *name,uint64_t a,uint64_t b) {
+static int32_t call3(gmem *m,const char *name,uint64_t a,uint64_t b,uint64_t d) {
     const hle_export *exp=hle_find("libScePad",nid_hash_name(name));
     if(!exp || !exp->fn)return INT32_MIN;
-    hle_args args={.gpr={a,b}};hle_call c={.a=&args,.mem=m};exp->fn(&c);return (int32_t)args.ret[0];
+    hle_args args={.gpr={a,b,d}};hle_call c={.a=&args,.mem=m};exp->fn(&c);return (int32_t)args.ret[0];
 }
+static int32_t call(gmem *m,const char *name,uint64_t a,uint64_t b){return call3(m,name,a,b,0);}
 static float f32(const uint8_t *p,unsigned at){float f;memcpy(&f,p+at,4);return f;}
 int main(void) {
 #ifdef _WIN32
@@ -27,6 +28,12 @@ int main(void) {
     guest_addr addr;CHECK(gmem_map(&m,0,GUEST_PAGE_SIZE,GPROT_RW,0,"pad output",&addr)==PS5C_OK);
     uint8_t *data=gmem_host(&m,addr,120);CHECK(data);
     CHECK(call(&m,"scePadInit",0,0)==0);
+    /* user 1: the standard port opens; special (2) and remote (16) ports have no device */
+    CHECK(call3(&m,"scePadOpen",1,0,0)==1 && call3(&m,"scePadGetHandle",1,0,0)==1);
+    CHECK((uint32_t)call3(&m,"scePadOpen",1,2,0)==0x80920007u);
+    CHECK((uint32_t)call3(&m,"scePadOpen",1,16,0)==0x80920007u);
+    CHECK((uint32_t)call3(&m,"scePadGetHandle",1,2,0)==0x80920007u);
+    CHECK((uint32_t)call3(&m,"scePadOpen",99,0,0)==0x80920001u);
     CHECK(call(&m,"scePadReadState",1,addr)==0);
     CHECK(fabsf(f32(data,28))==3 && f32(data,32)==1 && fabsf(f32(data,40))==8);
     CHECK(data[8]==255 && data[9]==255 && data[76]==1 && f32(data,24)==1);
@@ -50,5 +57,5 @@ int main(void) {
         CHECK(!memcmp(before,data,sizeof(before)));
     }
     gmem_free(&m);hle_registry_free();pal_shutdown();
-    puts("pad HLE: motion initially on, disable/re-enable, invalid handles, rest pose and analog triggers verified");return 0;
+    puts("pad HLE: port types, motion initially on, disable/re-enable, invalid handles, rest pose and analog triggers verified");return 0;
 }

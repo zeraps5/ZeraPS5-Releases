@@ -87,6 +87,11 @@ int main(int argc,char **argv) {
         CHECK(pal_file_size(f,&bytes)==PS5C_OK); printf("direct exFAT eboot: %s (%llu bytes)\n",eboot,(unsigned long long)bytes);
         uint8_t b[4]; CHECK(pal_file_pread(f,b,4,0,NULL)==PS5C_OK); printf("magic %02x %02x %02x %02x\n",b[0],b[1],b[2],b[3]);
         pal_file_close(f); pal_shutdown(); return 0; }
+    /* a host folder named like a package (a game's user folder) is not an image */
+    CHECK(exfat_path("unit-missing.pkg/cache/a.bin"));
+    (void)pal_mkdir("unit-user.pkg"); (void)pal_mkdir("unit-user.pkg/cache");
+    CHECK(!exfat_path("unit-user.pkg/cache/a.bin"));
+    { pal_file *w=NULL; CHECK(pal_file_open("unit-user.pkg/cache/a.bin",PAL_FILE_WRITE|PAL_FILE_CREATE|PAL_FILE_TRUNCATE,&w)==PS5C_OK); pal_file_close(w); }
     make_image(); write_image("unit.exfat",sizeof(image));
     char eboot[512]; CHECK(exfat_game_path("unit.exfat",eboot,sizeof(eboot))==PS5C_OK); CHECK(!strcmp(eboot,"unit.exfat/@game/eboot.bin"));
     unsigned count=0; CHECK(pal_dir_list("unit.exfat/",count_entry,&count)==PS5C_OK); CHECK(count==6);

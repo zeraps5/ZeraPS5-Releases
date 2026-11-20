@@ -1246,6 +1246,55 @@ static void sync_wake(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
+/* FreeBSD int _umtx_op(void *obj, int op, u_long val, void *uaddr, void *uaddr2): only the
+ * address wait/wake ops (same semantics as the sync-on-address calls above). The timeout is
+ * uaddr2: a relative timespec when uaddr is 0, else a struct _umtx_time of uaddr bytes
+ * {timespec, u32 flags (1 = absolute), u32 clock}. An absolute deadline is waited in 10 ms
+ * slices that end as a spurious wake (callers re-check the value and the clock). Other ops
+ * are logged once and fail with EINVAL. */
+enum { UMTX_WAIT = 2, UMTX_WAKE = 3, UMTX_WAIT_UINT = 11, UMTX_WAIT_UINT_PRIVATE = 15,
+       UMTX_WAKE_PRIVATE = 16 };
+static void umtx_op(hle_call *c) {
+    guest_addr addr = hle_arg_ptr(c, 0);
+    int32_t op = hle_arg_s32(c, 1);
+    if (op == UMTX_WAKE || op == UMTX_WAKE_PRIVATE) {
+        volatile void *p = (addr & 3) ? NULL : hle_mem(c, addr, 4);
+        if (!p) { posix_fail(c, G_EINVAL); return; }
+        int64_t n = (int64_t)hle_arg(c, 2);
+        if (n > 0) pal_wake_on_address(p, n >= 0x7FFFFFFF ? -1 : (int32_t)n);
+        hle_ret_s32(c, 0);
+        return;
+    }
+    if (op == UMTX_WAIT || op == UMTX_WAIT_UINT || op == UMTX_WAIT_UINT_PRIVATE) {
+        uint32_t size = op == UMTX_WAIT ? 8 : 4;
+        volatile void *p = (addr & (size - 1)) ? NULL : hle_mem(c, addr, size);
+        if (!p) { posix_fail(c, G_EINVAL); return; }
+        uint64_t expected = size == 8 ? hle_arg(c, 2) : hle_arg_u32(c, 2);
+        uint64_t timeout = UINT64_MAX;
+        bool absolute = false;
+        guest_addr tp = hle_arg_ptr(c, 4);
+        const int64_t *ts = (const int64_t *)hle_mem(c, tp, 16);
+        if (ts) {
+            if (hle_arg(c, 3) >= 24) {
+                const uint32_t *flags = (const uint32_t *)hle_mem(c, tp + 16, 4);
+                absolute = flags && (*flags & 1);
+            }
+            if (absolute) timeout = 10000000ull;
+            else if (ts[0] < 0 || ts[1] < 0) timeout = 0;
+            else timeout = (uint64_t)ts[0] * 1000000000ull + (uint64_t)ts[1];
+        }
+        if (!pal_wait_on_address(p, expected, size, timeout) && timeout != UINT64_MAX && !absolute) {
+            posix_fail(c, G_ETIMEDOUT);
+            return;
+        }
+        hle_ret_s32(c, 0);
+        return;
+    }
+    static int logged;
+    if (logged++ == 0) LOG_W(KERNEL, "_umtx_op: op %d not implemented", op);
+    posix_fail(c, G_EINVAL);
+}
+
 #define SYNC_LIB "libkernel_sync_on_address"
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(SYNC_LIB, "#Hc4CaR6JBL0", sync_wait32), /* sceKernelSyncOnAddressWait */
@@ -1257,6 +1306,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libkernel", "#B2n8aDorSH4", sync_wait32),
     HLE_FUNC_ENTRY("libkernel", "#PZQhiiLXRFs", sync_wait64),
     HLE_FUNC_ENTRY("libkernel", "#q2y-wDIVWZA", sync_wake),
+    HLE_FUNC_ENTRY("libkernel", "_umtx_op", umtx_op),
     POSIX_ENTRY("pthread_mutex_init", px_mutex_init),
     POSIX_ENTRY("pthread_mutex_destroy", px_mutex_destroy),
     POSIX_ENTRY("pthread_mutex_lock", px_mutex_lock),

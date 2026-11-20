@@ -284,7 +284,7 @@ typedef struct sh_stage_info {
     /* CS */
     uint32_t local_size[3];
     uint32_t cs_tgid_sgpr;     /* first workgroup id SGPR */
-    uint8_t cs_tgid_enable;    /* bit per dimension */
+    uint8_t cs_tgid_enable;    /* bit per dimension; bit 3: TG_SIZE_EN (an SGPR after the ids: wave count, wave index << 6) */
     uint8_t cs_tid_components; /* local id VGPRs: 1..3 */
     /* PS: SPI_PS_INPUT_ADDR, the layout of the input VGPRs (barycentrics, then the
      * position, face, ...); 0 = none (fits the padding: corpus files keep their size) */
@@ -398,9 +398,12 @@ enum {
     SH_TRANSLATE_EXACT = 1u,
     SH_TRANSLATE_REAL_LANES = 2u,
     SH_TRANSLATE_NO_BARRIER = 4u,
-    SH_TRANSLATE_NO_STRUCTURED = 8u
+    SH_TRANSLATE_NO_STRUCTURED = 8u,
+    SH_TRANSLATE_RT_SCALE = 16u
 };
 uint32_t sh_translation_flags(sh_stage stage);
+/* Translations for render targets drawn smaller than the guest's size (set before any) */
+void sh_set_rt_scale(bool on);
 bool sh_translation_wave64_lds(uint64_t hash);
 /* Automatic single-wave translation also needs 66 extra LDS dwords. */
 bool sh_compute_auto_wave64(const sh_program *p, const sh_stage_info *info);

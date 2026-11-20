@@ -9,22 +9,31 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
-static const uint32_t k_modes[] = {1, 5, 9, 22, 24, 27};
+static const uint32_t k_modes[] = {1, 5, 9, 22, 24, 25, 26, 27};
 
 /* Previous addressing, deliberately retaining the masks and divisions.
  * Using the optimized writer and reader together would hide a shared error. */
 static uint32_t reference_offset(uint32_t mode,uint32_t x,uint32_t y,uint32_t bpe){
-    if(mode==22) {
+    if(mode==22 || mode==25 || mode==26) {
         /* Independent bit equations from AMD AddrLib's 16-pipe PATINFO:
          * nibble01 rows 5,1,2,6,7; nibble2 rows 21..25. A positive entry
          * selects x[entry-1], a negative entry y[-entry-1]. */
-        static const int8_t low[5][8]={{1,2,3,-2,-1,-3,4,-4},{0,1,2,3,-1,-2,-3,4},
+        static const int8_t display[5][8]={{1,2,3,-2,-1,-3,4,-4},{0,1,2,3,-1,-2,-3,4},
             {0,0,1,2,-1,-2,-3,3},{0,0,0,1,-1,2,3,-2},{0,0,0,0,1,-1,2,-2}};
+        static const int8_t standard[5][8]={{1,2,3,4,-1,-2,-3,-4},{0,1,2,3,-1,-2,-3,4},
+            {0,0,1,2,-1,-2,-3,3},{0,0,0,1,-1,-2,2,3},{0,0,0,0,-1,-2,1,2}};
+        const int8_t (*low)[8] = mode == 25 ? standard : display;
         static const uint8_t high_x[5][4]={{7,4,6,5},{7,4,6,5},{6,3,5,4},{6,3,5,4},{5,2,4,3}};
         static const uint8_t high_y[5][4]={{4,7,5,6},{3,6,4,5},{3,6,4,5},{2,5,3,4},{2,5,3,4}};
         unsigned row=(unsigned)__builtin_ctz(bpe);uint32_t off=0;
         for(unsigned bit=0;bit<8;bit++){int c=low[row][bit];if(c)off|=((c>0?x>>(c-1):y>>(-c-1))&1u)<<bit;}
         for(unsigned bit=0;bit<4;bit++)off|=(((x>>high_x[row][bit])^(y>>high_y[row][bit]))&1u)<<(bit+8);
+        if (mode != 22) {
+            static const uint32_t block_x[] = {64, 64, 32, 32, 16};
+            static const uint32_t block_y[] = {64, 32, 32, 16, 16};
+            uint32_t bx = x / block_x[row], by = y / block_y[row];
+            off |= ((by & 1) << 12) | ((bx & 1) << 13) | ((by & 2) << 13) | ((bx & 2) << 14);
+        }
         return off;
     }
     uint32_t bw=bpe<=2?64:bpe<=8?32:16,bh=4096/(bw*bpe);

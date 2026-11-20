@@ -67,6 +67,10 @@ static void mix(void *user, float *out, uint32_t frames) {
         float a = out[k] < 0 ? -out[k] : out[k];
         if (a > peak) peak = a;
     }
+    /* PS5C_NO_AUDIO=1: the host plays silence (the streams keep their pace, testing aid) */
+    static int muted = -1;
+    if (muted < 0) muted = getenv("PS5C_NO_AUDIO") && strcmp(getenv("PS5C_NO_AUDIO"), "0");
+    if (muted) memset(out, 0, sizeof(float) * frames * 2);
     /* PS5C_LOG_AUDIO: the loudest sample of every 5 seconds (debugging aid) */
     static int logging = -1;
     static float window_peak;
@@ -82,6 +86,22 @@ static void mix(void *user, float *out, uint32_t frames) {
             window_frames = 0;
         }
     }
+}
+
+/* Opening the host device can take long (waveOut ~1 s on an idle PC; Demon's
+ * Souls' first port waited ~130 s behind its 13 spinning job threads, the main
+ * thread stuck in sceAudioOut2PortCreate): it opens on a thread of its own, and
+ * the streams go by our clock until it plays. */
+static int32_t host_start(void *arg) {
+    (void)arg;
+    __atomic_store_n(&g_mix.last_ns, pal_time_ns(), __ATOMIC_RELAXED);
+    if (pal_audio_start(mix, NULL) == PS5C_OK) {
+        __atomic_store_n(&g_mix.last_ns, pal_time_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_mix.host, true, __ATOMIC_RELEASE);
+    } else {
+        LOG_W(KERNEL, "no host sound output: audio is silent");
+    }
+    return 0;
 }
 
 int audio_mix_open(void) {
@@ -107,9 +127,8 @@ int audio_mix_open(void) {
         if (!settings_get_int("geral", "som", 1)) {
             LOG_I(KERNEL, "sound off ([geral] som=0)");
         } else {
-            __atomic_store_n(&g_mix.last_ns, pal_time_ns(), __ATOMIC_RELAXED);
-            if (pal_audio_start(mix, NULL) == PS5C_OK) g_mix.host = true;
-            else LOG_W(KERNEL, "no host sound output: audio is silent");
+            static pal_thread *opener; /* runs once; never joined */
+            if (pal_thread_create(&opener, host_start, NULL, "audio open", 0) != PS5C_OK) host_start(NULL);
         }
     }
     return id;
@@ -127,7 +146,7 @@ uint32_t audio_mix_queued(int id) {
  * never plays) would block every port waiting for room: its streams then go
  * by our clock, as without host sound. */
 bool audio_mix_active(void) {
-    if (!g_mix.host) return false;
+    if (!__atomic_load_n(&g_mix.host, __ATOMIC_ACQUIRE)) return false;
     /* Read the callback stamp before the clock: a callback between those
      * reads must not turn unsigned subtraction into a false stall. Multiple
      * guest audio threads can query this transition concurrently. */

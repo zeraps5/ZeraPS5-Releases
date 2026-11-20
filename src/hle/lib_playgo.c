@@ -116,7 +116,11 @@ static bool refresh_loci(hle_call *c) {
         query = pkg_query_locus, user = s;
     for (uint32_t i = 0; i < s->metadata.count; i++) {
         uint8_t value = 3;
-        if (s->metadata.chunks[i].size && (!query || !query(user, (uint16_t)i, &value)))
+        /* No package to ask (a folder or a plain .exfat image): every file of
+         * the game is on the disk, so every chunk is local, as for an installed
+         * game. Before, Open failed with NOT_SUPPORT_PLAYGO and RE4 (PPSA07411)
+         * stopped at 14 s. */
+        if (s->metadata.chunks[i].size && query && !query(user, (uint16_t)i, &value))
             return false;
         if (value != 0 && value != 2 && value != 3)
             return false;
@@ -174,17 +178,22 @@ done:
  * the game is on the disk in full, so it is reported as chunks with nothing left to download,
  * the console's answer for an installed game. Without this, Open failed and the game took its
  * data as missing. PS5C_PLAYGO_STRICT=1: Open fails as before. */
-#define PLAYGO_INSTALLED_CHUNKS 1000
+/* 128: Unity's PlayGo layer keeps the chunks in a fixed table; RE4 (PPSA07411) overran it
+ * with 160 or more (a mutex then read 0x200000002 and the PlayGo thread crashed in strlen
+ * at 14 s). Wolverine behaves the same with 128 as with 1000. PS5C_PLAYGO_CHUNKS=<n> overrides. */
+#define PLAYGO_INSTALLED_CHUNKS 128
 static bool installed_without_metadata(hle_call *c, playgo_metadata *out) {
     char path[1024];
     pal_path_info info;
     if (getenv("PS5C_PLAYGO_STRICT") || kernel_fs_resolve(c, "/app0/sce_sys/playgo-chunk.dat", path, sizeof(path)) ||
         (exfat_path(path) ? exfat_stat(path, &info) == PS5C_OK : pal_path_stat(path, &info) == PS5C_OK))
         return false;
-    out->chunks = calloc(PLAYGO_INSTALLED_CHUNKS, sizeof(*out->chunks));
+    const char *chunks_setting = getenv("PS5C_PLAYGO_CHUNKS");
+    uint32_t chunks = chunks_setting && atoi(chunks_setting) > 0 ? (uint32_t)atoi(chunks_setting) : PLAYGO_INSTALLED_CHUNKS;
+    out->chunks = calloc(chunks, sizeof(*out->chunks));
     if (!out->chunks)
         return false;
-    out->count = PLAYGO_INSTALLED_CHUNKS;
+    out->count = chunks;
     for (uint32_t i = 0; i < out->count; i++) out->chunks[i].language_mask = ~0ull;
     LOG_I(HLE, "PlayGo: no playgo-chunk.dat; the game is reported installed (%u chunks)", out->count);
     return true;
@@ -514,6 +523,7 @@ void hle_register_playgo(void) {
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetChunkId", pg_chunks),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetInstallChunkId", pg_chunks),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetLanguageMask", pg_language_mask),
+        HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoSetLanguageMask", pg_handle_only),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetSupportedOptionalChunk", pg_optional_chunk),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoPrefetch", pg_prefetch),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetLocus", pg_locus),
@@ -527,6 +537,9 @@ void hle_register_playgo(void) {
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetEta", pg_eta),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoGetOptionalChunk", pg_optional_chunk),
         HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoPrefetchOptionalChunk", pg_handle_only),
+        /* every chunk is installed: nothing to bring in ahead, no download state to snapshot */
+        HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoRequestNextChunk", pg_handle_only),
+        HLE_FUNC_ENTRY("libScePlayGo", "scePlayGoSnapshot", pg_handle_only),
     };
     hle_register_table(exports, PS5C_ARRAY_COUNT(exports));
 }

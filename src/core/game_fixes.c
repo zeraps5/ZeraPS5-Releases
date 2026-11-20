@@ -48,6 +48,7 @@ static const uint8_t k_tmnt_framebuffer[] = {
 static bool tmnt_framebuffer(uint8_t *at) {
     const int internal = settings_internal_height();
     if (!internal) return false;
+    settings_internal_height_native();
     const uint32_t h = (uint32_t)internal, w = h * 16 / 9;
     memcpy(at + 2, &w, 4);
     memcpy(at + 8, &h, 4);
@@ -88,6 +89,7 @@ static const uint8_t k_origins_display[] = { /* hiteR+0x8cc70f..0x8cc7c0 */
 static bool origins_display(uint8_t *at) {
     const int internal = settings_internal_height();
     if (settings_output_4k() && !internal) return false; /* 4K output: the game's own size */
+    if (internal) settings_internal_height_native();
     const uint32_t h = internal ? (uint32_t)internal : 1080, w = h * 16 / 9;
     /* +0x07: jmp +0x84; then the original r8/r9 loads (back here from +0xa4) */
     static const uint8_t site[14] = {0xeb, 0x7b, 0x4c, 0x8b, 0x43, 0x28, 0x4c, 0x8b, 0x4b, 0x30, 0x90, 0x90, 0x90, 0x90};
@@ -105,6 +107,57 @@ static bool origins_display(uint8_t *at) {
     return true;
 }
 
+/* R-Type Delta: HD Boosted (v01.000.002). Its INPUT thread sleeps 400 ms before it first
+ * polls sceUserServiceGetEvent, which fills the list of logged-in users; the main thread's
+ * save autoload then takes the list's first user. On the console loading the title module
+ * outlasts that sleep; here the autoload can come first and reads an empty list (a crash at
+ * RTypeDelta+0x24055 about 6 s in). The first sleep becomes 16 ms. */
+static const uint8_t k_rtype_input_sleep[] = {
+    0x48, 0x89, 0xdf,             /* mov rdi, rbx */
+    0xbe, 0x90, 0x01, 0x00, 0x00, /* mov esi, 400 */
+    0xff, 0x50, 0x08,             /* call [rax+8]: sleep (ms) */
+};
+
+static bool rtype_input_sleep(uint8_t *at) {
+    at[4] = 16, at[5] = 0;
+    return true;
+}
+
+guest_addr game_longshot_allocator_rva(const loaded_module *m) {
+    /* The v0.1.3 PS5 host uses VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE)
+     * from its first-touch handler. Check both the function entry and the
+     * small-commit branch before calling this private function. */
+    static const guest_addr allocator = 0x8fc20;
+    static const uint8_t entry[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+        0x53, 0x50, 0x48, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    };
+    static const uint8_t small_commit[] = {
+        0x48, 0x81, 0xfe, 0xff, 0xff, 0xff, 0x03, 0x0f, 0x87, 0xc1, 0x02, 0x00, 0x00,
+        0x85, 0xc0, 0x0f, 0x84, 0xb9, 0x02, 0x00, 0x00,
+    };
+    char title[32], version[32];
+    if (!m || !m->is_main || !m->name || strcmp(m->name, "eboot") || getenv("PS5C_NO_GAME_FIXES") ||
+        !settings_param_string("titleId", title, sizeof(title)) || strcmp(title, "PPSA99025") ||
+        !settings_param_string("contentVersion", version, sizeof(version)) || strcmp(version, "01.000.000"))
+        return 0;
+    for (uint32_t i = 0; i < m->img.segment_count; i++) {
+        const sce_segment *seg = &m->img.segments[i];
+        if (seg->h.p_type != PT_LOAD || !(seg->h.p_flags & PF_X) || !seg->has_data ||
+            seg->h.p_vaddr > allocator || seg->data_off > m->img.file_size)
+            continue;
+        uint64_t off = allocator - seg->h.p_vaddr;
+        uint64_t span = 0xd5 + sizeof(small_commit);
+        uint64_t available = PS5C_MIN(seg->h.p_filesz, m->img.file_size - seg->data_off);
+        if (off <= available && span <= available - off) {
+            const uint8_t *code = m->img.file + seg->data_off + off;
+            if (!memcmp(code, entry, sizeof(entry)) && !memcmp(code + 0xd5, small_commit, sizeof(small_commit)))
+                return allocator;
+        }
+    }
+    return 0;
+}
+
 static const game_fix k_fixes[] = {
     {"PPSA25582", "GameRebirth", "screen size of the opening screens follows the TV", 0x71ac80, k_tmnt_screen,
      sizeof(k_tmnt_screen), tmnt_screen},
@@ -112,6 +165,8 @@ static const game_fix k_fixes[] = {
      sizeof(k_tmnt_framebuffer), tmnt_framebuffer},
     {"PPSA05324", "hiteR", "display set up at the output's size instead of a fixed 3840x2160", 0x8cc70f,
      k_origins_display, sizeof(k_origins_display), origins_display},
+    {"PPSA26414", "RTypeDelta", "input thread polls the user login before the save autoload", 0x4908b,
+     k_rtype_input_sleep, sizeof(k_rtype_input_sleep), rtype_input_sleep},
 };
 
 compat_patch_status game_compat_apply(gmem *mem, const loaded_module *m,

@@ -53,6 +53,31 @@ static int execute(void) {
             }
         }
     }
+    /* Two interleaved R16_FLOAT attributes, loaded separately. The second
+     * instruction must use the high half of the same 32-bit record. */
+    const uint32_t typed_loads[] = {
+        0xe8682000u, 0x80000400u, /* tbuffer_load_format_x v4, v0, s[0:3], 0 format:13 idxen */
+        0xe8682002u, 0x80000500u, /* tbuffer_load_format_x v5, v0, s[0:3], 0 format:13 idxen offset:2 */
+        0xbf8c3f70u,
+        0xe0742000u, 0x80030400u, /* buffer_store_dwordx2 v[4:5], v0, s[12:15], 0 idxen */
+        0xbf810000u,
+    };
+    guest_addr typed_pc = a + 0xf00;
+    CHECK(gmem_write(&m, typed_pc, typed_loads, sizeof(typed_loads)));
+    g.regs[mmCOMPUTE_PGM_LO] = (uint32_t)(typed_pc >> 8);
+    g.regs[mmCOMPUTE_PGM_HI] = (uint32_t)(typed_pc >> 40);
+    u[3] = 0xfacu | (13u << 12);
+    for (unsigned lane = 0; lane < 64; lane++) src[lane] = 0x3e00b800u;
+    memset(out, 0xee, 64 * 16);
+    renderer_submit_begin(r);
+    renderer_dispatch(r, &g, 1, 1, 1);
+    renderer_sync_mem(r, a + 0x1000, 64 * 16);
+    for (unsigned lane = 0; lane < 64; lane++) {
+        if (out[4 * lane] == 0xbf000000u && out[4 * lane + 1] == 0x3fc00000u) continue;
+        fprintf(stderr, "typed half offsets, lane %u: %08x %08x\n", lane, out[4 * lane], out[4 * lane + 1]);
+        matched = false;
+        break;
+    }
     renderer_destroy(r);free(g.regs);pal_mutex_destroy(g.lock);pal_window_destroy(window);gmem_free(&m);pal_shutdown();
     CHECK(matched);puts("GPU D16: UINT/SINT/UNORM, 1-4 channels and high-half preservation passed");return 0;
 }

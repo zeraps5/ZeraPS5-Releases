@@ -218,8 +218,210 @@ static bool keyboard_event(hle_call *c, uint32_t id, const native_key *key) {
     return runtime_call_nested(c->rt, g_key_handler, g_key_arg, (uint64_t)(uintptr_t)event, 0,
                                &result);
 }
+/* ---- libSceIme text editor (sceImeOpen): no panel is drawn. With the native
+ * keyboard on, the PC keyboard types into it (Enter confirms, Esc cancels);
+ * otherwise it confirms right away with the text the game put in it (a world's
+ * default name). Events go to the game's handler from sceImeUpdate, like the
+ * keyboard's. Param/event layouts and panel sizes as in KytyPS5's ime.h. */
+#define IME_BUSY ((int32_t)0x80BC0001)
+#define IME_NOT_OPENED ((int32_t)0x80BC0002)
+#define IME_INVALID_TYPE ((int32_t)0x80BC0011)
+#define IME_INVALID_OPTION ((int32_t)0x80BC0015)
+#define IME_INVALID_MAX_TEXT_LENGTH ((int32_t)0x80BC0016)
+#define IME_INVALID_TEXT_BUFFER ((int32_t)0x80BC0017)
+#define IME_INVALID_WORK ((int32_t)0x80BC0020)
+#define IME_INVALID_HANDLER ((int32_t)0x80BC0022)
+#define IME_INVALID_PARAM ((int32_t)0x80BC0030)
+#define IME_VALID_OPTIONS 0x7bffu
+#define IME_OPTION_OVER_2K 0x4000u
+#define IME_TYPE_NUMBER 4u
+#define IME_MAX_TEXT 2048u
+#define IME_WORK_SIZE (20u * 1024u)
+enum { IME_EV_OPEN = 0, IME_EV_TEXT = 1, IME_EV_CARET = 2, IME_EV_CLOSE = 4, IME_EV_ENTER = 5 };
+static struct {
+    bool open;
+    guest_addr handler, arg, work, input;
+    uint32_t max, len, caret, type, option, session;
+    float x, y;
+    uint16_t text[IME_MAX_TEXT + 1];
+    uint32_t events[64], event_param[64], count;
+} g_ime;
+static void ime_panel_size(uint32_t type, uint32_t option, uint32_t *w, uint32_t *h) {
+    *w = type == IME_TYPE_NUMBER ? 370 : 793;
+    *h = type == IME_TYPE_NUMBER ? 402 : 408;
+    if (option & IME_OPTION_OVER_2K) *w *= 2, *h *= 2;
+}
+static void ime_queue(uint32_t id, uint32_t param) {
+    if (g_ime.count < PS5C_ARRAY_COUNT(g_ime.events)) {
+        g_ime.events[g_ime.count] = id;
+        g_ime.event_param[g_ime.count++] = param;
+    }
+}
+/* the text in the work area (what UPDATE_TEXT points at) and in the game's buffer */
+static void ime_sync(hle_call *c) {
+    uint16_t z = 0;
+    for (int i = 0; i < 2; i++) {
+        guest_addr a = i ? g_ime.input : g_ime.work;
+        gmem_write(c->mem, a, g_ime.text, (uint64_t)g_ime.len * 2);
+        gmem_write(c->mem, a + (uint64_t)g_ime.len * 2, &z, 2);
+    }
+}
+/* int sceImeGetPanelSize(const SceImeParam *param, uint32_t *width, uint32_t *height) */
+static void ime_get_panel_size(hle_call *c) {
+    uint32_t p[9], *w = (uint32_t *)hle_mem(c, hle_arg_ptr(c, 1), 4), *h = (uint32_t *)hle_mem(c, hle_arg_ptr(c, 2), 4);
+    if (!w || !h || !gmem_read(c->mem, hle_arg_ptr(c, 0), p, sizeof(p))) {
+        hle_ret_s32(c, IME_ADDRESS);
+        return;
+    }
+    if (p[1] > IME_TYPE_NUMBER) { hle_ret_s32(c, IME_INVALID_TYPE); return; }
+    if (p[8] & ~IME_VALID_OPTIONS) { hle_ret_s32(c, IME_INVALID_OPTION); return; }
+    ime_panel_size(p[1], p[8], w, h);
+    hle_ret_s32(c, 0);
+}
+/* int sceImeOpen(const SceImeParam *param, const SceImeParamExtended *extended)
+ * SceImeParam (0x60): +4 type, +0x20 option, +0x24 maxTextLength, +0x28 inputTextBuffer,
+ * +0x30 posx, +0x34 posy (floats), +0x40 work, +0x48 arg, +0x50 handler */
+static void ime_open(hle_call *c) {
+    uint8_t p[0x60];
+    if (g_ime.open) { hle_ret_s32(c, IME_BUSY); return; }
+    if (!gmem_read(c->mem, hle_arg_ptr(c, 0), p, sizeof(p))) { hle_ret_s32(c, IME_ADDRESS); return; }
+    uint32_t type, option, max;
+    guest_addr input, work, arg, handler;
+    memcpy(&type, p + 4, 4);
+    memcpy(&option, p + 0x20, 4);
+    memcpy(&max, p + 0x24, 4);
+    memcpy(&input, p + 0x28, 8);
+    memcpy(&work, p + 0x40, 8);
+    memcpy(&arg, p + 0x48, 8);
+    memcpy(&handler, p + 0x50, 8);
+    int32_t err = type > IME_TYPE_NUMBER ? IME_INVALID_TYPE
+                : option & ~IME_VALID_OPTIONS ? IME_INVALID_OPTION
+                : !max || max > IME_MAX_TEXT ? IME_INVALID_MAX_TEXT_LENGTH
+                : !input || !hle_mem(c, input, ((uint64_t)max + 1) * 2) ? IME_INVALID_TEXT_BUFFER
+                : !work || !hle_mem(c, work, IME_WORK_SIZE) ? IME_INVALID_WORK
+                : !handler ? IME_INVALID_HANDLER : 0;
+    if (err) { hle_ret_s32(c, err); return; }
+    uint32_t session = g_ime.session + 1;
+    memset(&g_ime, 0, sizeof(g_ime));
+    g_ime.session = session;
+    g_ime.handler = handler, g_ime.arg = arg, g_ime.work = work, g_ime.input = input;
+    g_ime.max = max, g_ime.type = type, g_ime.option = option;
+    memcpy(&g_ime.x, p + 0x30, 4);
+    memcpy(&g_ime.y, p + 0x34, 4);
+    const uint16_t *start = (const uint16_t *)hle_mem(c, input, ((uint64_t)max + 1) * 2);
+    while (g_ime.len < max && start[g_ime.len]) g_ime.len++;
+    memcpy(g_ime.text, start, (size_t)g_ime.len * 2);
+    g_ime.caret = g_ime.len;
+    memset(hle_mem(c, work, IME_WORK_SIZE), 0, IME_WORK_SIZE);
+    ime_sync(c);
+    g_ime.open = true;
+    ime_queue(IME_EV_OPEN, 0);
+    bool typing = native_keyboard_enabled();
+    if (typing) native_input_clear_keys();
+    else ime_queue(IME_EV_ENTER, 0); /* no way to type: accept the text as it is */
+    LOG_I(INPUT, "text input opened (%u characters, up to %u): %s", g_ime.len, max,
+          typing ? "type with the PC keyboard, Enter confirms, Esc cancels" : "confirmed as it is (native keyboard off)");
+    hle_ret_s32(c, 0);
+}
+/* int sceImeClose(void) */
+static void ime_close(hle_call *c) {
+    if (!g_ime.open) { hle_ret_s32(c, IME_NOT_OPENED); return; }
+    g_ime.open = false;
+    g_ime.count = 0;
+    hle_ret_s32(c, 0);
+}
+/* int sceImeSetText(const char16_t *text, uint32_t length): replaces the text */
+static void ime_set_text(hle_call *c) {
+    if (!g_ime.open) { hle_ret_s32(c, IME_NOT_OPENED); return; }
+    uint32_t n = hle_arg_u32(c, 1);
+    if (n > g_ime.max) n = g_ime.max;
+    const uint16_t *t = (const uint16_t *)hle_mem(c, hle_arg_ptr(c, 0), (uint64_t)n * 2);
+    if (!hle_arg_ptr(c, 0) || (n && !t)) { hle_ret_s32(c, IME_ADDRESS); return; }
+    g_ime.len = 0;
+    while (g_ime.len < n && t[g_ime.len]) g_ime.text[g_ime.len] = t[g_ime.len], g_ime.len++;
+    if (g_ime.caret > g_ime.len) g_ime.caret = g_ime.len;
+    ime_sync(c);
+    hle_ret_s32(c, 0);
+}
+/* int sceImeSetCaret(const SceImeCaret *caret): {float x, y; u32 height, index} */
+static void ime_set_caret(hle_call *c) {
+    if (!g_ime.open) { hle_ret_s32(c, IME_NOT_OPENED); return; }
+    uint32_t caret[4];
+    if (!gmem_read(c->mem, hle_arg_ptr(c, 0), caret, sizeof(caret))) { hle_ret_s32(c, IME_ADDRESS); return; }
+    if (caret[3] > g_ime.len) { hle_ret_s32(c, IME_INVALID_PARAM); return; }
+    g_ime.caret = caret[3];
+    hle_ret_s32(c, 0);
+}
+/* int sceImeSetTextGeometry(SceImeTextAreaMode mode, const SceImeTextGeometry *geometry):
+ * where the game draws the text; there is no panel to place */
+static void ime_set_text_geometry(hle_call *c) {
+    if (!g_ime.open) { hle_ret_s32(c, IME_NOT_OPENED); return; }
+    if (!hle_mem(c, hle_arg_ptr(c, 1), 16)) { hle_ret_s32(c, IME_ADDRESS); return; }
+    uint32_t mode = hle_arg_u32(c, 0);
+    hle_ret_s32(c, mode == 2 || mode == 3 ? 0 : IME_INVALID_PARAM);
+}
+/* PC keys into the text: characters at the caret, Backspace, arrows, Enter, Esc */
+static void ime_read_keys(hle_call *c) {
+    native_key k;
+    for (unsigned i = 0; i < 256 && native_input_read_key(&k); i++) {
+        if (k.event != 257 && k.event != 259) continue; /* key downs and repeats */
+        if (k.code == 0x28 || k.code == 0x58) ime_queue(IME_EV_ENTER, 0);
+        else if (k.code == 0x29) ime_queue(IME_EV_CLOSE, 0);
+        else if (k.code == 0x2A) {
+            if (!g_ime.caret) continue;
+            memmove(g_ime.text + g_ime.caret - 1, g_ime.text + g_ime.caret, (size_t)(g_ime.len - g_ime.caret) * 2);
+            g_ime.caret--, g_ime.len--;
+            ime_sync(c);
+            ime_queue(IME_EV_TEXT, 0);
+        } else if (k.code == 0x50 || k.code == 0x4F) {
+            bool right = k.code == 0x4F;
+            if (right ? g_ime.caret >= g_ime.len : !g_ime.caret) continue;
+            g_ime.caret += right ? 1 : -1;
+            ime_queue(IME_EV_CARET, right ? 2 : 1);
+        } else if (k.character >= 0x20 && k.character != 0x7F && g_ime.len < g_ime.max) {
+            memmove(g_ime.text + g_ime.caret + 1, g_ime.text + g_ime.caret, (size_t)(g_ime.len - g_ime.caret) * 2);
+            g_ime.text[g_ime.caret++] = k.character;
+            g_ime.len++;
+            ime_sync(c);
+            ime_queue(IME_EV_TEXT, 0);
+        }
+    }
+}
+/* SceImeEvent (0x48): u32 id; +8 param: rect {float x, y; u32 w, h}, edit text
+ * {char16_t *str; u32 caretIndex, areaNum; {u32 mode, index; s32 length} area[4]}, or u32 caret move */
+static void ime_update(hle_call *c) {
+    if (atomic_flag_test_and_set_explicit(&g_updating, memory_order_acquire)) return;
+    if (native_keyboard_enabled()) ime_read_keys(c);
+    uint32_t session = g_ime.session;
+    for (uint32_t i = 0; i < g_ime.count && g_ime.open && g_ime.session == session; i++) {
+        uint64_t event[9] = {0};
+        uint8_t *p = (uint8_t *)event;
+        uint32_t id = g_ime.events[i], u[6];
+        memcpy(p, &id, 4);
+        if (id == IME_EV_OPEN) {
+            memcpy(p + 8, &g_ime.x, 4);
+            memcpy(p + 12, &g_ime.y, 4);
+            ime_panel_size(g_ime.type, g_ime.option, &u[0], &u[1]);
+            memcpy(p + 16, u, 8);
+        } else if (id == IME_EV_TEXT) {
+            memcpy(p + 8, &g_ime.work, 8);
+            u[0] = g_ime.caret, u[1] = 1, u[2] = 1 /* edit */, u[3] = 0, u[4] = g_ime.len;
+            memcpy(p + 16, u, 20);
+        } else if (id == IME_EV_CARET) {
+            memcpy(p + 8, &g_ime.event_param[i], 4);
+        }
+        uint64_t result;
+        if (!runtime_call_nested(c->rt, g_ime.handler, g_ime.arg, (uint64_t)(uintptr_t)event, 0, &result)) break;
+    }
+    if (g_ime.session == session) g_ime.count = 0;
+    atomic_flag_clear_explicit(&g_updating, memory_order_release);
+}
 static void keyboard_update(hle_call *c) {
     hle_ret_s32(c, 0);
+    if (g_ime.open && hle_arg_ptr(c, 0) == g_ime.handler && c->rt) {
+        ime_update(c);
+        return;
+    }
     if (!g_key_open || hle_arg_ptr(c, 0) != g_key_handler || !c->rt ||
         atomic_flag_test_and_set_explicit(&g_updating, memory_order_acquire))
         return;
@@ -361,6 +563,12 @@ static const hle_export exports[] = {
     HLE_FUNC_ENTRY("libSceIme", "sceImeKeyboardGetResourceId", keyboard_resource_id),
     HLE_FUNC_ENTRY("libSceIme", "sceImeKeyboardGetInfo", keyboard_info),
     HLE_FUNC_ENTRY("libSceIme", "sceImeUpdate", keyboard_update),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeOpen", ime_open),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeClose", ime_close),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeGetPanelSize", ime_get_panel_size),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeSetText", ime_set_text),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeSetCaret", ime_set_caret),
+    HLE_FUNC_ENTRY("libSceIme", "sceImeSetTextGeometry", ime_set_text_geometry),
 };
 void hle_register_input(void) {
     hle_register_table(exports, PS5C_ARRAY_COUNT(exports));

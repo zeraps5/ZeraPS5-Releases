@@ -26,6 +26,8 @@ typedef struct pkg_inner_node {
     uint32_t parent, child, sibling; /* node indexes, 0 = none */
     bool dir;
     uint64_t size, offset;           /* offset: in the uncompressed image */
+    uint32_t pfs;                    /* PS4: ps4fs node + 1 of a file that is not one run of the image
+                                      * (scattered blocks, or compressed on its own); 0 = read at offset */
 } pkg_inner_node;
 
 typedef struct pkg_inner {
@@ -46,6 +48,13 @@ typedef struct pkg_inner {
     pkg_inner_node *nodes;
     uint32_t count, cap, uroot;
     ps5c_err tree_err;               /* the block table loaded but the tree did not */
+    /* PS4: the inner PFS stays open for the files read through their block lists */
+    pfs_image ps4fs;
+    bool have_ps4fs;
+    struct pal_mutex *file_lock;     /* PFSC tables and decoded blocks of compressed files */
+    struct pkg_pfsc **pfsc;          /* per node, loaded on the first read */
+    struct pkg_fblock *fblocks;
+    uint64_t file_tick;
 } pkg_inner;
 
 /* PS5: needs a package whose outer image pkg_find_key found stored as
@@ -58,7 +67,8 @@ ps5c_err pkg_inner_open(const char *path, const pkg_info *info, pkg_inner **out)
 void pkg_inner_close(pkg_inner *in);
 /* Bytes of the uncompressed inner image. Safe to call from several threads. */
 ps5c_err pkg_inner_read(pkg_inner *in, void *buf, uint64_t size, uint64_t off);
-/* Bytes of a file node. */
+/* Bytes of a file node: at its offset, or (PS4) through its block list,
+ * decompressing a file compressed on its own (its own PFSC stream). */
 ps5c_err pkg_inner_read_file(pkg_inner *in, const pkg_inner_node *n, void *buf, uint64_t size, uint64_t off);
 /* Drops the decoded spans, so the next reads decode again. */
 void pkg_inner_flush(pkg_inner *in);
