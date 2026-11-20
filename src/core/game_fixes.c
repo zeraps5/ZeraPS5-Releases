@@ -107,6 +107,22 @@ static bool origins_display(uint8_t *at) {
     return true;
 }
 
+/* R-Type Delta: HD Boosted (v01.000.002). Its INPUT thread sleeps 400 ms before it first
+ * polls sceUserServiceGetEvent, which fills the list of logged-in users; the main thread's
+ * save autoload then takes the list's first user. On the console loading the title module
+ * outlasts that sleep; here the autoload can come first and reads an empty list (a crash at
+ * RTypeDelta+0x24055 about 6 s in). The first sleep becomes 16 ms. */
+static const uint8_t k_rtype_input_sleep[] = {
+    0x48, 0x89, 0xdf,             /* mov rdi, rbx */
+    0xbe, 0x90, 0x01, 0x00, 0x00, /* mov esi, 400 */
+    0xff, 0x50, 0x08,             /* call [rax+8]: sleep (ms) */
+};
+
+static bool rtype_input_sleep(uint8_t *at) {
+    at[4] = 16, at[5] = 0;
+    return true;
+}
+
 guest_addr game_longshot_allocator_rva(const loaded_module *m) {
     /* The v0.1.3 PS5 host uses VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE)
      * from its first-touch handler. Check both the function entry and the
@@ -149,6 +165,8 @@ static const game_fix k_fixes[] = {
      sizeof(k_tmnt_framebuffer), tmnt_framebuffer},
     {"PPSA05324", "hiteR", "display set up at the output's size instead of a fixed 3840x2160", 0x8cc70f,
      k_origins_display, sizeof(k_origins_display), origins_display},
+    {"PPSA26414", "RTypeDelta", "input thread polls the user login before the save autoload", 0x4908b,
+     k_rtype_input_sleep, sizeof(k_rtype_input_sleep), rtype_input_sleep},
 };
 
 compat_patch_status game_compat_apply(gmem *mem, const loaded_module *m,

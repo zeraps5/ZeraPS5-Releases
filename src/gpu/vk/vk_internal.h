@@ -84,6 +84,7 @@ typedef struct vk_image {
     guest_addr stencil_addr;  /* DB_STENCIL_*_BASE of the stencil drawn with it (0: none) */
     VkDeviceSize allocated_bytes; /* physical allocation, including only resident mips for sparse images */
     uint32_t sparse_first; /* 0=dense; otherwise first physically bound mip (tail always bound) */
+    uint32_t mem_share; /* draw targets: the shared memory block it is bound to (index + 1; 0: its own) */
 } vk_image;
 
 /* Depth formats with a stencil aspect: attachments and layout changes cover
@@ -146,6 +147,9 @@ struct renderer {
     uint32_t rt_scale;
     uint32_t rt_cap; /* resolucao_interna: targets taller than this drawn at it (rt_scale 100) */
     bool scale_new;
+    /* set while a color or depth target is created for a draw: its memory may be shared with the
+     * other targets at its address (vk_renderer.c, shared target memory); PS5C_NO_RT_ALIAS=1 off */
+    bool alias_new;
     /* VK_KHR_push_descriptor (PS5C_VK_PUSH=0: a descriptor set allocated and updated per draw) */
     uint32_t push_max; /* 0: off; else the most descriptors a pushed set may hold */
     PFN_vkCmdPushDescriptorSetKHR push_descriptor_set;

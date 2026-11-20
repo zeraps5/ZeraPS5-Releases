@@ -40,5 +40,7 @@ void kobj_unlock(void);
  * advances *cursor. False when none is left. */
 struct guest_thread;
 bool kernel_thread_take_specific(struct guest_thread *t, uint32_t *cursor, uint64_t *destructor, uint64_t *value);
+/* _sceLibcInternalThreadAtexit destructors of an ending thread, newest first (lib_libc_internal.c) */
+bool libc_thread_take_dtor(uint32_t thread, uint64_t *fn, uint64_t *obj);
 
 #endif

@@ -3,7 +3,7 @@
  * imports games read through an output pointer, found by the static survey of
  * unimplemented imports (PS5C_LIST_UNIMPLEMENTED). Answers follow AnyPS5:
  *   - dialogs (IME, player invitation, web browser, PlayGo) finish at once,
- *     cancelled by the user (PlayGo: OK, everything is installed);
+ *     cancelled by the user (PlayGo: OK, everything is installed; IME: entered);
  *   - no system events, game intents, updates or Remote Play connections.
  *
  * Layouts (SDK):
@@ -14,6 +14,7 @@
  *   SceSystemServicePlayerDialogParam { u64 size; s32 mode; s32 userId; u64 accountId; u8 reserved[40]; }
  *   SceGameUpdateCheckResult        { u64 size; bool found; bool addcontFound; ... }
  *   SceSaveDataIcon                 { void *buf; u64 bufSize; u64 dataSize; u8 reserved[32]; } */
+#include <stdlib.h>
 #include <string.h>
 
 #include "base/log.h"
@@ -102,20 +103,55 @@ static void kernel_stop_unload_module(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
-/* ---- IME dialog: cancelled, the game keeps its text ---- */
+/* ---- IME dialog: no keyboard UI, answered at once ----
+ * SceImeDialogParam: { s32 userId; s32 type; u64 supportedLanguages; s32 enterLabel;
+ * s32 inputMethod; void *filter; u32 option; u32 maxTextLength; char16_t *inputTextBuffer;
+ * float posx, posy; s32 horizontalAlignment, verticalAlignment; const char16_t *placeholder,
+ * *title; s8 reserved[16]; }. A game that needs a name (Plants vs. Zombies: Replanted's
+ * new profile) cannot go on with a cancelled dialog: the dialog is entered with the
+ * game's text, or when that is empty PS5C_IME_TEXT (default: the user's name).
+ * PS5C_IME_CANCEL=1 restores the cancelled answer. */
 
 #define IME_NONE 0
 #define IME_FINISHED 2
+#define IME_END_OK 0
 #define IME_END_USER_CANCELED 1
 #define IME_END_ABORTED 2
 #define IME_NOT_OPENED ((int32_t)0x80BC0002u)
+#define IME_DEFAULT_TEXT "PS5C"
 
 static int32_t g_ime_status, g_ime_end;
 
+static bool ime_enter_text(hle_call *c, guest_addr param) {
+    const char *cancel = getenv("PS5C_IME_CANCEL");
+    if (!param || (cancel && cancel[0] == '1')) return false;
+    const uint8_t *p = hle_mem(c, param, 0x60);
+    if (!p) return false;
+    uint32_t max_len;
+    uint64_t buf_addr;
+    memcpy(&max_len, p + 36, 4);
+    memcpy(&buf_addr, p + 40, 8);
+    if (!buf_addr || !max_len || max_len > 4096) return false;
+    uint16_t *buf = hle_mem(c, (guest_addr)buf_addr, (uint64_t)(max_len + 1) * 2);
+    if (!buf) return false;
+    if (buf[0]) {
+        LOG_I(HLE, "IME dialog: no keyboard UI, entered the game's text");
+        return true;
+    }
+    const char *text = getenv("PS5C_IME_TEXT");
+    if (!text || !text[0]) text = IME_DEFAULT_TEXT;
+    uint32_t n = 0;
+    for (const unsigned char *s = (const unsigned char *)text; *s && n < max_len; s++)
+        buf[n++] = *s < 0x80 ? *s : '?'; /* ASCII; the rest needs UTF-8 decoding */
+    buf[n] = 0;
+    LOG_I(HLE, "IME dialog: no keyboard UI, entered \"%s\" (at most %u characters)", text, max_len);
+    return true;
+}
+
 static void ime_init(hle_call *c) {
-    LOG_I(HLE, "IME dialog: no keyboard UI, answered as cancelled");
     g_ime_status = IME_FINISHED;
-    g_ime_end = IME_END_USER_CANCELED;
+    g_ime_end = ime_enter_text(c, hle_arg_ptr(c, 0)) ? IME_END_OK : IME_END_USER_CANCELED;
+    if (g_ime_end == IME_END_USER_CANCELED) LOG_I(HLE, "IME dialog: no keyboard UI, answered as cancelled");
     hle_ret_s32(c, 0);
 }
 

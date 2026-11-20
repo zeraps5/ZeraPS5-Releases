@@ -95,6 +95,8 @@ typedef struct tr {
      * bit (translation order; compute shaders, whose lanes are known) */
     bool raw_mask[SH_SGPRS];
     bool lane_mask[SH_SGPRS]; /* comparison/EXEC represented by this invocation's bit */
+    bool scalar_use[SH_SGPRS]; /* read as a number by some scalar instruction (not only as a mask) */
+    bool scalar_use_ready;
     bool full_wave32; /* complete masks and native32 scalar lane exchange */
     bool mesh_ballot32;
     bool full_wave64; /* complete scalar masks and lane exchange for guest waves64 */
@@ -112,6 +114,7 @@ typedef struct tr {
     bool capture_require;
     bool vs_probe; /* PS5C_VS_PROBE: the probed values go to the end of the uniform buffer */
     bool ps_solid; /* PS5C_PS_SOLID: every pixel the draw covers becomes magenta */
+    uint32_t ps_solid_index; /* its place in a PS5C_PS_SOLID list: the color */
     uint32_t vs_probe_vid;
 
     uint32_t t_void, t_bool, t_u32, t_i32, t_f32, t_u64, t_v2f, t_v2i, t_v3u, t_v4f, t_v4u, t_v4i;
@@ -702,6 +705,38 @@ static uint32_t vector_mask(tr *t,const rdna2_inst *in,uint32_t code) {
     return bit0(t,own_lane_bit(t,lo,hi));
 }
 
+static uint32_t c64(tr *t, uint64_t v);
+
+/* Whether a scalar instruction reads this SGPR as a number (arithmetic, bit fields,
+ * comparisons, s_bitset's destination) rather than only as a lane mask in logic ops. */
+static bool salu_logic_name(const char *name) {
+    static const char *const k[] = {"s_mov_", "s_and_", "s_or_", "s_xor_", "s_andn2_", "s_orn2_", "s_nand_",
+                                    "s_nor_", "s_xnor_", "s_not_", "s_cselect_", "s_andn1_", "s_orn1_"};
+    for (size_t i = 0; name && i < sizeof(k) / sizeof(k[0]); i++)
+        if (!strncmp(name, k[i], strlen(k[i]))) return true;
+    return false;
+}
+
+static bool sgpr_scalar_use(tr *t, uint32_t code) {
+    if (!t->scalar_use_ready) {
+        t->scalar_use_ready = true;
+        for (uint32_t i = 0; i < t->p->count; i++) {
+            const rdna2_inst *q = &t->p->insts[i];
+            bool sop = q->enc == RDNA2_ENC_SOP1 || q->enc == RDNA2_ENC_SOP2 || q->enc == RDNA2_ENC_SOPC ||
+                       q->enc == RDNA2_ENC_SOPK;
+            if (!sop || (q->enc != RDNA2_ENC_SOPC && salu_logic_name(q->name))) continue;
+            uint32_t regs[3] = {q->src[0], q->enc == RDNA2_ENC_SOP1 ? q->dst : q->src[1],
+                                q->enc == RDNA2_ENC_SOPK ? q->dst : RDNA2_OP_NULL};
+            for (int k = 0; k < 3; k++)
+                if (regs[k] < SH_SGPRS) {
+                    t->scalar_use[regs[k]] = true;
+                    if (regs[k] + 1 < SH_SGPRS) t->scalar_use[regs[k] + 1] = true;
+                }
+        }
+    }
+    return code < SH_SGPRS && (t->scalar_use[code] || (code + 1 < SH_SGPRS && t->scalar_use[code + 1]));
+}
+
 static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
     uint32_t U = t->t_u32, B = t->t_bool, L = t->t_u64;
     uint32_t d = in->dst;
@@ -746,6 +781,13 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
         }
         if (changed) in = &conv;
     }
+    /* An inverting logic op on lane masks (each invocation's own bit 0) must keep
+     * only that bit: ~1 is 0xfffffffe, a set mask that never empties a loop's
+     * remaining-lanes copy (Longshot's frame generation search, s_nand_b64 /
+     * s_and_saveexec / s_andn2_b64 exec, ran to the loop limit). */
+    bool lane_bit = lane_result && !t->full_wave64 && !t->full_wave32;
+#define LB32(r) (lane_bit ? op2(t, SpvOpBitwiseAnd, U, (r), cu(t, 1)) : (r))
+#define LB64(r) (lane_bit ? op2(t, SpvOpBitwiseAnd, L, (r), c64(t, 1)) : (r))
     if (in->enc == RDNA2_ENC_SOPK) {
         a = get_s(t, d);
         bool zext = op == SH_OP_S_CMPK_EQ_U32 || op == SH_OP_S_CMPK_LG_U32 || op == SH_OP_S_CMPK_GT_U32 ||
@@ -768,8 +810,8 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
     case SH_OP_S_MOV_B64: set_s64(t, d, A64()); break;
     case SH_OP_S_CMOV_B32: set_s(t, d, sel(t, U, get_scc(t), A32(), get_s(t, d))); break;
     case SH_OP_S_MOVK_I32: set_s(t, d, cu(t, (uint32_t)in->simm16)); break;
-    case SH_OP_S_NOT_B32: { uint32_t r = op1(t, SpvOpNot, U, A32()); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
-    case SH_OP_S_NOT_B64: { uint32_t r = op1(t, SpvOpNot, L, A64()); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
+    case SH_OP_S_NOT_B32: { uint32_t r = LB32(op1(t, SpvOpNot, U, A32())); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
+    case SH_OP_S_NOT_B64: { uint32_t r = LB64(op1(t, SpvOpNot, L, A64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
     case SH_OP_S_BREV_B32: set_s(t, d, op1(t, SpvOpBitReverse, U, A32())); break;
     case SH_OP_S_BCNT1_I32_B32: { uint32_t r = ubits(t, op1(t, SpvOpBitCount, t->t_i32, A32())); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
     case SH_OP_S_FF1_I32_B32: set_s(t, d, ubits(t, ext1(t, t->t_i32, GLSLstd450FindILsb, A32()))); break;
@@ -858,10 +900,10 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
     case SH_OP_S_OR_B32: LOGIC32(SpvOpBitwiseOr)
     case SH_OP_S_XOR_B32: LOGIC32(SpvOpBitwiseXor)
     case SH_OP_S_ANDN2_B32: { b = op1(t, SpvOpNot, U, B32()); LOGIC32(SpvOpBitwiseAnd) }
-    case SH_OP_S_ORN2_B32: { b = op1(t, SpvOpNot, U, B32()); LOGIC32(SpvOpBitwiseOr) }
-    case SH_OP_S_NAND_B32: { uint32_t r = op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseAnd, U, A32(), B32())); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
-    case SH_OP_S_NOR_B32: { uint32_t r = op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseOr, U, A32(), B32())); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
-    case SH_OP_S_XNOR_B32: { uint32_t r = op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseXor, U, A32(), B32())); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
+    case SH_OP_S_ORN2_B32: { uint32_t r = LB32(op2(t, SpvOpBitwiseOr, U, A32(), op1(t, SpvOpNot, U, B32()))); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
+    case SH_OP_S_NAND_B32: { uint32_t r = LB32(op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseAnd, U, A32(), B32()))); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
+    case SH_OP_S_NOR_B32: { uint32_t r = LB32(op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseOr, U, A32(), B32()))); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
+    case SH_OP_S_XNOR_B32: { uint32_t r = LB32(op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseXor, U, A32(), B32()))); set_s(t, d, r); set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0))); break; }
     case SH_OP_S_LSHL_B32: { b = op2(t, SpvOpBitwiseAnd, U, B32(), cu(t, 31)); LOGIC32(SpvOpShiftLeftLogical) }
     case SH_OP_S_LSHR_B32: { b = op2(t, SpvOpBitwiseAnd, U, B32(), cu(t, 31)); LOGIC32(SpvOpShiftRightLogical) }
     case SH_OP_S_ASHR_I32: {
@@ -885,10 +927,10 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
     case SH_OP_S_OR_B64: LOGIC64(SpvOpBitwiseOr)
     case SH_OP_S_XOR_B64: LOGIC64(SpvOpBitwiseXor)
     case SH_OP_S_ANDN2_B64: { uint32_t r = op2(t, SpvOpBitwiseAnd, L, A64(), op1(t, SpvOpNot, L, B64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
-    case SH_OP_S_NAND_B64: { uint32_t r = op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseAnd, L, A64(), B64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
-    case SH_OP_S_NOR_B64: { uint32_t r = op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseOr, L, A64(), B64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
-    case SH_OP_S_XNOR_B64: { uint32_t r = op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseXor, L, A64(), B64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
-    case SH_OP_S_ORN2_B64: { uint32_t r = op2(t, SpvOpBitwiseOr, L, A64(), op1(t, SpvOpNot, L, B64())); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
+    case SH_OP_S_NAND_B64: { uint32_t r = LB64(op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseAnd, L, A64(), B64()))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
+    case SH_OP_S_NOR_B64: { uint32_t r = LB64(op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseOr, L, A64(), B64()))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
+    case SH_OP_S_XNOR_B64: { uint32_t r = LB64(op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseXor, L, A64(), B64()))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
+    case SH_OP_S_ORN2_B64: { uint32_t r = LB64(op2(t, SpvOpBitwiseOr, L, A64(), op1(t, SpvOpNot, L, B64()))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
     case SH_OP_S_LSHL_B64: { uint32_t r = op2(t, SpvOpShiftLeftLogical, L, A64(), op2(t, SpvOpBitwiseAnd, U, B32(), cu(t, 63))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
     case SH_OP_S_LSHR_B64: { uint32_t r = op2(t, SpvOpShiftRightLogical, L, A64(), op2(t, SpvOpBitwiseAnd, U, B32(), cu(t, 63))); set_s64(t, d, r); set_scc(t, nz64(t, r)); break; }
     case SH_OP_S_BFE_U64: {
@@ -950,6 +992,7 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
                    : op == SH_OP_S_XNOR_SAVEEXEC_B64 ? op1(t, SpvOpNot, L, op2(t, SpvOpBitwiseXor, L, s0, exec))
                    : op == SH_OP_S_ANDN1_SAVEEXEC_B64 ? op2(t, SpvOpBitwiseAnd, L, ns0, exec)
                    : op2(t, SpvOpBitwiseOr, L, ns0, exec);
+        r = LB64(r);
         set_s64(t, RDNA2_OP_EXEC_LO, r);
         set_scc(t, nz64(t, r));
         break;
@@ -965,6 +1008,7 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
                    : op == SH_OP_S_XNOR_SAVEEXEC_B32 ? op1(t, SpvOpNot, U, op2(t, SpvOpBitwiseXor, U, s0, exec))
                    : op == SH_OP_S_ANDN1_SAVEEXEC_B32 ? op2(t, SpvOpBitwiseAnd, U, ns0, exec)
                    : op2(t, SpvOpBitwiseOr, U, ns0, exec);
+        r = LB32(r);
         set_s(t, RDNA2_OP_EXEC_LO, r);
         set_scc(t, op2(t, SpvOpINotEqual, B, r, cu(t, 0)));
         break;
@@ -1107,6 +1151,38 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
         else if (op == SH_OP_S_MOVK_I32) raw = true;
         else if (op == SH_OP_S_MOV_B32 || op == SH_OP_S_MOV_B64)
             raw = in->src[0] >= 128 || (in->src[0] < SH_SGPRS && t->raw_mask[in->src[0]]);
+        else if (bitwise && !lane_result && (in->enc == RDNA2_ENC_SOP1 || in->enc == RDNA2_ENC_SOP2)) {
+            /* A logic op on plain masks and constants is a plain mask too: RADV's
+             * s_mov_b64 vcc, 0 / s_not_b64 s[8:9], vcc / s_and_saveexec_b64 left the
+             * whole-wave ~0 in EXEC, and a later v_cmpx (bit 0) never emptied a loop's
+             * remaining-lanes copy of it (Longshot's Lanczos resample ran to the limit). */
+            raw = true;
+            for (int k = 0; k < (in->enc == RDNA2_ENC_SOP2 ? 2 : 1) && raw; k++) {
+                uint32_t code = in->src[k], v;
+                raw = (code < SH_SGPRS && t->raw_mask[code]) ||
+                      (code >= 128 && code != RDNA2_OP_SCC && sh_inline_const(code, in->literal, &v));
+            }
+        }
+        /* A whole-wave constant mask (s_mov_b64 / s_cselect_b64 of -1 and 0) becomes the
+         * invocation's own bit at once, the form EXEC and its copies have. Paths that
+         * meet at one instruction then agree: Longshot's frame generation reaches its
+         * final s_not_b64 / s_and_saveexec_b64 with s[10:11] either -1 / 0 or a copy of
+         * EXEC, and one static form for both turned ~1 into a lane-position mask. */
+        if (t->info->stage == SH_STAGE_CS && t->in_lid && wide && d != RDNA2_OP_EXEC_LO && d + 1 < SH_SGPRS &&
+            (op == SH_OP_S_MOV_B64 || op == SH_OP_S_CSELECT_B64) && !sgpr_scalar_use(t, d)) {
+            bool constant_mask = true;
+            for (int k = 0; k < (op == SH_OP_S_CSELECT_B64 ? 2 : 1) && constant_mask; k++) {
+                uint32_t code = in->src[k], v;
+                constant_mask = code >= 128 && code != RDNA2_OP_SCC && sh_inline_const(code, in->literal, &v) &&
+                                (v == 0 || (v == 0xFFFFFFFFu && code >= 193 && code <= 208));
+            }
+            if (constant_mask) {
+                set_s(t, d, op2(t, SpvOpBitwiseAnd, U, get_s(t, d), cu(t, 1)));
+                set_s(t, d + 1, cu(t, 0));
+                raw = false;
+                lane_result = true;
+            }
+        }
         t->raw_mask[d] = raw;
         t->lane_mask[d] = lane_result;
         if (wide && d + 1 < SH_SGPRS) {
@@ -1138,6 +1214,8 @@ static void salu(tr *t, const rdna2_inst *in, uint32_t op) {
 #undef B64
 #undef LOGIC32
 #undef LOGIC64
+#undef LB32
+#undef LB64
 #undef CMP32
 #undef ICMP32
 }
@@ -3072,6 +3150,7 @@ static void buffer_atomic(tr *t, const rdna2_inst *in, uint32_t var, uint32_t dw
 /* scratch_load / scratch_store: lane-private memory (spills, local arrays). The address is
  * SADDR (an SGPR, 0x7F: none) or else VADDR, plus the signed offset; a Private array of
  * SCRATCH_DWORDS per invocation stands in for the lane's slice, the index clamped to it. */
+static void scratch_rw(tr *t, const char *name, bool load, uint32_t off, uint32_t d, uint32_t vdata);
 static void scratch_op(tr *t, const rdna2_inst *in, uint32_t op) {
     uint32_t U = t->t_u32;
     if (!t->scratch) {
@@ -3080,14 +3159,68 @@ static void scratch_op(tr *t, const rdna2_inst *in, uint32_t op) {
     }
     uint32_t off = in->sbase != RDNA2_OP_NULL && in->sbase < SH_SGPRS ? get_s(t, in->sbase) : get_v(t, in->vaddr);
     off = op2(t, SpvOpIAdd, U, off, cu(t, (uint32_t)in->offset));
+    scratch_rw(t, in->name, op == SH_OP_SCRATCH_LOAD, off, in->dst - RDNA2_OP_VGPR, in->vdata);
+}
+
+/* RADV/ACO scratch on GFX10: MUBUF through a V# the shader builds itself with
+ * ADD_TID_ENABLE (word3 bit 23), so each lane addresses its own swizzled slice.
+ * A guest buffer shared by the lanes would let every lane of a wave overwrite the
+ * others (Longshot's optical flow came out constant per 8x8 wave). The V#'s word3
+ * is a literal moved into the SGPR before the access; the lane-private array
+ * stands in for the slice. */
+static bool mubuf_scratch(const sh_program *p, uint32_t i) {
+    const rdna2_inst *in = &p->insts[i];
+    if (in->enc != RDNA2_ENC_MUBUF || in->idxen || in->tfe || !in->name ||
+        strstr(in->name, "format") || strstr(in->name, "atomic") ||
+        (strncmp(in->name, "buffer_load_", 12) && strncmp(in->name, "buffer_store_", 13)))
+        return false;
+    uint32_t r3 = in->srsrc + 3u;
+    for (uint32_t j = i; j-- > 0;) {
+        const rdna2_inst *w = &p->insts[j];
+        uint32_t base, n = 1;
+        if (w->enc == RDNA2_ENC_SOP1 || w->enc == RDNA2_ENC_SOP2 || w->enc == RDNA2_ENC_SOPK) {
+            base = w->dst;
+            n = (p->iflags[j] & SH_IF_64) ? 2 : 1;
+        } else if (w->enc == RDNA2_ENC_SMEM) {
+            base = w->dst;
+            n = strstr(w->name ? w->name : "", "x16") ? 16 : strstr(w->name ? w->name : "", "x8") ? 8 :
+                strstr(w->name ? w->name : "", "x4") ? 4 : strstr(w->name ? w->name : "", "x2") ? 2 : 1;
+        } else if ((w->enc == RDNA2_ENC_VOP1 || w->enc == RDNA2_ENC_VOP2 || w->enc == RDNA2_ENC_VOP3) &&
+                   w->dst < SH_SGPRS) {
+            base = w->dst;
+        } else {
+            continue;
+        }
+        if (r3 < base || r3 >= base + n) continue;
+        return w->enc == RDNA2_ENC_SOP1 && w->name && !strcmp(w->name, "s_mov_b32") &&
+               w->src[0] == RDNA2_OP_LITERAL && ((w->literal >> 23) & 1);
+    }
+    return false;
+}
+
+static void scratch_buffer_op(tr *t, const rdna2_inst *in) {
+    uint32_t U = t->t_u32;
+    /* the wave's scratch offset (an SGPR) is the same for every access: only
+     * VADDR (OFFEN), a constant SOFFSET and the instruction offset address the slice */
+    uint32_t off = in->offen ? get_v(t, in->vaddr) : cu(t, 0);
+    if (in->soffset >= 128 && in->soffset != RDNA2_OP_LITERAL) off = op2(t, SpvOpIAdd, U, off, src_u(t, in, in->soffset));
+    off = op2(t, SpvOpIAdd, U, off, cu(t, (uint32_t)in->offset));
+    bool load = !strncmp(in->name, "buffer_load_", 12);
+    scratch_rw(t, in->name, load, off, in->vdata, in->vdata);
+}
+
+static void scratch_rw(tr *t, const char *name, bool load, uint32_t off, uint32_t d, uint32_t vdata) {
+    uint32_t U = t->t_u32;
+    if (!t->scratch) {
+        fail(t, "scratch memory not declared");
+        return;
+    }
     uint32_t dw = op2(t, SpvOpShiftRightLogical, U, off, cu(t, 2));
-    const char *name = in->name;
     uint32_t n = strstr(name, "dwordx4") ? 4 : strstr(name, "dwordx3") ? 3 : strstr(name, "dwordx2") ? 2 : 1;
     bool dword = strstr(name, "dword") != NULL, shrt = strstr(name, "short") != NULL;
 #define SCRATCH_PTR(i) op2(t, SpvOpAccessChain, t->p_pr_u32, t->scratch, ext2(t, U, GLSLstd450UMin, (i), cu(t, SCRATCH_DWORDS - 1)))
     uint32_t sh8 = op2(t, SpvOpShiftLeftLogical, U, op2(t, SpvOpBitwiseAnd, U, off, cu(t, 3)), cu(t, 3));
-    if (op == SH_OP_SCRATCH_LOAD) {
-        uint32_t d = in->dst - RDNA2_OP_VGPR;
+    if (load) {
         if (dword) {
             uint32_t c[4];
             for (uint32_t k = 0; k < n; k++) c[k] = ld(t, U, SCRATCH_PTR(op2(t, SpvOpIAdd, U, dw, cu(t, k))));
@@ -3108,9 +3241,9 @@ static void scratch_op(tr *t, const rdna2_inst *in, uint32_t op) {
     }
     uint32_t merge = begin_if(t, active(t));
     if (dword) {
-        for (uint32_t k = 0; k < n; k++) st(t, SCRATCH_PTR(op2(t, SpvOpIAdd, U, dw, cu(t, k))), get_v(t, in->vdata + k));
+        for (uint32_t k = 0; k < n; k++) st(t, SCRATCH_PTR(op2(t, SpvOpIAdd, U, dw, cu(t, k))), get_v(t, vdata + k));
     } else {
-        uint32_t ptr = SCRATCH_PTR(dw), fm = shrt ? 0xFFFF : 0xFF, v = get_v(t, in->vdata);
+        uint32_t ptr = SCRATCH_PTR(dw), fm = shrt ? 0xFFFF : 0xFF, v = get_v(t, vdata);
         if (strstr(name, "d16_hi")) v = op2(t, SpvOpShiftRightLogical, U, v, cu(t, 16));
         uint32_t m = op2(t, SpvOpShiftLeftLogical, U, cu(t, fm), sh8);
         v = op2(t, SpvOpShiftLeftLogical, U, op2(t, SpvOpBitwiseAnd, U, v, cu(t, fm)), sh8);
@@ -4506,6 +4639,11 @@ static void finish(tr *t) {
         }
         uint32_t chosen = t->vs_probe_vid == 0xFFFFFFFFu ? spv_const_bool(&t->b, true)
                                                          : op2(t, SpvOpIEqual, t->t_bool, vid, cu(t, t->vs_probe_vid));
+        if (t->info->stage == SH_STAGE_CS && getenv("PS5C_VS_PROBE_Z")) { /* PS5C_VS_PROBE_Z=<n>: and local z == n */
+            uint32_t lz = op2(t, SpvOpCompositeExtract, U, ld(t, t->t_v3u, t->in_lid), 2);
+            chosen = op2(t, SpvOpLogicalAnd, t->t_bool, chosen,
+                         op2(t, SpvOpIEqual, t->t_bool, lz, cu(t, (uint32_t)strtoul(getenv("PS5C_VS_PROBE_Z"), NULL, 10))));
+        }
         { /* PS5C_VS_PROBE_HALF_GT=<k>:<limit>: only where probe k's low half (a 16-bit float) exceeds the limit */
             const char *e = getenv("PS5C_VS_PROBE_HALF_GT");
             if (e && strchr(e, ':')) {
@@ -4534,7 +4672,9 @@ static void finish(tr *t) {
         for (uint32_t k = 0; k < 8; k++)
             if (t->out_mrt[k] && !((t->info->ps_mrt_kind >> (2 * k)) & 3u))
                 st(t, t->out_mrt[k], spv_op(&t->b, SpvOpCompositeConstruct, t->t_v4f,
-                                            (uint32_t[]){cf(t, 1.0f), cf(t, 0.0f), cf(t, 1.0f), cf(t, 1.0f)}, 4));
+                                            (uint32_t[]){cf(t, (0x9Bu >> (t->ps_solid_index % 8)) & 1 ? 1.0f : 0.0f),
+                                                         cf(t, (0xD4u >> (t->ps_solid_index % 8)) & 1 ? 1.0f : 0.0f),
+                                                         cf(t, (0x69u >> (t->ps_solid_index % 8)) & 1 ? 1.0f : 0.0f), cf(t, 1.0f)}, 4));
         spv_op_void(&t->b, SpvOpReturn, NULL, 0);
         return;
     }
@@ -5183,6 +5323,9 @@ static void translate_inst_body(tr *t, uint32_t i) {
     case RDNA2_ENC_VOP3P: valu(t, in, op); break;
     case RDNA2_ENC_VINTRP: interp(t, in); break;
     case RDNA2_ENC_MUBUF:
+        if (site >= 0 && mubuf_scratch(t->p, t->p->sites[site].inst)) { scratch_buffer_op(t, in); break; }
+        buffer_op(t, in, op, site);
+        break;
     case RDNA2_ENC_MTBUF: buffer_op(t, in, op, site); break;
     case RDNA2_ENC_MIMG:
         if (op == SH_OP_IMAGE_BVH || op == SH_OP_IMAGE_BVH64) bvh_op(t, in, site);
@@ -5751,6 +5894,26 @@ static void prologue(tr *t) {
             if (n < SH_SGPRS) tgid[n] = true;
             n++;
         }
+        /* TG_SIZE_EN: the next SGPR holds the wave count of the workgroup (bits 5:0) and this
+         * wave's index in it (bits 11:6). RADV's ACO derives each lane's local index from it
+         * (v_mbcnt with s_and_b32 tg_size, 0xfc0); left unset, every wave loaded the same part
+         * of a shared-memory tile (Longshot's optical flow read garbage and made NaN). */
+        if (((info->cs_tgid_enable >> 3) & 1) && n < SH_SGPRS && t->sgpr[n]) {
+            uint32_t sx = info->local_size[0] ? info->local_size[0] : 64, sy = info->local_size[1] ? info->local_size[1] : 1,
+                     sz = info->local_size[2] ? info->local_size[2] : 1, wave = t->p->wave32 ? 32u : 64u;
+            uint32_t lx = spv_prologue_op(b, SpvOpCompositeExtract, U, (uint32_t[]){lid, 0}, 2);
+            uint32_t ly = spv_prologue_op(b, SpvOpCompositeExtract, U, (uint32_t[]){lid, 1}, 2);
+            uint32_t lz = spv_prologue_op(b, SpvOpCompositeExtract, U, (uint32_t[]){lid, 2}, 2);
+            uint32_t flat = spv_prologue_op(b, SpvOpIAdd, U, (uint32_t[]){lx,
+                spv_prologue_op(b, SpvOpIMul, U, (uint32_t[]){spv_prologue_op(b, SpvOpIAdd, U, (uint32_t[]){ly,
+                    spv_prologue_op(b, SpvOpIMul, U, (uint32_t[]){lz, cu(t, sy)}, 2)}, 2), cu(t, sx)}, 2)}, 2);
+            uint32_t id = spv_prologue_op(b, SpvOpUDiv, U, (uint32_t[]){flat, cu(t, wave)}, 2);
+            uint32_t waves = (sx * sy * sz + wave - 1) / wave;
+            uint32_t v = spv_prologue_op(b, SpvOpBitwiseOr, U, (uint32_t[]){
+                spv_prologue_op(b, SpvOpShiftLeftLogical, U, (uint32_t[]){id, cu(t, 6)}, 2), cu(t, waves & 63)}, 2);
+            spv_prologue_void(b, SpvOpStore, (uint32_t[]){t->sgpr[n], v}, 2);
+            tgid[n] = true; /* not reloaded from the user data afterwards */
+        }
         for (uint32_t k = 0; k < info->cs_tid_components && k < 3; k++) {
             if (!t->vgpr[k]) continue;
             uint32_t v = spv_prologue_op(b, SpvOpCompositeExtract, U, (uint32_t[]){lid, k}, 2);
@@ -6149,7 +6312,8 @@ bool sh_translate(const sh_program *p, const sh_stage_info *info, const sh_site_
         spv_emit(b,SPV_SEC_GLOBAL,SpvOpVariable,(uint32_t[]){spv_type_pointer(b,SpvStorageClassWorkgroup,arr),t->wg_states,SpvStorageClassWorkgroup},3);
     }
     for (uint32_t i = 0; i < p->count; i++) {
-        if (p->insts[i].enc != RDNA2_ENC_FLAT || (p->insts[i].seg != 1 && !t->flat_apertures)) continue;
+        if ((p->insts[i].enc != RDNA2_ENC_FLAT || (p->insts[i].seg != 1 && !t->flat_apertures)) &&
+            !mubuf_scratch(p, i)) continue;
         uint32_t arr = spv_type_array(b, t->t_u32, spv_const_u32(b, SCRATCH_DWORDS));
         t->p_pr_u32 = spv_type_pointer(b, SpvStorageClassPrivate, t->t_u32);
         t->scratch = spv_id(b);
@@ -6370,7 +6534,8 @@ bool sh_translate(const sh_program *p, const sh_stage_info *info, const sh_site_
             }
         }
         const char *solid = info->stage == SH_STAGE_PS ? getenv("PS5C_PS_SOLID") : NULL; /* <program hash> */
-        t->ps_solid = solid && strtoull(solid, NULL, 16) == p->hash;
+        for (const char *q = solid; q && *q && !t->ps_solid; q = strchr(q, ',') ? strchr(q, ',') + 1 : NULL, t->ps_solid_index += !t->ps_solid)
+            t->ps_solid = strtoull(q, NULL, 16) == p->hash; /* <hash>[,<hash>...]: magenta, red, green, blue, yellow, cyan, ... */
         if(t->ps_capture && t->ps_solid)fail(t,"PS register capture cannot replace shader output");
         /* PS5C_VS_PROBE=<program hash>:<vertex index>:<byte pc>:<vgpr>[,<pc>:<vgpr>...] (up to 8): that
          * vertex's VGPRs (or sN scalar selectors) after those instructions, read back by the renderer (debugging aid) */

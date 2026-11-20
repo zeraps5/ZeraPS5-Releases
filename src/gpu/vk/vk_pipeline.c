@@ -3518,6 +3518,13 @@ static const sh_program *get_fused_program(renderer *r, guest_addr es, guest_add
     if (!f->prog) f->prog = program_storage_alloc(sparse_programs());
     vr_flow_invalidate(&P->vertex_flow);
     f->ok = code && f->prog && analyze_cached_program(code, dwords, es, f->prog);
+    if (code && getenv("PS5C_DUMP_FUSED")) { /* the joined code, for `ps5c disasm` (debugging aid) */
+        char path[96];
+        pal_mkdir("user"), pal_mkdir("user/frames");
+        snprintf(path, sizeof(path), "user/frames/fused_%llx_%llx.bin", (unsigned long long)es, (unsigned long long)gs);
+        FILE *out = fopen(path, "wb");
+        if (out) fwrite(code, 4, dwords, out), fclose(out);
+    }
     static uint32_t logged;
     if (logged++ < 16)
         LOG_I(GPU, "merged program 0x%llx + 0x%llx: %s", (unsigned long long)es, (unsigned long long)gs,
@@ -4993,6 +5000,31 @@ static bool create_graphics(renderer *r, pipe_entry *e, const gfx_key *k, stage_
     free(w[0]);
     free(w[1]);
     if (!ok && e->pending) return false; /* logged when it is built */
+    /* PS5C_DUMP_VS_FOR_PS=<pixel shader hash>: the vertex shader's code of its pipelines,
+     * for `ps5c disasm` (debugging aid) */
+    const char *dump_vs = getenv("PS5C_DUMP_VS_FOR_PS");
+    if (dump_vs && ps->prog && strtoull(dump_vs, NULL, 16) == ps->prog->hash) {
+        uint32_t avail = 0;
+        const uint32_t *code = vk_shader_code(r->mem, k->vs, &avail);
+        char path[96];
+        pal_mkdir("user"), pal_mkdir("user/frames");
+        snprintf(path, sizeof(path), "user/frames/vs_%016llx_%llx.bin", (unsigned long long)vs->prog->hash,
+                 (unsigned long long)k->vs);
+        FILE *out = code ? fopen(path, "wb") : NULL;
+        if (out) fwrite(code, 4, PS5C_MIN(avail, 8192u), out), fclose(out);
+    }
+    const char *dump_ps = getenv("PS5C_DUMP_PS"); /* <hash>[,<hash>...]: the PS code, for `ps5c disasm` */
+    char ps_hex[17];
+    if (ps->prog) snprintf(ps_hex, sizeof(ps_hex), "%016llx", (unsigned long long)ps->prog->hash);
+    if (dump_ps && ps->prog && strstr(dump_ps, ps_hex)) {
+        uint32_t avail = 0;
+        const uint32_t *code = vk_shader_code(r->mem, k->ps, &avail);
+        char path[96];
+        pal_mkdir("user"), pal_mkdir("user/frames");
+        snprintf(path, sizeof(path), "user/frames/ps_%s.bin", ps_hex);
+        FILE *out = code ? fopen(path, "wb") : NULL;
+        if (out) fwrite(code, 4, PS5C_MIN(avail, 8192u), out), fclose(out);
+    }
     LOG_I(GPU, "pipeline %s: %s 0x%llx PS 0x%llx prim %u, %u targets (%u pipelines, %.0f ms)", ok ? "created" : "FAILED",
           k->mesh==2?"GS compute/replay":k->mesh==1?"MESH":"VS", (unsigned long long)k->vs, (unsigned long long)k->ps, k->prim, k->rt_count, r->pipes->pipe_count,
           (pal_time_ns() - t0) / 1e6);
@@ -5015,6 +5047,18 @@ static bool create_compute(renderer *r, pipe_entry *e, stage_state *cs, const vk
     }
     free(w[0]);
     if (!ok && e->pending) return false;
+    const char *dump_cs = getenv("PS5C_DUMP_CS"); /* <hash>[,<hash>...] or all: its code, for `ps5c disasm` */
+    char dump_hex[17];
+    if (cs->prog) snprintf(dump_hex, sizeof(dump_hex), "%016llx", (unsigned long long)cs->prog->hash);
+    if (dump_cs && cs->prog && (!strcmp(dump_cs, "all") || strstr(dump_cs, dump_hex))) {
+        uint32_t avail = 0;
+        const uint32_t *code = vk_shader_code(r->mem, cs->prog->base, &avail);
+        char path[96];
+        pal_mkdir("user"), pal_mkdir("user/frames");
+        snprintf(path, sizeof(path), "user/frames/cs_%016llx.bin", (unsigned long long)cs->prog->hash);
+        FILE *out = code ? fopen(path, "wb") : NULL;
+        if (out) fwrite(code, 4, PS5C_MIN(avail, 16384u), out), fclose(out);
+    }
     LOG_I(GPU, "compute pipeline %s: CS 0x%llx, local size %ux%ux%u (%.0f ms)", ok ? "created" : "FAILED",
           (unsigned long long)cs->prog->base, cs->info.local_size[0], cs->info.local_size[1], cs->info.local_size[2],
           (pal_time_ns() - t0) / 1e6);
@@ -5802,6 +5846,14 @@ static vk_image *mip_chain(renderer *r, vk_image *img, const uint32_t *t) {
     return c;
 }
 
+/* Draw targets created at an address share memory with the others there (vk_renderer.c,
+ * shared target memory); PS5C_NO_RT_ALIAS=1: each has its own, as before. */
+static bool rt_alias(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("PS5C_NO_RT_ALIAS") == NULL;
+    return on;
+}
+
 /* A shader reading or writing a depth surface's bits as a color format (Sonic Frontiers copies
  * its depth with a compute shader: 32_UINT in, 32_UINT out), which a depth image cannot be
  * viewed as: a color image of that format at the same address, holding the depth's bits.
@@ -6568,13 +6620,20 @@ static bool trace_image(const vk_image *img) {
     static int tfmt = -2;
     static uint32_t tcount;
     static uint64_t format_from;
+    /* PS5C_TRACE_FORMAT_AFTER=<seconds>: only from that long after the first check, for
+     * games that flip from the CPU (their CP flip count stays 0, so _FROM cannot help) */
+    static uint64_t format_after_ns, format_start_ns;
     if (tfmt == -2) {
         tfmt = getenv("PS5C_TRACE_FORMAT") ? atoi(getenv("PS5C_TRACE_FORMAT")) : -1;
         const char *from = getenv("PS5C_TRACE_FORMAT_FROM");
         format_from = from ? strtoull(from, NULL, 10) : 0;
+        const char *after = getenv("PS5C_TRACE_FORMAT_AFTER");
+        format_after_ns = after ? (uint64_t)(strtod(after, NULL) * 1e9) : 0;
+        format_start_ns = pal_time_ns();
     }
     if (tfmt >= 0) {
         if (g_trace_flip < format_from) return false;
+        if (format_after_ns && pal_time_ns() - format_start_ns < format_after_ns) return false;
         if (!img || (int)img->format != tfmt || tcount >= 300) return false;
         for (uint32_t i = 0; i < n; i++)
             if (img->width == tw[i] && img->height == th[i]) return ++tcount, true;
@@ -7343,6 +7402,24 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                       (v->desc[1] >> 20) & 0x1FF, v->desc[3] >> 28, img ? "" : " MISSING",
                       img ? (uint32_t)(img - r->images) : 0, img ? img->width : 0, img ? img->height : 0, img ? img->layers : 0,
                       img ? (unsigned long long)img->written_seq : 0ull, v->desc[1], v->desc[2], v->desc[3], v->desc[4], v->desc[5]);
+                if (img && img->width > 1) { /* the guest bytes at the image's start */
+                    uint32_t w[4] = {0};
+                    bool readable = gmem_read(r->mem, img->addr, w, sizeof(w));
+                    LOG_I(GPU, "trace: source 0x%llx readable %u bytes %08x %08x %08x %08x",
+                          (unsigned long long)img->addr, readable, w[0], w[1], w[2], w[3]);
+                    const char *dump = getenv("PS5C_TRACE_DUMP"); /* <shader hash>: guest bytes (4 MiB) of its images to files */
+                    if (dump && strtoull(dump, NULL, 16) == p->hash && img->width >= 256) {
+                        static uint8_t *bytes;
+                        if (!bytes) bytes = (uint8_t *)malloc(4u << 20);
+                        char path[96];
+                        snprintf(path, sizeof(path), "user/frames/raw_%llx.bin", (unsigned long long)img->addr);
+                        uint32_t n = 4u << 20;
+                        while (bytes && n >= 65536 && !gmem_read(r->mem, img->addr, bytes, n)) n -= 4096;
+                        LOG_I(GPU, "trace: dump 0x%llx readable 0x%x bytes", (unsigned long long)img->addr, n);
+                        FILE *out = bytes && n >= 65536 ? fopen(path, "wb") : NULL;
+                        if (out) fwrite(bytes, 1, n, out), fclose(out);
+                    }
+                }
                 if (img && img->width == 1 && img->height == 1 && vk_format_bytes(img->format) == 4) {
                     uint32_t pixel = 0;
                     bool readable = gmem_read(r->mem,img->addr,&pixel,sizeof(pixel));
@@ -8367,8 +8444,9 @@ static vk_image *depth_image(renderer *r, const gpu *g, guest_addr za, uint32_t 
         img = vk_image_find_array(r, za, zw, zh, zf); /* a slice 0 draw into a known array */
         if (!img) {
             r->scale_new = true; /* PS5C_RT_SCALE */
+            r->alias_new = rt_alias(); /* memory shared with the other draw targets here */
             img = vk_image_get(r, za, zw, zh, zf);
-            r->scale_new = false;
+            r->scale_new = r->alias_new = false;
         }
     } else {
         img = vk_image_find_array(r, za, zw, zh, zf);
@@ -8767,7 +8845,12 @@ static uint32_t largest_index(vk_pipelines *P, const gpu_draw *d, const void *in
             return P->index_max[i].max;
     }
     uint32_t max = 0;
-    if (d->index_size == 2) {
+    if (d->index_size == 1) { /* 8-bit indices: read as 32-bit, the scan ran past the buffer */
+        const uint8_t *ix = (const uint8_t *)indices;
+        uint8_t m = 0;
+        for (uint32_t i = 0; i < d->count; i++) m = ix[i] > m ? ix[i] : m;
+        max = m;
+    } else if (d->index_size == 2) {
         const uint16_t *ix = (const uint16_t *)indices;
         uint16_t m = 0;
         for (uint32_t i = 0; i < d->count; i++) m = ix[i] > m ? ix[i] : m;
@@ -8803,6 +8886,11 @@ static bool tex_save_wanted(const gpu *g, const sh_program *ps) {
     static frame_trig trig;
     int64_t frame = frame_trigger(&trig, "PS5C_SAVE_TEXTURES_FRAME", g->stats.flips);
     if (frame != -2 && (int64_t)g->stats.flips != frame) return false;
+    /* PS5C_SAVE_TEXTURES_SKIP=<n>: the (n+1)-th such draw instead, for games that flip from
+     * the CPU (their CP flip count stays 0, so _FRAME cannot pick a later frame) */
+    static uint32_t seen;
+    const char *skip = getenv("PS5C_SAVE_TEXTURES_SKIP");
+    if (skip && seen++ < strtoul(skip, NULL, 10)) return false;
     done = true;
     return true;
 }
@@ -8987,6 +9075,15 @@ static void vs_probe_read(renderer *r, const gpu *g, const gpu_draw *d, const st
     static frame_trig trigger;
     int64_t frame = frame_trigger(&trigger,"PS5C_VS_PROBE_FRAME",g->stats.flips);
     if (frame != -2 && frame != (int64_t)g->stats.flips) return;
+    /* PS5C_VS_PROBE_AFTER=<seconds>: only that long after the first probed draw or
+     * dispatch, for games that flip from the CPU (their CP flip count stays 0) */
+    static uint64_t probe_after_ns = UINT64_MAX, probe_start_ns;
+    if (probe_after_ns == UINT64_MAX) {
+        const char *a = getenv("PS5C_VS_PROBE_AFTER");
+        probe_after_ns = a ? (uint64_t)(strtod(a, NULL) * 1e9) : 0;
+        probe_start_ns = pal_time_ns();
+    }
+    if (probe_after_ns && pal_time_ns() - probe_start_ns < probe_after_ns) return;
     end_pass(r);
     sync_batch(r);
     const uint32_t *w = (const uint32_t *)((const uint8_t *)arena_ptr(r, vs->u_off) + vs->u_bytes);
@@ -9140,8 +9237,9 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
             }
             if (!rts[i]) {
                 r->scale_new = true; /* PS5C_RT_SCALE */
+                r->alias_new = rt_alias(); /* memory shared with the other draw targets here */
                 rts[i] = vk_image_get(r, base, w, h, f);
-                r->scale_new = false;
+                r->scale_new = r->alias_new = false;
             }
         }
         if (!rts[i]) {
@@ -11521,13 +11619,13 @@ static bool do_dispatch_impl(renderer *r,stage_state *cs,uint32_t x,uint32_t y,u
      * outputs before a later pass changes them. Deliberately synchronizes,
      * so runs with this enabled are not performance measurements. */
     static int save_compute = -1;
-    static uint64_t save_hash[8], save_from;
+    static uint64_t save_hash[16], save_from;
     static uint32_t saved_compute, save_count, save_max;
     if (save_compute < 0) { /* PS5C_SAVE_COMPUTE=<hash>[,<hash>...], PS5C_SAVE_COMPUTE_FROM=<flip>|@<file>,
                              * PS5C_SAVE_COMPUTE_MAX=<dispatches> (4) */
         const char *env = getenv("PS5C_SAVE_COMPUTE"), *f = getenv("PS5C_SAVE_COMPUTE_FROM"), *m = getenv("PS5C_SAVE_COMPUTE_MAX");
         save_compute = env != NULL;
-        for (const char *q = env; q && *q && save_count < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : "")
+        for (const char *q = env; q && *q && save_count < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : "")
             save_hash[save_count++] = strtoull(q, NULL, 16);
         save_from = f && f[0] != '@' ? strtoull(f, NULL, 0) : 0;
         save_max = m ? (uint32_t)atoi(m) : 4;
@@ -11542,6 +11640,15 @@ static bool do_dispatch_impl(renderer *r,stage_state *cs,uint32_t x,uint32_t y,u
     static uint64_t save_every = 0, save_last = UINT64_MAX; /* PS5C_SAVE_COMPUTE_EVERY=<flips>: one dispatch per n frames */
     if (!save_every) save_every = getenv("PS5C_SAVE_COMPUTE_EVERY") ? strtoull(getenv("PS5C_SAVE_COMPUTE_EVERY"), NULL, 10) : 1;
     bool save_due = save_every <= 1 || save_last == UINT64_MAX || g_trace_flip >= save_last + save_every;
+    /* PS5C_SAVE_COMPUTE_AFTER=<seconds>: only that long after the first matching dispatch,
+     * for games that flip from the CPU (their CP flip count stays 0) */
+    static uint64_t save_after_ns = UINT64_MAX, save_start_ns;
+    if (save_match && save_after_ns == UINT64_MAX) {
+        const char *a = getenv("PS5C_SAVE_COMPUTE_AFTER");
+        save_after_ns = a ? (uint64_t)(strtod(a, NULL) * 1e9) : 0;
+        save_start_ns = pal_time_ns();
+    }
+    if (save_match && save_after_ns && pal_time_ns() - save_start_ns < save_after_ns) save_due = false;
     if (save_match && save_due && saved_compute < save_max && g_trace_flip >= save_from &&
         (!save_file || (save_frame >= 0 && g_trace_flip >= (uint64_t)save_frame))) {
         save_last = g_trace_flip;
@@ -11593,7 +11700,7 @@ static bool cpu_buffer_pattern(renderer *r, const gpu *g, const stage_state *cs,
         0xe0002000,0x80000101,0xbf8c3f70,0xe0102000,0x80010100,0xbf810000};
     const sh_program *p=cs->prog;
     if(p->count!=13 || p->dwords<PS5C_ARRAY_COUNT(kernel) || cs->info.cs_tgid_sgpr!=12 ||
-       cs->info.cs_tgid_enable!=1 || cs->groups[1]!=1 || cs->groups[2]!=1)
+       (cs->info.cs_tgid_enable&7)!=1 || cs->groups[1]!=1 || cs->groups[2]!=1)
         return false;
     /* Both parameter layouts occur: {count, mask} and {mask, count}.
      * Only the two scalar load offsets may differ. */
@@ -11926,7 +12033,7 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
             if (!cs->info.local_size[i]) cs->info.local_size[i] = i ? 1 : 64;
         }
         cs->info.cs_tgid_sgpr = user;
-        cs->info.cs_tgid_enable = (uint8_t)((rsrc2 >> 7) & 7);
+        cs->info.cs_tgid_enable = (uint8_t)(((rsrc2 >> 7) & 7) | (((rsrc2 >> 10) & 1) << 3));
         cs->eval.group_sgpr = (uint8_t)user;
         cs->eval.group_sgprs = (uint8_t)(((rsrc2 >> 7) & 1) + ((rsrc2 >> 8) & 1) + ((rsrc2 >> 9) & 1));
         cs->info.cs_tid_components = (uint8_t)(((rsrc2 >> 11) & 3) + 1);

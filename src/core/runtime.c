@@ -1413,6 +1413,16 @@ static void thread_exit_dtors(ps5_runtime *rt, guest_thread *t) {
         call_guest(rt, t, rt->thread_dtors, 0, 0, 0, &rax);
         thread_check_process_exit(rt, t);
     }
+    /* thread_local destructors the HLE libc took (_sceLibcInternalThreadAtexit) and the
+     * thread did not run itself through _sceLibcInternalThreadDtors */
+    uint32_t atexit_dtors = 0;
+    uint64_t dfn, dobj;
+    while (atexit_dtors < 4096 && libc_thread_take_dtor(t->id, &dfn, &dobj)) {
+        atexit_dtors++;
+        t->thread_exit = false;
+        call_guest(rt, t, dfn, dobj, 0, 0, &rax);
+        thread_check_process_exit(rt, t);
+    }
     uint32_t keys = 0;
     for (int pass = 0; pass < 4; pass++) {
         uint32_t cursor = 0;
@@ -1428,9 +1438,9 @@ static void thread_exit_dtors(ps5_runtime *rt, guest_thread *t) {
         if (!any) break;
     }
     static uint32_t logged;
-    if ((keys || rt->thread_dtors) && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 8)
-        LOG_I(CORE, "thread %u '%s' exit: libc hook %s, %u key destructor(s)", t->id, t->name,
-              rt->thread_dtors ? "run" : "none", keys);
+    if ((keys || atexit_dtors || rt->thread_dtors) && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 8)
+        LOG_I(CORE, "thread %u '%s' exit: libc hook %s, %u thread_local destructor(s), %u key destructor(s)",
+              t->id, t->name, rt->thread_dtors ? "run" : "none", atexit_dtors, keys);
 }
 
 static int32_t guest_thread_main(void *arg) {

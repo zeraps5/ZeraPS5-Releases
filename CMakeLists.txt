@@ -95,7 +95,7 @@ ps5c_target_defaults(ps5c_base)
 
 # ---- pal: host operating system services ----
 if(WIN32)
-    add_library(ps5c_pal STATIC src/pal_win32/report_session.c src/pal_win32/report_archive.c src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_win32/pal_win32.c
+    add_library(ps5c_pal STATIC src/pal_win32/report_session.c src/pal_win32/report_archive.c src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pfs_volume.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_win32/pal_win32.c
                 src/pal_win32/pal_media_win32.c src/pal_win32/dualsense.c src/pal_win32/pal_bundled_assets.c)
     target_link_libraries(ps5c_pal PUBLIC user32 gdi32 shell32 shlwapi ole32 mfuuid uuid synchronization winmm setupapi
                           hid advapi32)
@@ -103,7 +103,7 @@ if(WIN32)
     target_sources(ps5c_pal PRIVATE src/pal_win32/udp_lan.c)
     target_link_libraries(ps5c_pal PUBLIC ws2_32)
 else()
-    add_library(ps5c_pal STATIC src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_posix/pal_posix.c)
+    add_library(ps5c_pal STATIC src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pfs_volume.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_posix/pal_posix.c)
     find_package(Threads REQUIRED)
     target_link_libraries(ps5c_pal PUBLIC Threads::Threads)
     target_compile_definitions(ps5c_pal PRIVATE _GNU_SOURCE)

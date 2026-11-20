@@ -1026,9 +1026,87 @@ void vk_buffer_destroy(renderer *r, vk_buffer *b) {
  * and its submission lost the device: No Man's Sky's fill clears touched images no draw used). */
 static uint64_t g_recording_seq;
 
+/* ---- Shared target memory ----
+ * Unreal's transient render targets put targets of several formats and sizes at the same
+ * addresses every frame (Balan Wonderworld: ~500 of them over 443 addresses at character
+ * select). One host image with its own memory each went past the device's memory budget,
+ * and then each new one evicted an older one after a queue wait: 9 fps. On the console they
+ * are the same memory. A color or depth target created for a draw now binds a block shared
+ * with the other draw targets at its address that it fits in (Vulkan memory aliasing); the
+ * image that used a block last holds its contents, another one switching in starts from
+ * UNDEFINED, after the last one's work. Copies between images of one address (depth read as
+ * color, promotion to a mutable image) keep separate memory: only draw targets share. */
+#define MEM_SHARE_MAX 4096
+static struct mem_share {
+    VkDeviceMemory memory;
+    VkDeviceSize size;
+    guest_addr addr;
+    uint32_t type, refs;
+    vk_image *last; /* the image that used the block last (NULL: none since its last left) */
+} g_share[MEM_SHARE_MAX];
+static uint32_t g_share_count;
+static uint64_t g_share_bytes; /* allocated in shared blocks (their images count 0 bytes each) */
+
+static uint32_t device_memory_type(renderer *r, uint32_t bits) { /* vk_alloc_memory's choice */
+    for (uint32_t i = 0; i < r->mem_props.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (r->mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            return i;
+    return UINT32_MAX;
+}
+
+/* A shared block at addr for req: one it fits in (one more reference) or a new one */
+static bool share_memory(renderer *r, guest_addr addr, const VkMemoryRequirements *req, VkDeviceMemory *out,
+                         uint32_t *share) {
+    uint32_t type = device_memory_type(r, req->memoryTypeBits), slot = UINT32_MAX;
+    if (type == UINT32_MAX) return false;
+    for (uint32_t i = 0; i < g_share_count; i++) {
+        struct mem_share *s = &g_share[i];
+        if (!s->refs) {
+            if (slot == UINT32_MAX) slot = i;
+        } else if (s->addr == addr && s->type == type && s->size >= req->size) {
+            s->refs++;
+            *out = s->memory;
+            *share = i + 1;
+            return true;
+        }
+    }
+    if (slot == UINT32_MAX) {
+        if (g_share_count == MEM_SHARE_MAX) return false;
+        slot = g_share_count++;
+    }
+    if (!vk_alloc_memory(r, req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out)) return false;
+    g_share[slot] = (struct mem_share){*out, req->size, addr, type, 1, NULL};
+    g_share_bytes += req->size;
+    *out = g_share[slot].memory;
+    *share = slot + 1;
+    return true;
+}
+
+/* Frees an image's memory, or drops its reference to a shared block (img: the image leaving it) */
+static void memory_release(renderer *r, const vk_image *img, VkDeviceMemory memory, uint32_t share) {
+    if (!memory) return;
+    if (share && share <= g_share_count && g_share[share - 1].memory == memory && g_share[share - 1].refs) {
+        struct mem_share *s = &g_share[share - 1];
+        if (s->last == img) s->last = NULL;
+        if (--s->refs) return;
+        g_share_bytes -= g_share_bytes >= s->size ? s->size : g_share_bytes;
+        memset(s, 0, sizeof(*s));
+    }
+    vkFreeMemory(r->device, memory, NULL);
+}
+
 void vk_barrier(VkCommandBuffer cmd, vk_image *img, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
     if (g_recording_seq && img->last_use < g_recording_seq) img->last_use = g_recording_seq;
+    if (img->mem_share && img->mem_share <= g_share_count) {
+        struct mem_share *s = &g_share[img->mem_share - 1];
+        if (s->last != img && s->memory == img->memory) {
+            /* another target used the memory since: its contents are gone, after its work */
+            if (s->last) img->access |= s->last->access, img->stage |= s->last->stage;
+            img->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            s->last = img;
+        }
+    }
     if (dst_access & (VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT))
         img->rect_valid = false; /* written by other than a draw: the next feedback copy is whole */
     if (img->layout == to && to != VK_IMAGE_LAYOUT_GENERAL && to != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
@@ -1316,7 +1394,7 @@ static void image_release(renderer *r, vk_image *img) {
     for (uint32_t k = 0; k < img->sub_count; k++) vkDestroyImageView(r->device, img->sub[k].view, NULL);
     free(img->sub);
     vkDestroyImage(r->device, img->image, NULL);
-    vkFreeMemory(r->device, img->memory, NULL);
+    memory_release(r, img, img->memory, img->mem_share);
     vk_pipeline_forget_image(r, (uint32_t)(img - r->images));
 }
 
@@ -1515,6 +1593,7 @@ static vk_image *get_image(renderer *r, guest_addr addr, uint32_t width, uint32_
     uint64_t image_bytes = 0;
     if (r->image_bytes_limit)
         for (uint32_t i = 0; i < r->image_count; i++) image_bytes += r->images[i].allocated_bytes;
+    image_bytes += g_share_bytes;
     /* Over the memory budget (integrated GPUs share system RAM), new images replace
      * old ones too: Commandos: Origins' 4K Unreal surfaces reached the 7.8 GiB the
      * Iris Xe reports, and its driver then crashed in vkCmdPipelineBarrier. */
@@ -1608,7 +1687,7 @@ static vk_image *get_image(renderer *r, guest_addr addr, uint32_t width, uint32_
         vkDestroyImageView(r->device, img->array_view, NULL);
         if (img->ds_view) vkDestroyImageView(r->device, img->ds_view, NULL);
         vkDestroyImage(r->device, img->image, NULL);
-        vkFreeMemory(r->device, img->memory, NULL);
+        memory_release(r, img, img->memory, img->mem_share);
         memset(img, 0, sizeof(*img));
         r->image_cache_pressure = true;
         return NULL;
@@ -1689,18 +1768,21 @@ static bool create_objects(renderer *r, vk_image *img, VkFormat format, uint32_t
         if (!check(r, vkCreateImage(r->device, &ci, NULL, &img->image), "vkCreateImage")) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(r->device, img->image, &req);
-        if (!vk_alloc_memory(r, &req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &img->memory)) {
+        img->mem_share = 0;
+        bool shared = r->alias_new && !img->depth && ci.mipLevels == 1 && !r->image_backing_limit &&
+                      share_memory(r, img->addr, &req, &img->memory, &img->mem_share);
+        if (!shared && !vk_alloc_memory(r, &req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &img->memory)) {
             vkDestroyImage(r->device, img->image, NULL);
             img->image = VK_NULL_HANDLE;
             return false;
         }
         if (!check(r, vkBindImageMemory(r->device, img->image, img->memory, 0), "vkBindImageMemory")) {
             vkDestroyImage(r->device, img->image, NULL);
-            vkFreeMemory(r->device, img->memory, NULL);
-            img->image = VK_NULL_HANDLE, img->memory = VK_NULL_HANDLE;
+            memory_release(r, img, img->memory, img->mem_share);
+            img->image = VK_NULL_HANDLE, img->memory = VK_NULL_HANDLE, img->mem_share = 0;
             return false;
         }
-        img->allocated_bytes=req.size;
+        img->allocated_bytes = shared ? 0 : req.size;
     }
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = img->image;
@@ -1920,7 +2002,7 @@ static struct {
     VkDeviceMemory memory;
     VkImageView view, array_view;
     struct vk_image_sub *sub;
-    uint32_t sub_count;
+    uint32_t sub_count, mem_share;
 } g_retired[MAX_RETIRED];
 static uint32_t g_retired_count;
 
@@ -1934,7 +2016,7 @@ static void free_retired(renderer *r) {
         for (uint32_t k = 0; k < g_retired[i].sub_count; k++) vkDestroyImageView(r->device, g_retired[i].sub[k].view, NULL);
         free(g_retired[i].sub);
         vkDestroyImage(r->device, g_retired[i].image, NULL);
-        vkFreeMemory(r->device, g_retired[i].memory, NULL);
+        memory_release(r, NULL, g_retired[i].memory, g_retired[i].mem_share);
     }
     g_retired_count = 0;
 }
@@ -1974,6 +2056,8 @@ bool vk_image_promote(renderer *r, vk_image *img) {
     g_retired[k].array_view = img->array_view;
     g_retired[k].sub = img->sub;
     g_retired[k].sub_count = img->sub_count;
+    g_retired[k].mem_share = img->mem_share;
+    if (img->mem_share && g_share[img->mem_share - 1].last == img) g_share[img->mem_share - 1].last = NULL;
     *img = n;
     LOG_I(GPU, "host image 0x%llx %ux%u format %d: views may reinterpret it now", (unsigned long long)img->addr, img->width,
           img->height, (int)img->format);
@@ -2021,6 +2105,8 @@ bool vk_image_rescale(renderer *r, vk_image *img) {
     g_retired[k].array_view = img->array_view;
     g_retired[k].sub = img->sub;
     g_retired[k].sub_count = img->sub_count;
+    g_retired[k].mem_share = img->mem_share;
+    if (img->mem_share && g_share[img->mem_share - 1].last == img) g_share[img->mem_share - 1].last = NULL;
     *img = n;
     LOG_I(GPU, "render target 0x%llx %ux%u drawn at %ux%u from now on (PS5C_RT_SCALE)", (unsigned long long)img->addr,
           img->width, img->height, cw, ch);
@@ -2367,6 +2453,39 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
         return;
     }
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    /* PS5C_SAVE_LAYER_STATS=1: an array of half floats, the NaN of each layer and their
+     * rows (debugging aid: the layers a pass left unwritten or wrote with NaN) */
+    if (getenv("PS5C_SAVE_LAYER_STATS") && src->layers > 1 && src->format == VK_FORMAT_R16G16B16A16_SFLOAT && slices == 1) {
+        for (uint32_t layer = 0; layer < src->layers; layer++) {
+            vk_check_work(r, vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer (layer stats)");
+            vk_barrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy lc = {0};
+            lc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            lc.imageSubresource.baseArrayLayer = layer;
+            lc.imageSubresource.layerCount = 1;
+            lc.imageExtent.width = vk_img_w(src), lc.imageExtent.height = vk_img_h(src), lc.imageExtent.depth = 1;
+            vkCmdCopyImageToBuffer(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf.buffer, 1, &lc);
+            vk_check_work(r, vkEndCommandBuffer(cmd), "vkEndCommandBuffer (layer stats)");
+            VkSubmitInfo lsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+            vk_check_work(r, vkQueueSubmit(r->queue, 1, &lsi, VK_NULL_HANDLE), "vkQueueSubmit (layer stats)");
+            vk_check_work(r, vkQueueWaitIdle(r->queue), "vkQueueWaitIdle (layer stats)");
+            vk_check_work(r, vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer (layer stats)");
+            uint32_t nans = 0, rows = 0;
+            char line[512];
+            int at = 0;
+            for (uint32_t y = 0; y < vk_img_h(src); y++) {
+                uint32_t c = 0;
+                for (uint32_t x = 0; x < vk_img_w(src); x++) {
+                    uint16_t hv;
+                    memcpy(&hv, (const uint8_t *)buf.mapped + ((uint64_t)y * vk_img_w(src) + x) * 8, 2);
+                    c += ((hv >> 10) & 0x1F) == 31;
+                }
+                nans += c;
+                if (c && rows++ < 24 && at < (int)sizeof(line) - 16) at += snprintf(line + at, sizeof(line) - (size_t)at, " y%u:%u", y, c);
+            }
+            LOG_I(GPU, "layer stats %s: layer %u NaN/inf %u of %u%s", path, layer, nans, vk_img_w(src) * vk_img_h(src), at ? line : "");
+        }
+    }
     vk_check_work(r, vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer (transfer)");
     vk_barrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy c = {0};
@@ -2438,6 +2557,21 @@ void vk_save_image(renderer *r, vk_image *src, const char *path) {
         LOG_I(GPU, "image stats %s: %c min %g max %g mean %g (finite), nonzero %llu, NaN %llu, inf %llu of %llu", path, "RGBA"[ch],
               lo, hi, sum / (double)(n - nans - infs ? n - nans - infs : 1), (unsigned long long)nonzero, (unsigned long long)nans,
               (unsigned long long)infs, (unsigned long long)n);
+        if (ch == 0 && nans && nans < n && src->format == VK_FORMAT_R16G16B16A16_SFLOAT && vk_img_h(src) <= 160) {
+            /* where the NaN are: per row, the count and the first and last column (debugging aid) */
+            char line[2048];
+            int at = 0;
+            for (uint32_t y = 0; y < vk_img_h(src) && at < (int)sizeof(line) - 32; y++) {
+                uint32_t c = 0, first = 0, last = 0;
+                for (uint32_t x = 0; x < vk_img_w(src); x++) {
+                    uint16_t hv;
+                    memcpy(&hv, (const uint8_t *)buf.mapped + ((uint64_t)y * vk_img_w(src) + x) * 8, 2);
+                    if (((hv >> 10) & 0x1F) == 31 && (hv & 0x3FF)) { if (!c) first = x; last = x; c++; }
+                }
+                if (c) at += snprintf(line + at, sizeof(line) - (size_t)at, " y%u:%u[%u-%u]", y, c, first, last);
+            }
+            LOG_I(GPU, "image NaN rows %s:%s", path, line);
+        }
         }
     }
     uint32_t step = vk_img_w(src) >= 1024 && !getenv("PS5C_SAVE_FULL") ? 4 : 1;
@@ -3554,8 +3688,12 @@ renderer *renderer_create(pal_window *window, gmem *mem) {
     renderer *r = (renderer *)calloc(1, sizeof(renderer));
     if (!r) return NULL;
     char title[64]={0};
-    r->ngg_culling_profile=settings_param_string("titleId",title,sizeof(title)) && !strcmp(title,"PPSA99319");
-    if(r->ngg_culling_profile)LOG_I(GPU,"Quake III homebrew: RADV NGG culling profile enabled");
+    /* RADV homebrews whose NGG vertex shaders cull triangles through LDS: Quake III and
+     * Longshot (a vertex shader run alone dropped every triangle of its movie and scene draws) */
+    r->ngg_culling_profile=settings_param_string("titleId",title,sizeof(title)) &&
+                           (!strcmp(title,"PPSA99319") || !strcmp(title,"PPSA99025"));
+    if(r->ngg_culling_profile)LOG_I(GPU,"%s homebrew: RADV NGG culling profile enabled",
+                                    !strcmp(title,"PPSA99025")?"Longshot":"Quake III");
     memset(&g_panel, 0, sizeof(g_panel));
     const char *lod=getenv("PS5C_LOD_STATS_BINDINGS");
     r->lod_stats_enabled=lod && *lod && strcmp(lod,"0");
@@ -3671,7 +3809,7 @@ void renderer_destroy(renderer *r) {
             for (uint32_t k = 0; k < r->images[i].sub_count; k++) vkDestroyImageView(r->device, r->images[i].sub[k].view, NULL);
             free(r->images[i].sub);
             vkDestroyImage(r->device, r->images[i].image, NULL);
-            vkFreeMemory(r->device, r->images[i].memory, NULL);
+            memory_release(r, &r->images[i], r->images[i].memory, r->images[i].mem_share);
         }
         if (r->splash.image) vkDestroyImage(r->device, r->splash.image, NULL);
         if (r->splash.memory) vkFreeMemory(r->device, r->splash.memory, NULL);

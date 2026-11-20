@@ -212,6 +212,13 @@ case("v_mbcnt_lo_vcc_compaction", ["v_and_b32_e32 v7, 31, v0", "v_cmp_gt_u32_e32
                                    "v_mbcnt_lo_u32_b32 v4, vcc_lo, 0", "v_min_u32_e32 v6, 16, v7",
                                    "v_sub_nc_u32_e32 v4, v4, v6"], lo=0)
 
+# RADV scratch: a V# built in the shader with ADD_TID_ENABLE (word3 bit 23) gives
+# each lane its own slice, so every lane reads back the index it stored
+case("buffer_scratch_add_tid", ["s_mov_b32 s28, 0", "s_mov_b32 s29, 0", "s_mov_b32 s30, -1", "s_mov_b32 s31, 0x31e16000",
+                                "v_and_b32_e32 v6, 63, v0", "buffer_store_dword v6, off, s[28:31], 0 offset:8",
+                                "s_waitcnt vmcnt(0)", "buffer_load_dword v4, off, s[28:31], 0 offset:8",
+                                "s_waitcnt vmcnt(0)", "v_sub_nc_u32_e32 v4, v4, v6"], lo=0)
+
 
 # ---- v_min / v_max: -0 orders below +0 (the host's NMin/NMax may return either zero) ----
 NZ, PZ = 0x80000000, 0x00000000

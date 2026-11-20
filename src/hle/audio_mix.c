@@ -67,6 +67,10 @@ static void mix(void *user, float *out, uint32_t frames) {
         float a = out[k] < 0 ? -out[k] : out[k];
         if (a > peak) peak = a;
     }
+    /* PS5C_NO_AUDIO=1: the host plays silence (the streams keep their pace, testing aid) */
+    static int muted = -1;
+    if (muted < 0) muted = getenv("PS5C_NO_AUDIO") && strcmp(getenv("PS5C_NO_AUDIO"), "0");
+    if (muted) memset(out, 0, sizeof(float) * frames * 2);
     /* PS5C_LOG_AUDIO: the loudest sample of every 5 seconds (debugging aid) */
     static int logging = -1;
     static float window_peak;
