@@ -1,10 +1,10 @@
 # Game compatibility and tested builds
 
-**Current public release [b984](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b984) · Reviewed 15 November 2026.**
+**Current public release [b1080](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) · Game records reviewed 15 November 2026.**
 
 **New records: Sonic Origins Plus reaches Green Hill Zone on Intel Iris Xe; Sonic Superstars reaches Bridge Island; Quake II reaches Outer Base with movement and firing on RTX.** Each row names its actual tested revision and hardware.
 
-The **0.1.1 b984 release is published**. Its code integrates these development changes; game sessions keep their original b974/b981 or developer revisions. [Release changes and validation](docs/release-candidate-b984.md). Updating the public release does not relabel earlier game tests.
+The [b1080 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) describe the latest code and automated validation. The game sessions below keep their original test revisions and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
 
 [Gameplay](#gameplay-records) · [Scenes](#scene-progress) · [Menus](#menus-and-title-screens) · [Startup](#opening-and-startup-records) · [PS4](#experimental-ps4-records) · [28-session RTX follow-up](#latest-rtx-startup-survey) · [Report a result](CONTRIBUTING.md#compatibility-reports)
 

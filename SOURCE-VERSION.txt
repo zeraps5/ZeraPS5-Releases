@@ -1,12 +1,12 @@
-Public release: v0.1.1-b984
-Version: 0.1.1+0d269bb (build 984, 2026-11-16)
-Corresponding emulator source commit: 0d269bb8de1cdc4dce31f4d689d8fef0d675d700
-Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b984/ZeraPS5-v0.1.1-b984-win64-source.zip
-Source archive SHA-256: 814bbadf56ab3064d279076df90d69823e5730ff8b43aa24dc66c6675ed7ec81
-Windows archive SHA-256: 46b513f07ddb78c3def09a3e80038f50468968ee122db2b1922b7ed2c8171eb0
+Public release: v0.1.1-b1080
+Version: 0.1.1+de3949f (build 1080, 2026-11-20)
+Corresponding emulator source commit: de3949fe50cece287585ecfbe73d2dafa36b684e
+Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1080/ZeraPS5-v0.1.1-b1080-win64-source.zip
+Source archive SHA-256: 32a1b1e5d909ed1db2494176619421dcb0c3fb5d6d0bfcc709539c12e85c7e6d
+Windows archive SHA-256: 6451a63cd7bad88793d7c7637abbdd9b07dd5fe883b98e6b37a7769bba414846
 
-The default branch contains the reviewed b984 emulator source import.
-The existing b984 release tag still identifies the original distribution snapshot.
-Use the versioned source archive above for the exact packaged emulator sources
-and the metadata needed to reproduce the original build identity.
+The release tag points to the tested b1080 source integration.
+The current release archive contains the build number and exact packaged source.
+The default branch retains the b984 code snapshot for contribution history.
+Historical b984 release: https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b984
 Contribution instructions: CONTRIBUTING.md

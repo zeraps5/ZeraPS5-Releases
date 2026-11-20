@@ -1,5 +1,15 @@
 # Release changelog
 
+## v0.1.1-b1080 — 20 November 2026 UTC
+
+- **Vulkan and shader compatibility.** Includes fixes for RADV-generated shaders, texture modes 25 and 26, 8-bit index streams, sub-dword typed buffer loads, and render targets that share guest memory. GPU-only pixels can be restored from R32 to an RGBA8 view without changing their bytes.
+- **Longshot.** Adds startup and memory support for the targeted build and shader fixes for the black patches, flicker and ghosting seen in development.
+- **R-Type Delta HD.** Adds AJM control handling, an ATRAC9 fallback and a title-specific input timing fix.
+- **Game images.** Adds direct, read-only access to supported .ffpfsc images, including nested PFS and PFSC-compressed data.
+- **Runtime and services.** Improves memory pools, file I/O, thread cleanup, IME text handling, JPEG decoding and audio compatibility. Includes engine-side rendering and internal-resolution changes from development.
+
+[Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080).
+
 ## v0.1.1-b984 — 16 November 2026 UTC
 
 Published Windows x64 release, source `0d269bb`. [Full release changes, dated game observations and validation](docs/release-candidate-b984.md).
