@@ -122,6 +122,8 @@ static void test_rgba_number_interpretation(void) {
     CHECK(view(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(view(VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
     CHECK(view(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UINT, false, 1) == VK_FORMAT_R8G8B8A8_UINT);
+    CHECK(view(VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UNORM, false, 0) == VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK(view(VK_FORMAT_R32_UINT, VK_FORMAT_B8G8R8A8_UNORM, false, 0) == VK_FORMAT_R32_UINT);
 }
 
 static void test_uv_number_interpretation(void) {
@@ -242,13 +244,14 @@ static void test_gpu_residency(void) {
         if (k == 5 || k == 7) {
             /* Reject a different texel size and an unlisted same-size alias.
              * Neither request may consume the original backing record. */
-            vk_image *wrong = vk_image_get(r, a + k * 0x100, 2, 2, VK_FORMAT_R8G8B8A8_UNORM);
+            VkFormat wrong_format = k == 5 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+            vk_image *wrong = vk_image_get(r, a + k * 0x100, 2, 2, wrong_format);
             CHECK(wrong && !wrong->gpu_written);
         }
         /* Spill in the writer's integer format, restore through the sampler's
          * compatible normalized format. There is no CPU copy to reconstruct. */
         VkFormat restored = k == 5   ? VK_FORMAT_R8_UNORM
-                            : k == 6 ? VK_FORMAT_R8G8B8A8_UNORM
+                            : k == 6 || k == 7 ? VK_FORMAT_R8G8B8A8_UNORM
                                      : fixtures[k].format;
         vk_image *img =
             fixtures[k].depth
