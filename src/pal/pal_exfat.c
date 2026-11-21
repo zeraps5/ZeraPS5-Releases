@@ -45,6 +45,7 @@ typedef struct volume {
     uint32_t nnodes, cap;
     pkg_inner *pkg;      /* a .pkg volume: reads go through its span decoder */
     pfs_volume *pfs;     /* a PFS image (.ffpfsc): reads go through it */
+    bool pfs_exfat;      /* ...holding an exFAT image: the exFAT reader reads that through it */
     struct volume *next;
 } volume;
 struct exfat_file { volume *v; uint32_t id; uint64_t pos; pal_mutex *lock; };
@@ -110,6 +111,7 @@ void exfat_shutdown(void) {
 }
 static ps5c_err raw(volume *v, uint64_t off, void *buf, uint64_t n) {
     if (off > v->size || n > v->size - off) return PS5C_ERR_INVALID;
+    if (v->pfs_exfat) return pfs_volume_image_read(v->pfs, buf, n, off);
     uint64_t got = 0;
     ps5c_err e = pal_file_pread(v->file, buf, n, off, &got);
     return e == PS5C_OK && got != n ? PS5C_ERR_IO : e;
@@ -164,7 +166,7 @@ static ps5c_err read_node(volume *v, const node *n, void *buf, uint64_t bytes, u
     if (off >= n->size) return PS5C_OK;
     bytes = PS5C_MIN(bytes, n->size - off);
     if (bytes > SIZE_MAX) return PS5C_ERR_OUT_OF_RANGE;
-    if (v->pfs) {
+    if (v->pfs && !v->pfs_exfat) {
         ps5c_err err = n->pfs_file ? pfs_volume_read(v->pfs, n->pfs_file - 1, buf, bytes, off) : PS5C_ERR_INVALID;
         if (!err && got) *got = bytes;
         return err;
@@ -464,14 +466,18 @@ static ps5c_err load_pfs(volume *v) {
 static ps5c_err load_volume(volume *v) {
     const char *dot = strrchr(v->path, '.');
     if (dot && ext_at(dot) == 4) return load_pkg(v);
-    if (dot && ext_at(dot) == 7) { /* .ffpfsc: a PFS image, or else exFAT */
-        ps5c_err err = pfs_volume_open(v->path, &v->pfs);
-        if (!err) return load_pfs(v);
-        if (err != PS5C_ERR_INVALID) return err;
+    ps5c_err err = PS5C_OK;
+    if (dot && ext_at(dot) == 7) { /* .ffpfsc: a PFS image (holding the game, or an exFAT image with it), or else exFAT */
+        err = pfs_volume_open(v->path, &v->pfs);
+        if (!err && !pfs_volume_exfat(v->pfs)) return load_pfs(v);
+        if (err && err != PS5C_ERR_INVALID) return err;
+        if (!err) v->pfs_exfat = true, v->size = pfs_volume_image_size(v->pfs);
+        err = PS5C_OK;
     }
-    ps5c_err err = pal_file_open(v->path, PAL_FILE_READ, &v->file);
-    if (err) return err;
-    if ((err = pal_file_size(v->file, &v->size))) return err;
+    if (!v->pfs_exfat) {
+        if ((err = pal_file_open(v->path, PAL_FILE_READ, &v->file))) return err;
+        if ((err = pal_file_size(v->file, &v->size))) return err;
+    }
     uint8_t b[512]; if ((err = raw(v, 0, b, sizeof(b)))) return err;
     if (memcmp(b+3, "EXFAT   ", 8) || rd_le16(b+510) != 0xaa55 || rd_le16(b+104) != 0x100 || b[108] < 9 || b[108] > 12 || (unsigned)b[108]+b[109] > 25 || !b[110] || b[110]>2) return PS5C_ERR_INVALID;
     uint64_t sector = 1ull << b[108], sectors = rd_le64(b+72);

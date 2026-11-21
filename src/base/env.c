@@ -80,3 +80,32 @@ void ps5c_env_reset(void) {
     }
     atomic_flag_clear_explicit(&g_lock, memory_order_release);
 }
+
+/* Sets a variable for the rest of the run (process environment and cache). The
+ * value a lookup returned earlier stays valid (it is not freed). For start-up
+ * profiles, before the switches it sets are read on hot paths. */
+void ps5c_env_set(const char *name, const char *value) {
+    size_t nn = strlen(name), vn = strlen(value);
+    char *entry = (char *)malloc(nn + vn + 2);
+    if (entry) {
+        memcpy(entry, name, nn);
+        entry[nn] = '=';
+        memcpy(entry + nn + 1, value, vn + 1);
+        putenv(entry); /* kept: the environment holds the pointer */
+    }
+    uint32_t h = name_hash(name);
+    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) {
+    }
+    for (uint32_t i = 0; i < ENV_SLOTS; i++) {
+        env_slot *s = &g_slots[(h + i) & (ENV_SLOTS - 1)];
+        const char *n = atomic_load_explicit(&s->name, memory_order_relaxed);
+        if (n && strcmp(n, name)) continue;
+        s->value = copy(value); /* an earlier answer is left allocated */
+        if (!n) {
+            char *key = copy(name);
+            if (key) atomic_store_explicit(&s->name, key, memory_order_release);
+        }
+        break;
+    }
+    atomic_flag_clear_explicit(&g_lock, memory_order_release);
+}

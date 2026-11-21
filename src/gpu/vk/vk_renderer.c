@@ -3679,6 +3679,9 @@ static bool place_window(renderer *r) {
     return true;
 }
 
+static bool g_radv_homebrew;
+void renderer_set_radv_homebrew(bool on) { g_radv_homebrew = on; }
+
 renderer *renderer_create(pal_window *window, gmem *mem) {
     if (getenv("PS5C_NO_VULKAN") || !window || !vk_api_load()) return NULL;
     if (vk_pipeline_async_on()) {
@@ -3694,6 +3697,10 @@ renderer *renderer_create(pal_window *window, gmem *mem) {
                            (!strcmp(title,"PPSA99319") || !strcmp(title,"PPSA99025"));
     if(r->ngg_culling_profile)LOG_I(GPU,"%s homebrew: RADV NGG culling profile enabled",
                                     !strcmp(title,"PPSA99025")?"Longshot":"Quake III");
+    else if(g_radv_homebrew) { /* the same RADV found in another homebrew (Prince of Persia, Burnout) */
+        r->ngg_culling_profile=true;
+        LOG_I(GPU,"homebrew with PS5 RADV inside: RADV NGG culling profile enabled");
+    }
     memset(&g_panel, 0, sizeof(g_panel));
     const char *lod=getenv("PS5C_LOD_STATS_BINDINGS");
     r->lod_stats_enabled=lod && *lod && strcmp(lod,"0");

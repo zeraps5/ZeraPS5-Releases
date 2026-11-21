@@ -4,7 +4,9 @@
  * zlib blocks behind a block table) holding a second PFS with the game. The
  * stream layout is the one pal_pkg_inner decodes for PS4 files compressed on
  * their own: "PFSC", block size at 0x10, table offset at 0x18, length at 0x28;
- * a block is zeros (no bytes), stored (a whole block's bytes) or zlib. */
+ * a block is zeros (no bytes), stored (a whole block's bytes) or zlib.
+ * Burnout Revenge and PPSA33016 hold an exFAT image (<id>.exfat) instead: its
+ * bytes are handed to the exFAT reader (pfs_volume_image_read). */
 #include "pal/pal_pfs_volume.h"
 #include "pal/pal.h"
 #include "base/endian.h"
@@ -36,8 +38,8 @@ struct pfs_volume {
     pal_file *file;
     uint64_t size;
     pfs_image outer, inner;
-    bool nested;
-    const pfs_node *image;  /* nested: the outer file holding the inner image */
+    bool nested, exfat;     /* the game in an inner PFS image / in an exFAT image */
+    const pfs_node *image;  /* nested or exfat: the outer file holding the inner image */
     pfsc image_stream;      /* ...when it is compressed (image_stream.off != NULL) */
     pfsc *files;            /* per tree node: its stream when compressed */
     cache image_cache, file_cache;
@@ -152,9 +154,9 @@ static void cache_free(cache *c) {
     if (c->lock) pal_mutex_destroy(c->lock);
 }
 
-/* the one file below the root that is a PFS image of its own (its first bytes
- * are a superblock), or NULL: the game is in the image's own tree */
-static const pfs_node *nested_image(pfs_volume *v) {
+/* the one file below the root that is an image of its own (<id>.ffpfs: PFS,
+ * <id>.exfat: exFAT), or NULL: the game is in the image's own tree */
+static const pfs_node *nested_image(pfs_volume *v, bool *exfat) {
     const pfs_image *o = &v->outer;
     const pfs_node *found = NULL;
     for (uint32_t c = o->nodes[o->uroot].child; c; c = o->nodes[c].sibling) {
@@ -165,9 +167,11 @@ static const pfs_node *nested_image(pfs_volume *v) {
         }
         if (!strcmp(n->name, "eboot.bin")) return NULL;
         size_t len = strlen(n->name);
-        if (len > 6 && !strcmp(n->name + len - 6, ".ffpfs")) {
+        bool ex = len > 6 && !strcmp(n->name + len - 6, ".exfat");
+        if (ex || (len > 6 && !strcmp(n->name + len - 6, ".ffpfs"))) {
             if (found) return NULL;
             found = n;
+            *exfat = ex;
         }
     }
     return found;
@@ -182,10 +186,12 @@ ps5c_err pfs_volume_open(const char *path, pfs_volume **out) {
     if (!e) e = cache_init(&v->image_cache);
     if (!e) e = cache_init(&v->file_cache);
     if (!e) e = pfs_open(&v->outer, file_read, v, 0);
-    if (!e && (v->image = nested_image(v))) {
+    bool exfat = false;
+    if (!e && (v->image = nested_image(v, &exfat))) {
         if (v->image->flags & 1) e = stream_open(&v->outer, v->image, &v->image_stream);
-        if (!e) e = pfs_open(&v->inner, image_read, v, 0);
-        v->nested = !e;
+        if (!e && exfat) v->exfat = true;
+        else if (!e) e = pfs_open(&v->inner, image_read, v, 0);
+        v->nested = !e && !exfat;
     }
     const pfs_image *t = !e ? pfs_volume_tree(v) : NULL;
     if (t && !(v->files = calloc(t->count ? t->count : 1, sizeof *v->files))) e = PS5C_ERR_NOMEM;
@@ -196,7 +202,8 @@ ps5c_err pfs_volume_open(const char *path, pfs_volume **out) {
         return e;
     }
     LOG_I(CORE, "PFS image: %s, %u entries%s, read in place", path, t->count,
-          v->nested ? (v->image_stream.off ? " in its compressed inner image" : " in its inner image") : "");
+          v->exfat ? (v->image_stream.off ? ", the game in its compressed exFAT image" : ", the game in its exFAT image")
+          : v->nested ? (v->image_stream.off ? " in its compressed inner image" : " in its inner image") : "");
     *out = v;
     return PS5C_OK;
 }
@@ -230,4 +237,17 @@ ps5c_err pfs_volume_read(pfs_volume *v, uint32_t node, void *buf, uint64_t size,
     if (off > total || size > total - off) return PS5C_ERR_OUT_OF_RANGE;
     if (v->files[node].off) return stream_read(&v->file_cache, &v->files[node], node + 1, buf, size, off);
     return pfs_read(t, &t->nodes[node], buf, size, off);
+}
+
+bool pfs_volume_exfat(const pfs_volume *v) { return v->exfat; }
+
+uint64_t pfs_volume_image_size(const pfs_volume *v) {
+    if (!v->image) return 0;
+    return v->image_stream.off ? v->image_stream.len : v->image->size;
+}
+
+ps5c_err pfs_volume_image_read(pfs_volume *v, void *buf, uint64_t size, uint64_t off) {
+    uint64_t total = pfs_volume_image_size(v);
+    if (!v->image || off > total || size > total - off) return PS5C_ERR_OUT_OF_RANGE;
+    return image_read(v, buf, size, off);
 }

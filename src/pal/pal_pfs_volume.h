@@ -19,5 +19,9 @@ const pfs_image *pfs_volume_tree(const pfs_volume *v);
 uint64_t pfs_volume_size(const pfs_volume *v, uint32_t node);
 /* Bytes of a file node of the tree, decompressed. Thread-safe. */
 ps5c_err pfs_volume_read(pfs_volume *v, uint32_t node, void *buf, uint64_t size, uint64_t off);
+/* The game is in an exFAT image the PFS holds (<id>.exfat): its bytes, decompressed. */
+bool pfs_volume_exfat(const pfs_volume *v);
+uint64_t pfs_volume_image_size(const pfs_volume *v);
+ps5c_err pfs_volume_image_read(pfs_volume *v, void *buf, uint64_t size, uint64_t off);
 
 #endif

@@ -6639,6 +6639,19 @@ static bool trace_image(const vk_image *img) {
             if (img->width == tw[i] && img->height == th[i]) return ++tcount, true;
         return all ? (++tcount, true) : false;
     }
+    /* PS5C_TRACE_AFTER=<seconds> (with PS5C_TRACE_IMAGES=all): the first 400 events from then on,
+     * for games that flip from the CPU (no CP flip count to pick a frame by) */
+    static int64_t trace_after_ns = -2, trace_after_start;
+    static uint32_t trace_after_count;
+    if (trace_after_ns == -2) {
+        const char *a = getenv("PS5C_TRACE_AFTER");
+        trace_after_ns = a ? (int64_t)(strtod(a, NULL) * 1e9) : -1;
+        trace_after_start = (int64_t)pal_time_ns();
+    }
+    if (trace_after_ns >= 0 && all) {
+        if ((int64_t)pal_time_ns() - trace_after_start < trace_after_ns) return false;
+        return trace_after_count++ < 400;
+    }
     static frame_trig trig;
     int64_t f = frame_trigger(&trig, "PS5C_TRACE_FRAME", g_trace_flip);
     frame = f == -2 ? 0 : f < 0 ? UINT64_MAX : (uint64_t)f;
@@ -6903,6 +6916,21 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             guest_addr base = site_base[i];
             uint32_t stride = (v->desc[1] >> 16) & 0x3FFF;
             uint64_t size = site_size[i];
+            if (site->kind == SH_SITE_BUFFER && base && trace_image(NULL)) { /* the guest bytes a buffer starts with */
+                uint32_t w[4] = {0};
+                bool readable = gmem_read(r->mem, base, w, sizeof(w));
+                uint64_t span = size < (4u << 20) ? size : (4u << 20), nonzero = 0;
+                const uint8_t *all = span ? (const uint8_t *)gmem_host(r->mem, base, span) : NULL;
+                for (uint64_t k = 0; all && k < span; k++) nonzero += all[k] != 0;
+                LOG_I(GPU, "trace: buffer 0x%llx: %llu of %llu bytes nonzero", (unsigned long long)base,
+                      (unsigned long long)nonzero, (unsigned long long)span);
+                LOG_I(GPU, "trace: %s 0x%llx (%016llx) site %u %s buffer 0x%llx size 0x%llx stride %u, "
+                           "readable %u bytes %08x %08x %08x %08x (V# %08x %08x %08x %08x)",
+                      "shader", (unsigned long long)p->base,
+                      (unsigned long long)p->hash, i, site->store ? "writes" : "reads", (unsigned long long)base,
+                      (unsigned long long)size, stride, readable, w[0], w[1], w[2], w[3], v->desc[0], v->desc[1],
+                      v->desc[2], v->desc[3]);
+            }
             uint64_t coherent_extent=coherent_size[i]==UINT64_MAX?0:coherent_size[i];
             bool coherent=coherent_extent!=0;
             uint64_t full=stride?(uint64_t)v->desc[2]*stride:v->desc[2];

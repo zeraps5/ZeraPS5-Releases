@@ -585,6 +585,7 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("__pthread_cleanup_pop_imp", cleanup_pop),
     HLE_FUNC_ENTRY(K, "sceKernelIsStack", is_stack),
     HLE_FUNC_ENTRY(K, "scePthreadRename", rename_),
+    HLE_FUNC_ENTRY(K, "pthread_set_name_np", rename_), /* same arguments (Burnout Revenge) */
     HLE_FUNC_ENTRY(K, "scePthreadGetname", get_name),
     HLE_FUNC_ENTRY(K, "scePthreadYield", yield_),
     POSIX_ENTRY("pthread_yield", yield_),

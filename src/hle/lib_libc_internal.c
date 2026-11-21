@@ -158,6 +158,7 @@ static const hle_export k_exports[] = {
 void hle_register_libc_internal(void) {
     hle_register_table(k_exports, PS5C_ARRAY_COUNT(k_exports));
     hle_register_libc_memory();
+    hle_register_libc_extra();
     hle_register_libc_process();
     hle_register_libc_jumps();
 }

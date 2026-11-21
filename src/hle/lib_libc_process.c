@@ -217,6 +217,21 @@ static void getenv_(hle_call *c) {
             }
         pal_mutex_unlock(s->lock);
     }
+    /* PS5C_GUEST_ENV="NAME=value;NAME2=value": variables the guest sees besides its own
+     * (diagnostics: RADV_DEBUG=startup for the homebrew ports with Mesa inside) */
+    const char *extra = key && s && !value ? getenv("PS5C_GUEST_ENV") : NULL;
+    for (const char *p = extra; p && *p;) {
+        const char *end = strchr(p, ';'), *eq = strchr(p, '=');
+        size_t item = end ? (size_t)(end - p) : strlen(p);
+        if (eq && eq < p + item && (size_t)(eq - p) == n && !memcmp(p, key, (size_t)n)) {
+            size_t len = item - (size_t)(eq + 1 - p);
+            guest_addr copy = allocate(c, len + 1, 16);
+            char zero = 0;
+            if (copy && gmem_write(c->mem, copy, eq + 1, len) && gmem_write(c->mem, copy + len, &zero, 1)) value = copy;
+            break;
+        }
+        p = end ? end + 1 : NULL;
+    }
     hle_ret_u64(c, value);
 }
 static void setenv_(hle_call *c) {
@@ -530,6 +545,10 @@ static guest_addr new_stream(ps5_runtime *rt, int fd) {
         return 0;
     }
     f->fd = fd;
+    /* FreeBSD's fileno() macro reads short _file at +0x12 when __isthreaded is 0
+     * (Prince of Persia's reSOT ftruncates its disk images through it) */
+    int16_t file = (int16_t)fd;
+    gmem_write(&rt->mem, f->addr + 0x12, &file, 2);
     pal_mutex_lock(s->lock);
     f->next = s->streams;
     s->streams = f;
@@ -778,6 +797,89 @@ static void time_(hle_call *c) {
     }
     hle_ret_u64(c, (uint64_t)seconds);
 }
+/* clock_t clock(void): process time in CLOCKS_PER_SEC (1000000) units */
+static void clock_(hle_call *c) {
+    static uint64_t start;
+    uint64_t now = pal_time_ns();
+    if (!start) start = now;
+    hle_ret_u64(c, (now - start) / 1000);
+}
+/* int strerror_r(int errnum, char *buf, size_t len) */
+static void strerror_r_(hle_call *c) {
+    const char *text = error_message(hle_arg_s32(c, 0));
+    uint64_t len = hle_arg(c, 2), n = strlen(text) + 1;
+    if (!hle_arg_ptr(c, 1) || !len) {
+        hle_ret_s32(c, 34); /* ERANGE */
+        return;
+    }
+    if (n > len) n = len;
+    char *out = (char *)hle_mem(c, hle_arg_ptr(c, 1), n);
+    if (out) memcpy(out, text, (size_t)n), out[n - 1] = 0;
+    hle_ret_s32(c, out ? 0 : 14);
+}
+/* struct tm (FreeBSD): sec, min, hour, mday, mon, year, wday, yday, isdst (int), gmtoff (long),
+ * zone (char *): 56 bytes. The console's local time is taken as UTC. */
+static void tm_from(int64_t t, int32_t tm[9]) {
+    int64_t days = t / 86400, rem = t % 86400;
+    if (rem < 0) rem += 86400, days--;
+    tm[0] = (int32_t)(rem % 60), tm[1] = (int32_t)(rem / 60 % 60), tm[2] = (int32_t)(rem / 3600);
+    tm[6] = (int32_t)((days % 7 + 11) % 7); /* 1970-01-01 was a Thursday */
+    int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = yoe + era * 400, doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    tm[3] = (int32_t)d, tm[4] = (int32_t)m - 1, tm[5] = (int32_t)(y - 1900);
+    static const int32_t before[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    tm[7] = before[m - 1] + (int32_t)d - 1 + (leap && m > 2);
+    tm[8] = 0;
+}
+static int64_t tm_to(const int32_t tm[6]) {
+    int64_t y = (int64_t)tm[5] + 1900, m = tm[4] + 1;
+    y += (m - 1) / 12, m = (m - 1) % 12 + 1;
+    if (m <= 0) m += 12, y--;
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
+    int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + tm[3] - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+    return days * 86400 + (int64_t)tm[2] * 3600 + (int64_t)tm[1] * 60 + tm[0];
+}
+static bool tm_write(hle_call *c, guest_addr at, int64_t t) {
+    uint8_t buf[56] = {0};
+    int32_t tm[9];
+    tm_from(t, tm);
+    memcpy(buf, tm, sizeof tm);
+    return at && gmem_write(c->mem, at, buf, sizeof buf);
+}
+/* struct tm *localtime(const time_t *) / gmtime: one buffer per process */
+static void localtime_(hle_call *c) {
+    static guest_addr buf;
+    int64_t t = 0;
+    if (!hle_arg_ptr(c, 0) || !gmem_read(c->mem, hle_arg_ptr(c, 0), &t, 8)) {
+        hle_ret_u64(c, 0);
+        return;
+    }
+    if (!buf) buf = allocate(c, 64, 16);
+    hle_ret_u64(c, tm_write(c, buf, t) ? buf : 0);
+}
+/* struct tm *localtime_r(const time_t *, struct tm *) / gmtime_r */
+static void localtime_r_(hle_call *c) {
+    int64_t t = 0;
+    bool ok = hle_arg_ptr(c, 0) && gmem_read(c->mem, hle_arg_ptr(c, 0), &t, 8) && tm_write(c, hle_arg_ptr(c, 1), t);
+    hle_ret_u64(c, ok ? hle_arg_ptr(c, 1) : 0);
+}
+/* time_t mktime(struct tm *): normalizes the fields too */
+static void mktime_(hle_call *c) {
+    int32_t tm[9];
+    if (!hle_arg_ptr(c, 0) || !gmem_read(c->mem, hle_arg_ptr(c, 0), tm, sizeof tm)) {
+        hle_ret_u64(c, UINT64_MAX);
+        return;
+    }
+    int64_t t = tm_to(tm);
+    tm_write(c, hle_arg_ptr(c, 0), t);
+    hle_ret_u64(c, (uint64_t)t);
+}
 static void srand_(hle_call *c) {
     struct libc_state *s = state(c->rt);
     if (s) {
@@ -891,6 +993,12 @@ static void stdout_init(ps5_runtime *rt, void *slot, size_t n) {
 static void stderr_init(ps5_runtime *rt, void *slot, size_t n) {
     stdstream(rt, slot, n, 2);
 }
+/* int __isthreaded: 1, so FreeBSD's stdio macros (fileno, getc...) call the functions */
+static void isthreaded_init(ps5_runtime *rt, void *slot, size_t n) {
+    (void)rt;
+    int32_t one = 1;
+    if (n >= 4) memcpy(slot, &one, 4);
+}
 #define E(name, fn) HLE_FUNC_ENTRY("libSceLibcInternal", name, fn)
 static const hle_export exports[] = {
     E("_init_env", init_env),
@@ -932,6 +1040,13 @@ static const hle_export exports[] = {
     E("feof", feof_),
     E("clearerr", clearerr_),
     E("time", time_),
+    E("strerror_r", strerror_r_),
+    E("clock", clock_),
+    E("localtime", localtime_),
+    E("gmtime", localtime_),
+    E("localtime_r", localtime_r_),
+    E("gmtime_r", localtime_r_),
+    E("mktime", mktime_),
     E("srand", srand_),
     E("rand", rand_),
     E("qsort", qsort_),
@@ -943,6 +1058,7 @@ static const hle_export exports[] = {
     HLE_DATA_ENTRY("libSceLibcInternal", "__stdinp", stdin_init),
     HLE_DATA_ENTRY("libSceLibcInternal", "__stdoutp", stdout_init),
     HLE_DATA_ENTRY("libSceLibcInternal", "__stderrp", stderr_init),
+    HLE_DATA_ENTRY("libSceLibcInternal", "__isthreaded", isthreaded_init),
 };
 void hle_register_libc_process(void) {
     hle_register_table(exports, PS5C_ARRAY_COUNT(exports));

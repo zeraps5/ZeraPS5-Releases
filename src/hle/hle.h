@@ -127,6 +127,7 @@ void hle_register_libkernel_thread(void);
 void hle_register_libkernel_memory(void);
 void hle_register_libc_internal(void);
 void hle_register_libc_memory(void);
+void hle_register_libc_extra(void);
 void hle_register_libc_process(void);
 void hle_register_libc_jumps(void);
 void hle_libc_reset(struct ps5_runtime *rt);

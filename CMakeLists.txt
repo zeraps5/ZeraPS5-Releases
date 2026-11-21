@@ -224,6 +224,7 @@ add_library(ps5c_core STATIC
     src/hle/lib_kernel_thread.c
     src/hle/lib_libc_internal.c
     src/hle/lib_libc_memory.c
+    src/hle/lib_libc_extra.c
     src/hle/lib_libc_process.c
     src/hle/lib_libc_jumps.c
     src/hle/lib_services.c

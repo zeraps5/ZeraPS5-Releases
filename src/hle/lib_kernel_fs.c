@@ -401,6 +401,9 @@ int kernel_fs_resolve(hle_call *c, const char *guest, char *host, size_t host_si
     return -resolve_path(c, guest, host, host_size);
 }
 
+/* For other HLE modules (mmap of a file): bytes read at off into host memory, or a negative errno. */
+int64_t kernel_fs_pread_host(int32_t fd, void *buf, uint64_t size, uint64_t off);
+
 static int read_guest_path(hle_call *c, uint32_t arg, char *out, size_t size) {
     guest_addr p = hle_arg_ptr(c, arg);
     if (!p || !hle_read_str(c, p, out, size)) return -E_FAULT;
@@ -421,6 +424,14 @@ static int fd_alloc(void) {
 }
 
 static fd_entry *fd_get(int32_t fd) { return fd >= FIRST_FD && fd < MAX_FDS && g_fds[fd].used ? &g_fds[fd] : NULL; }
+
+int64_t kernel_fs_pread_host(int32_t fd, void *buf, uint64_t size, uint64_t off) {
+    fd_entry *e = fd_get(fd);
+    if (!e || !e->file) return -E_BADF;
+    if (e->is_dir) return -E_ISDIR;
+    uint64_t got = 0;
+    return pal_file_pread(e->file, buf, size, off, &got) == PS5C_OK ? (int64_t)got : -E_IO;
+}
 
 bool kernel_socket_claim_fd(int32_t fd) {
     if (!g_lock || fd < FIRST_FD || fd >= MAX_FDS)
@@ -1718,6 +1729,8 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("fchmod", posix_fchmod),
     HLE_FUNC_ENTRY(K, "sceKernelUtimes", sce_path_exists),
     HLE_FUNC_ENTRY(P, "chmod", posix_path_exists),
+    HLE_FUNC_ENTRY(K, "chmod", posix_path_exists), /* Prince of Persia imports it from libkernel */
+    HLE_FUNC_ENTRY("libSceLibcInternal", "remove", posix_unlink), /* files; Prince of Persia */
     POSIX_ENTRY("stat", posix_stat),
     HLE_FUNC_ENTRY(K, "sceKernelStat", sce_stat),
     POSIX_ENTRY("fstat", posix_fstat),

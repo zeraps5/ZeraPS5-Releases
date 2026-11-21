@@ -408,9 +408,13 @@ static void avp_init_ex(hle_call *c) {
  * thread, so it is read here, up front) */
 static pal_media *open_through_callbacks(hle_call *c, av_player *p, guest_addr path) {
     uint64_t r = 0;
-    if (!runtime_call_nested(c->rt, p->file_open, p->file_obj, path, 0, &r) || (int32_t)r < 0) return NULL;
+    if (!runtime_call_nested(c->rt, p->file_open, p->file_obj, path, 0, &r) || (int32_t)r < 0) {
+        LOG_W(HLE, "sceAvPlayerAddSource: the game's file open callback failed (0x%llx)", (unsigned long long)r);
+        return NULL;
+    }
     uint64_t size = 0;
     runtime_call_nested(c->rt, p->file_size, p->file_obj, 0, 0, &size);
+    LOG_I(HLE, "sceAvPlayerAddSource: %llu bytes through the game's file callbacks", (unsigned long long)size);
     pal_media *m = NULL;
     uint8_t *data = size && size < (1ull << 31) ? (uint8_t *)malloc(size) : NULL;
     guest_addr chunk = 0;
@@ -432,6 +436,8 @@ static pal_media *open_through_callbacks(hle_call *c, av_player *p, guest_addr p
             pal_file_close(df);
         }
         if (pos == size) m = pal_media_open_memory(data, size);
+        else LOG_W(HLE, "sceAvPlayerAddSource: the game's read callback stopped at %llu of %llu bytes",
+                   (unsigned long long)pos, (unsigned long long)size);
         gmem_unmap(c->mem, chunk, chunk_size);
     }
     free(data);

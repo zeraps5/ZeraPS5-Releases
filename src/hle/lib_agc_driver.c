@@ -264,6 +264,23 @@ static int32_t gpu_worker(void *arg) {
                 uint32_t q = (g_drv.next_queue + n) % CP_QUEUES;
                 if (!first_ticket[q]) continue;
                 gpu_job *j = &g_drv.ring[first_ticket[q] % SUBMIT_RING];
+                if (j->blocked_ns && !j->suspend) {
+                    /* An empty suspension behind work of its own queue parked on a CP wait
+                     * goes first: that wait may be for graphics work the CPU submits only
+                     * after the suspension returns (Halloween: the graphics queue waits for
+                     * a label its later frames release). It carries no commands to reorder. */
+                    for (uint64_t t = first_ticket[q] + 1; t <= g_drv.submitted; t++) {
+                        gpu_job *later = &g_drv.ring[t % SUBMIT_RING];
+                        if (later->done || later->queue != q) continue;
+                        if (later->suspend && !later->dwords && suspend_ready(later->ticket)) j = later;
+                        break;
+                    }
+                    if (j->suspend) {
+                        selected = j->ticket;
+                        g_drv.next_queue = (q + 1) % CP_QUEUES;
+                        break;
+                    }
+                }
                 if (j->retry_ns > now_ns || (j->suspend && !suspend_ready(j->ticket))) continue;
                 selected = first_ticket[q];
                 g_drv.next_queue = (q + 1) % CP_QUEUES;
@@ -352,13 +369,20 @@ static int32_t gpu_worker(void *arg) {
                 job.reported_stuck = true;
                 const uint32_t *w = (const uint32_t *)gmem_host(g_drv.gpu.mem, job.stream.wait_packet, 36);
                 uint64_t value = 0;
+                guest_addr a = 0;
                 if (w && job.stream.wait_opcode == 0x39) {
-                    guest_addr a = (guest_addr)(w[1] & ~7u) | ((guest_addr)(w[2] & 0x3ffffu) << 32);
+                    a = (guest_addr)(w[1] & ~7u) | ((guest_addr)(w[2] & 0x3ffffu) << 32);
                     gmem_read_u64(g_drv.gpu.mem, a, &value);
                 } else if (w && job.stream.wait_opcode != 0x59 && (w[1] & 0x10)) {
-                    guest_addr a = (guest_addr)(w[2] & ~3u) | ((guest_addr)(w[3] & 0x3ffffu) << 32);
+                    a = (guest_addr)(w[2] & ~3u) | ((guest_addr)(w[3] & 0x3ffffu) << 32);
                     gmem_read(g_drv.gpu.mem, a, &value, job.stream.wait_opcode == 0x93 ? 8 : 4);
                 }
+                char last[160];
+                if (a && gpu_last_write(a, last, sizeof(last)))
+                    LOG_W(GPU, "  label 0x%llx last written by the command processor: %s", (unsigned long long)a, last);
+                else if (a)
+                    LOG_W(GPU, "  label 0x%llx: no command-processor write seen (the CPU or a shader writes it)",
+                          (unsigned long long)a);
                 if (w)
                     LOG_W(GPU, "CP ticket %llu queue %d blocked 10 s at 0x%llx: %08x %08x %08x %08x %08x %08x %08x (memory %016llx), %u queued",
                           (unsigned long long)job.ticket, job.queue_event, (unsigned long long)job.stream.wait_packet,
@@ -543,9 +567,20 @@ static void submit_suspend_point(hle_call *c) {
             const gpu_job *j = &g_drv.ring[t % SUBMIT_RING];
             if (j->done) continue;
             n++;
-            LOG_W(GPU, "  ticket %llu queue %u (event %d) suspend %u blocked %u retry %lld ms", (unsigned long long)j->ticket,
-                  j->queue, j->queue_event, j->suspend, j->blocked_ns != 0,
+            LOG_W(GPU, "  ticket %llu queue %u (event %d) suspend %u (%u dwords) blocked %u retry %lld ms",
+                  (unsigned long long)j->ticket, j->queue, j->queue_event, j->suspend, j->dwords, j->blocked_ns != 0,
                   j->retry_ns ? (long long)(j->retry_ns - (int64_t)pal_time_ns()) / 1000000 : 0);
+            /* PS5C_LOG_STUCK_PACKETS: the packets of each job still pending */
+            const uint32_t *cmd = getenv("PS5C_LOG_STUCK_PACKETS") && j->dwords
+                ? (const uint32_t *)gmem_host(g_drv.gpu.mem, j->addr, (uint64_t)j->dwords * 4) : NULL;
+            for (uint32_t pos = 0; cmd && pos < j->dwords;) {
+                uint32_t hdr = cmd[pos], len = hdr >> 30 == 2 || hdr == 0xFFFF1000u ? 1 : ((hdr >> 16) & 0x3FFF) + 2;
+                LOG_W(GPU, "    +%u op %02x len %u: %08x %08x %08x %08x %08x %08x", pos, (hdr >> 8) & 0xff, len,
+                      pos + 1 < j->dwords ? cmd[pos + 1] : 0, pos + 2 < j->dwords ? cmd[pos + 2] : 0,
+                      pos + 3 < j->dwords ? cmd[pos + 3] : 0, pos + 4 < j->dwords ? cmd[pos + 4] : 0,
+                      pos + 5 < j->dwords ? cmd[pos + 5] : 0, pos + 6 < j->dwords ? cmd[pos + 6] : 0);
+                pos += len;
+            }
         }
         pal_mutex_unlock(g_drv.q_lock);
         log_worker_state(); /* without q_lock: the worker may be waiting for it */

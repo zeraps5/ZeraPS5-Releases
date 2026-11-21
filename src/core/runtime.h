@@ -120,6 +120,10 @@ typedef struct ps5_runtime {
     guest_addr process_params;
     guest_addr sandbox_word;
     guest_addr longshot_allocator; /* validated address of this build's VirtualAlloc */
+    /* sigaction handlers the guest installed (FreeBSD numbering, 0: none); a fault in guest
+     * code with a SIGSEGV/SIGBUS handler is delivered to it (homebrew ports trap MMIO that way) */
+    guest_addr sig_handler[33];
+    uint32_t sig_flags[33];
     uint32_t next_thread_id;
     uint32_t tls_patches;
     uint64_t hle_calls;

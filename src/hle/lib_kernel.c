@@ -911,7 +911,243 @@ static void fcntl_(hle_call *c) {
     hle_ret_s32(c, cmd >= 0 && cmd <= 4 ? 0 : -1); /* F_DUPFD..F_SETFL */
 }
 
+/* ---- POSIX odds and ends of PS2 games wrapped for PS5 (Burnout Revenge, Prince of Persia) ---- */
+
+/* sigset_t is 128 bits; signal n is bit n - 1 */
+static void sigset_fill(hle_call *c, uint8_t v) {
+    uint8_t *s = hle_arg_ptr(c, 0) ? (uint8_t *)hle_mem(c, hle_arg_ptr(c, 0), 16) : NULL;
+    if (s) memset(s, v, 16);
+    hle_ret_s32(c, s ? 0 : -1);
+}
+static void sigemptyset_(hle_call *c) { sigset_fill(c, 0); }
+static void sigfillset_(hle_call *c) { sigset_fill(c, 0xFF); }
+static void sigset_bit(hle_call *c, int op) {
+    uint32_t *s = hle_arg_ptr(c, 0) ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 0), 16) : NULL;
+    int32_t n = hle_arg_s32(c, 1);
+    if (!s || n < 1 || n > 128) {
+        hle_ret_s32(c, -1);
+        return;
+    }
+    uint32_t bit = 1u << ((n - 1) & 31), *w = &s[(n - 1) / 32];
+    if (op == 0) *w |= bit;
+    else if (op == 1) *w &= ~bit;
+    hle_ret_s32(c, op == 2 ? (*w & bit) != 0 : 0);
+}
+static void sigaddset_(hle_call *c) { sigset_bit(c, 0); }
+static void sigdelset_(hle_call *c) { sigset_bit(c, 1); }
+static void sigismember_(hle_call *c) { sigset_bit(c, 2); }
+/* sigaction(sig, act, oldact): handlers are accepted and never called (no signals are raised) */
+/* sigaction(sig, act, oldact): struct sigaction {handler; int flags; sigset_t mask} (32 bytes).
+ * SIGSEGV and SIGBUS handlers are called on faults in guest code (runtime.c, deliver_signal);
+ * the others are kept and never raised. */
+static void sigaction_(hle_call *c) {
+    int32_t sig = hle_arg_s32(c, 0);
+    if (sig < 1 || sig > 32) {
+        hle_ret_s32(c, -1);
+        return;
+    }
+    uint8_t *old = hle_arg_ptr(c, 2) ? (uint8_t *)hle_mem(c, hle_arg_ptr(c, 2), 32) : NULL;
+    if (old) {
+        memset(old, 0, 32);
+        memcpy(old, &c->rt->sig_handler[sig], 8);
+        memcpy(old + 8, &c->rt->sig_flags[sig], 4);
+    }
+    const uint8_t *act = hle_arg_ptr(c, 1) ? (const uint8_t *)hle_mem(c, hle_arg_ptr(c, 1), 32) : NULL;
+    if (act) {
+        guest_addr h;
+        uint32_t f;
+        memcpy(&h, act, 8);
+        memcpy(&f, act + 8, 4);
+        c->rt->sig_flags[sig] = f;
+        __atomic_store_n(&c->rt->sig_handler[sig], h > 1 ? h : 0, __ATOMIC_RELEASE); /* SIG_DFL 0, SIG_IGN 1 */
+        if (h > 1 && (sig == 10 || sig == 11)) LOG_I(KERNEL, "guest %s handler at 0x%llx", sig == 11 ? "SIGSEGV" : "SIGBUS", (unsigned long long)h);
+    }
+    hle_ret_s32(c, 0);
+}
+static void sigmask_(hle_call *c) { /* sigprocmask / pthread_sigmask(how, set, oldset) */
+    uint8_t *old = hle_arg_ptr(c, 2) ? (uint8_t *)hle_mem(c, hle_arg_ptr(c, 2), 16) : NULL;
+    if (old) memset(old, 0, 16);
+    hle_ret_s32(c, 0);
+}
+static void attr_getscope_(hle_call *c) { /* PTHREAD_SCOPE_PROCESS */
+    int32_t v = 0;
+    if (hle_arg_ptr(c, 1)) gmem_write(c->mem, hle_arg_ptr(c, 1), &v, 4);
+    hle_ret_s32(c, 0);
+}
+static void ok0_(hle_call *c) { hle_ret_s32(c, 0); }
+static void posix_sleep_(hle_call *c) { /* unsigned sleep(unsigned seconds): 0 left */
+    pal_sleep_ns((uint64_t)hle_arg_u32(c, 0) * 1000000000ull);
+    hle_ret_u32(c, 0);
+}
+/* sysctl(mib, n, old, oldlen, new, newlen): hw.ncpu and hw.pagesize; anything else reads as
+ * zeros (kern.proc.pid: a process no debugger traces), each new name logged once */
+static void sysctl_(hle_call *c) {
+    uint32_t n = hle_arg_u32(c, 1), mib[8] = {0};
+    if (n > 8) n = 8;
+    if (hle_arg_ptr(c, 0)) gmem_read(c->mem, hle_arg_ptr(c, 0), mib, n * 4);
+    guest_addr old = hle_arg_ptr(c, 2), lenp = hle_arg_ptr(c, 3);
+    uint64_t len = 0;
+    if (lenp) gmem_read(c->mem, lenp, &len, 8);
+    int32_t value = -1;
+    if (n == 2 && mib[0] == 6 && mib[1] == 3) value = 8;          /* hw.ncpu */
+    else if (n == 2 && mib[0] == 6 && mib[1] == 7) value = 16384; /* hw.pagesize */
+    if (value >= 0) {
+        if (old && len >= 4) gmem_write(c->mem, old, &value, 4);
+        len = 4;
+    } else {
+        static uint32_t seen[16][3];
+        static uint32_t nseen;
+        bool known = false;
+        for (uint32_t i = 0; i < nseen; i++) known |= seen[i][0] == n && seen[i][1] == mib[0] && seen[i][2] == mib[1];
+        if (!known && nseen < 16) {
+            seen[nseen][0] = n, seen[nseen][1] = mib[0], seen[nseen][2] = mib[1], nseen++;
+            LOG_I(KERNEL, "sysctl {%u, %u, %u, %u} (%u names): zeros", mib[0], mib[1], mib[2], mib[3], n);
+        }
+        uint8_t *o = old && len ? (uint8_t *)hle_mem(c, old, len) : NULL;
+        if (o) memset(o, 0, (size_t)len);
+    }
+    if (lenp) gmem_write(c->mem, lenp, &len, 8);
+    hle_ret_s32(c, 0);
+}
+/* sysctlbyname(name, old, oldlen, new, newlen): hw.ncpu, hw.pagesize; other names read as zeros */
+static void sysctlbyname_(hle_call *c) {
+    char name[64] = "";
+    hle_read_str(c, hle_arg_ptr(c, 0), name, sizeof name);
+    guest_addr old = hle_arg_ptr(c, 1), lenp = hle_arg_ptr(c, 2);
+    uint64_t len = 0;
+    if (lenp) gmem_read(c->mem, lenp, &len, 8);
+    int32_t value = !strcmp(name, "hw.ncpu") ? 8 : !strcmp(name, "hw.pagesize") ? 16384 : -1;
+    if (value >= 0) {
+        if (old && len >= 4) gmem_write(c->mem, old, &value, 4);
+        len = 4;
+    } else {
+        static uint32_t logged;
+        if (logged++ < 8) LOG_I(KERNEL, "sysctlbyname \"%s\": zeros", name);
+        uint8_t *o = old && len ? (uint8_t *)hle_mem(c, old, len) : NULL;
+        if (o) memset(o, 0, (size_t)len);
+    }
+    if (lenp) gmem_write(c->mem, lenp, &len, 8);
+    hle_ret_s32(c, 0);
+}
+/* sceKernelGetExecutableModuleHandle(): the main module's handle (index + 1, as GetModuleInfoFromAddr) */
+static int32_t main_handle(hle_call *c) {
+    for (size_t i = 0; i < c->rt->ms->modules.len; i++)
+        if (c->rt->ms->modules.data[i]->is_main) return (int32_t)i + 1;
+    return 1;
+}
+static void executable_handle_(hle_call *c) { hle_ret_s32(c, main_handle(c)); }
+/* sceKernelGetModuleInfo(handle, SceKernelModuleInfo *): size, name[256], segments[4] {addr, size u32, prot u32},
+ * segment count, fingerprint[20] */
+static void get_module_info_(hle_call *c) {
+    int32_t handle = hle_arg_s32(c, 0);
+    uint8_t *info = (uint8_t *)hle_mem(c, hle_arg_ptr(c, 1), 0x160);
+    if (!info) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EFAULT);
+        return;
+    }
+    if (handle < 1 || (size_t)handle > c->rt->ms->modules.len) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_ESRCH);
+        return;
+    }
+    const loaded_module *m = c->rt->ms->modules.data[handle - 1];
+    memset(info, 0, 0x160);
+    uint64_t size = 0x160;
+    memcpy(info, &size, 8);
+    snprintf((char *)info + 8, 256, "%s", m->name ? m->name : "");
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < m->img.segment_count && count < 4; i++) {
+        const elf64_phdr *ph = &m->img.segments[i].h;
+        if (ph->p_type != PT_LOAD) continue;
+        uint32_t prot = ((ph->p_flags & 4) ? 1u : 0) | ((ph->p_flags & 2) ? 2u : 0) | ((ph->p_flags & 1) ? 4u : 0);
+        uint64_t addr = m->bias + ph->p_vaddr;
+        uint32_t seg[2] = {(uint32_t)ph->p_memsz, prot};
+        memcpy(info + 0x108 + count * 16, &addr, 8);
+        memcpy(info + 0x110 + count * 16, seg, 8);
+        count++;
+    }
+    memcpy(info + 0x148, &count, 4);
+    hle_ret_s32(c, 0);
+}
+
+/* pthread_barrier_t: a pointer the guest keeps; here, a host barrier. init(barrier *, attr, count),
+ * wait(barrier *): PTHREAD_BARRIER_SERIAL_THREAD (-1) for one thread of each round, destroy(barrier *).
+ * Prince of Persia's reSOT lines up its disk threads with them. */
+typedef struct host_barrier {
+    pal_mutex *lock;
+    pal_cond *cond;
+    uint32_t count, waiting;
+    uint64_t round;
+} host_barrier;
+static host_barrier *barrier_at(hle_call *c) {
+    uint64_t v = 0;
+    if (!hle_arg_ptr(c, 0) || !gmem_read(c->mem, hle_arg_ptr(c, 0), &v, 8)) return NULL;
+    return (host_barrier *)(uintptr_t)v;
+}
+static void barrier_init_(hle_call *c) {
+    uint32_t count = hle_arg_u32(c, 2);
+    host_barrier *b = count && hle_arg_ptr(c, 0) ? calloc(1, sizeof *b) : NULL;
+    if (!b || pal_mutex_create(&b->lock) != PS5C_OK || pal_cond_create(&b->cond) != PS5C_OK) {
+        free(b);
+        hle_ret_s32(c, 22); /* EINVAL */
+        return;
+    }
+    b->count = count;
+    uint64_t v = (uint64_t)(uintptr_t)b;
+    gmem_write(c->mem, hle_arg_ptr(c, 0), &v, 8);
+    hle_ret_s32(c, 0);
+}
+static void barrier_wait_(hle_call *c) {
+    host_barrier *b = barrier_at(c);
+    if (!b) {
+        hle_ret_s32(c, 22);
+        return;
+    }
+    pal_mutex_lock(b->lock);
+    uint64_t round = b->round;
+    int32_t r = 0;
+    if (++b->waiting == b->count) {
+        b->waiting = 0;
+        b->round++;
+        pal_cond_broadcast(b->cond);
+        r = -1;
+    } else {
+        while (round == b->round) pal_cond_wait(b->cond, b->lock);
+    }
+    pal_mutex_unlock(b->lock);
+    hle_ret_s32(c, r);
+}
+static void barrier_destroy_(hle_call *c) {
+    host_barrier *b = barrier_at(c);
+    if (b) {
+        pal_cond_destroy(b->cond);
+        pal_mutex_destroy(b->lock);
+        free(b);
+        uint64_t zero = 0;
+        gmem_write(c->mem, hle_arg_ptr(c, 0), &zero, 8);
+    }
+    hle_ret_s32(c, 0);
+}
+
 static const hle_export k_exports[] = {
+    HLE_FUNC_ENTRY(LIB, "pthread_barrier_init", barrier_init_),
+    HLE_FUNC_ENTRY(LIB, "pthread_barrier_wait", barrier_wait_),
+    HLE_FUNC_ENTRY(LIB, "pthread_barrier_destroy", barrier_destroy_),
+    HLE_FUNC_ENTRY(LIB, "flock", ok0_),
+    HLE_FUNC_ENTRY(LIB, "sigaltstack", ok0_),
+    HLE_FUNC_ENTRY(LIB, "sigemptyset", sigemptyset_),
+    HLE_FUNC_ENTRY(LIB, "sigfillset", sigfillset_),
+    HLE_FUNC_ENTRY(LIB, "sigaddset", sigaddset_),
+    HLE_FUNC_ENTRY(LIB, "sigdelset", sigdelset_),
+    HLE_FUNC_ENTRY(LIB, "sigismember", sigismember_),
+    HLE_FUNC_ENTRY(LIB, "sigaction", sigaction_),
+    HLE_FUNC_ENTRY(LIB, "pthread_sigmask", sigmask_),
+    HLE_FUNC_ENTRY(LIB, "pthread_attr_getscope", attr_getscope_),
+    HLE_FUNC_ENTRY(LIB, "pthread_attr_setscope", ok0_),
+    HLE_FUNC_ENTRY(LIB, "sleep", posix_sleep_),
+    HLE_FUNC_ENTRY(LIB, "sysctl", sysctl_),
+    HLE_FUNC_ENTRY(LIB, "sysctlbyname", sysctlbyname_),
+    HLE_FUNC_ENTRY(LIB, "sceKernelGetExecutableModuleHandle", executable_handle_),
+    HLE_FUNC_ENTRY(LIB, "sceKernelGetModuleInfo", get_module_info_),
     HLE_DATA_ENTRY(LIB, "__stack_chk_guard", stack_chk_guard_init),
     HLE_FUNC_ENTRY(LIB, "__stack_chk_fail", stack_chk_fail),
     HLE_FUNC_ENTRY(LIB, "__tls_get_addr", tls_get_addr),

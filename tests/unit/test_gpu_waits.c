@@ -62,6 +62,11 @@ static void atomic_add(uint32_t *p, guest_addr at) {
     uint32_t a[] = {0xc0061e00, 9, (uint32_t)at, (uint32_t)(at >> 32), 1, 0, 0, 0};
     memcpy(p, a, sizeof(a));
 }
+/* an 8-dword NOP: block padding after a conditional tail chain */
+static void nop8(uint32_t *p) {
+    uint32_t a[] = {0xc0061000, 0, 0, 0, 0, 0, 0, 0};
+    memcpy(p, a, sizeof(a));
+}
 static void test_nested_wait_no_replay_or_early_irq(void) {
     reset();
     guest_addr root = base + 256, child = base + 1024, count = base + 8, label = base + 16;
@@ -224,7 +229,7 @@ static void conditional_chain(guest_addr first, guest_addr count) {
     for (uint32_t i = 0; i < 12; i++) {
         uint32_t p[22];
         conditional_ib(p, 1, base + 16, UINT64_MAX, 0, first + (i+1)*128, i==11 ? 8 : 22, 0, 0);
-        atomic_add(p+14,count); /* a tail jump must not return here */
+        nop8(p+14); /* padding: a tail jump, not a call that returns here */
         put(first+i*128,p,22);
     }
     uint32_t end[8];atomic_add(end,count);put(first+12*128,end,8);
@@ -250,7 +255,7 @@ static void test_conditional_chain_wait_resumes_only_selected_path(void) {
     guest_addr root=base+256,branch=base+512,target=base+1024,label=base+16,count=base+8;
     uint32_t p[20]={0};atomic_add(p,count);atomic_add(p+12,count);
     p[8]=0xc0023f00;p[9]=(uint32_t)branch;p[10]=(uint32_t)(branch>>32);p[11]=22;
-    uint32_t b[22];conditional_ib(b,1,0,0,0,target,15,0,0);atomic_add(b+14,count);
+    uint32_t b[22];conditional_ib(b,1,0,0,0,target,15,0,0);nop8(b+14);
     uint32_t t[15]={0xc0053c00,0x13,(uint32_t)label,(uint32_t)(label>>32),1,~0u,4};
     atomic_add(t+7,count);put(root,p,20);put(branch,b,22);put(target,t,15);
     gpu_submission s={0};
@@ -279,11 +284,23 @@ static void test_conditional_four_byte_predicate_and_else(void) {
 }
 static void test_conditional_cycle_yields_without_false_call_depth(void) {
     reset();guest_addr root=base+256,count=base+8;
-    uint32_t p[22];conditional_ib(p,1,0,0,0,root,22,0,0);atomic_add(p+14,count);put(root,p,22);
+    uint32_t p[22];conditional_ib(p,1,0,0,0,root,22,0,0);nop8(p+14);put(root,p,22);
     gpu_submission s={0};CHECK(gpu_submit_resume(&g,&s,root,22,0)==GPU_EXEC_YIELD);
     CHECK(!s.fault && s.depth==1 && value(count)==0 && interrupts==0);
     reset();put(root,p,22);gpu_submit(&g,root,22,0);
     CHECK(value(count)==0 && interrupts==0);
+}
+/* Commands after a conditional IB in its block run once the selected block ends
+ * (Halloween: a second pipe's chain called mid-block, the frame's releases after it). */
+static void test_conditional_ib_mid_block_returns(void) {
+    reset();
+    guest_addr root=base+256,target=base+1024,count=base+8;
+    uint32_t p[22],t[8];conditional_ib(p,1,0,0,0,target,8,0,0);atomic_add(p+14,count);
+    atomic_add(t,count);put(root,p,22);put(target,t,8);
+    gpu_submission s={0};CHECK(gpu_submit_resume(&g,&s,root,22,0)==GPU_EXEC_DONE);
+    CHECK(value(count)==2 && !s.depth && s.done);
+    reset();put(root,p,22);put(target,t,8);gpu_submit(&g,root,22,0);
+    CHECK(value(count)==2);
 }
 static void test_cyclic_chain_yields(void) {
     reset();
@@ -374,6 +391,7 @@ int main(void) {
         TEST_CASE(test_conditional_chain_wait_resumes_only_selected_path),
         TEST_CASE(test_conditional_four_byte_predicate_and_else),
         TEST_CASE(test_conditional_cycle_yields_without_false_call_depth),
+        TEST_CASE(test_conditional_ib_mid_block_returns),
         TEST_CASE(test_wait64_mask_and_high_word), TEST_CASE(test_wait_reads_prior_gpu_results),
         TEST_CASE(test_mem_semaphore_blocks_signals_and_consumes_once),
         TEST_CASE(test_mem_semaphore_refuses_invalid_packets_and_memory),

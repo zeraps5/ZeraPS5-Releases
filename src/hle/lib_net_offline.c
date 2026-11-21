@@ -584,11 +584,112 @@ static void net_bad_socket(hle_call *c) {
     hle_ret_s32(c, NET_ERROR_EBADF);
 }
 
+/* SceNet sockets without a network: on the console sceNetSocket works with the cable
+ * out, binding and options too, while traffic fails (EA's DirtySDK in Immortals of
+ * Aveum gives up at startup when its first UDP socket cannot be created). Ids from
+ * OFFLINE_FIRST; PS5C_NET_SOCKET_DOWN=1 keeps the old ENETDOWN answer. */
+#define OFFLINE_FIRST 0x2000
+#define OFFLINE_SOCKETS 256
+#define NET_ERROR_EAGAIN ((int32_t)0x80410123)      /* 35 */
+#define NET_ERROR_ENETUNREACH ((int32_t)0x80410133) /* 51 */
+static uint16_t g_offline_port[OFFLINE_SOCKETS]; /* 0 = free, 1 = unbound, else the bound port */
+static pal_mutex *g_offline_lock;
+
+static int32_t offline_index(hle_call *c) {
+    int32_t s = hle_arg_s32(c, 0) - OFFLINE_FIRST;
+    return s >= 0 && s < OFFLINE_SOCKETS && __atomic_load_n(&g_offline_port[s], __ATOMIC_RELAXED) ? s : -1;
+}
+
+static void net_error(hle_call *c, int32_t code) {
+    set_errno(c, code & 0xff);
+    hle_ret_s32(c, code);
+}
+
+/* int sceNetSocket(const char *name, int family, int type, int protocol) */
+static void net_socket(hle_call *c) {
+    static int down = -1;
+    if (down < 0) down = getenv("PS5C_NET_SOCKET_DOWN") != NULL;
+    if (down || !g_offline_lock) {
+        net_down_net(c);
+        return;
+    }
+    int32_t id = -1;
+    pal_mutex_lock(g_offline_lock);
+    for (int32_t i = 0; i < OFFLINE_SOCKETS && id < 0; i++)
+        if (!g_offline_port[i]) {
+            g_offline_port[i] = 1;
+            id = i;
+        }
+    pal_mutex_unlock(g_offline_lock);
+    if (id < 0) net_error(c, (int32_t)0x80410118); /* EMFILE */
+    else hle_ret_s32(c, OFFLINE_FIRST + id);
+}
+
+/* int sceNetBind(s, const SceNetSockaddr *addr, len): the port is kept for getsockname */
+static void net_bind(hle_call *c) {
+    int32_t i = offline_index(c);
+    if (i < 0) {
+        net_bad_socket(c);
+        return;
+    }
+    const uint8_t *a = hle_arg_ptr(c, 1) ? (const uint8_t *)hle_mem(c, hle_arg_ptr(c, 1), 4) : NULL;
+    uint16_t port = a ? (uint16_t)(a[2] << 8 | a[3]) : 0;
+    g_offline_port[i] = port > 1 ? port : (uint16_t)(49152 + i);
+    hle_ret_s32(c, 0);
+}
+
+/* int sceNetGetsockname(s, SceNetSockaddr *addr, SceNetSocklen_t *len): 0.0.0.0 and the port */
+static void net_getsockname(hle_call *c) {
+    int32_t i = offline_index(c);
+    if (i < 0) {
+        net_bad_socket(c);
+        return;
+    }
+    uint8_t *a = hle_arg_ptr(c, 1) ? (uint8_t *)hle_mem(c, hle_arg_ptr(c, 1), 16) : NULL;
+    uint32_t *len = hle_arg_ptr(c, 2) ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 2), 4) : NULL;
+    uint16_t port = g_offline_port[i] == 1 ? 0 : g_offline_port[i];
+    if (a) {
+        memset(a, 0, 16);
+        a[0] = 16;
+        a[1] = 2; /* AF_INET */
+        a[2] = (uint8_t)(port >> 8);
+        a[3] = (uint8_t)port;
+    }
+    if (len) *len = 16;
+    hle_ret_s32(c, 0);
+}
+
+static void net_offline_ok(hle_call *c) {
+    if (offline_index(c) < 0) net_bad_socket(c);
+    else hle_ret_s32(c, 0);
+}
+
+/* traffic: nothing reaches anyone, nothing arrives */
+static void net_unreachable(hle_call *c) {
+    if (offline_index(c) < 0) net_bad_socket(c);
+    else net_error(c, NET_ERROR_ENETUNREACH);
+}
+
+static void net_nothing_yet(hle_call *c) {
+    if (offline_index(c) < 0) {
+        net_bad_socket(c);
+        return;
+    }
+    pal_sleep_ns(1000000); /* a blocking caller polls instead of spinning */
+    net_error(c, NET_ERROR_EAGAIN);
+}
+
+static void net_offline_close(hle_call *c) {
+    int32_t i = offline_index(c);
+    if (i >= 0) __atomic_store_n(&g_offline_port[i], 0, __ATOMIC_RELAXED);
+    hle_ret_s32(c, 0);
+}
+
 #define LAN_WRAPPER(name, op, offline) \
     static void name(hle_call *c) { if (!net_lan_sce_call(c, op)) offline(c); }
-LAN_WRAPPER(net_close, NL_CLOSE, ok)
-LAN_WRAPPER(net_sendto, NL_SENDTO, net_bad_socket)
-LAN_WRAPPER(net_recvfrom, NL_RECVFROM, net_bad_socket)
+LAN_WRAPPER(net_close, NL_CLOSE, net_offline_close)
+LAN_WRAPPER(net_sendto, NL_SENDTO, net_unreachable)
+LAN_WRAPPER(net_recvfrom, NL_RECVFROM, net_nothing_yet)
 #undef LAN_WRAPPER
 
 /* int sceNetEpollWait(eid, events *, maxevents, int timeout_us): nothing ever becomes ready.
@@ -657,8 +758,8 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY( "bind", posix_bind),
     POSIX_ENTRY( "setsockopt", posix_setsockopt),
     POSIX_ENTRY( "getsockname", posix_getsockname),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetSocket", net_down_net),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetSetsockopt", ok), /* no socket is ever created */
+    HLE_FUNC_ENTRY("libSceNet", "sceNetSocket", net_socket),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetSetsockopt", ok),
     HLE_FUNC_ENTRY("libSceNet", "sceNetSocketClose", net_close),
     HLE_FUNC_ENTRY("libSceNet", "sceNetResolverCreate", new_id),
     HLE_FUNC_ENTRY("libSceNet", "sceNetResolverStartNtoa", net_down_net),
@@ -690,20 +791,20 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceNet", "sceNetNtohl", net_swap32),
     HLE_FUNC_ENTRY("libSceNet", "sceNetHtonll", net_swap64),
     HLE_FUNC_ENTRY("libSceNet", "sceNetNtohll", net_swap64),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetBind", net_bad_socket),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetConnect", net_bad_socket),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetListen", net_bad_socket),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetAccept", net_bad_socket),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetSend", net_bad_socket),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetBind", net_bind),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetConnect", net_unreachable),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetListen", net_offline_ok),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetAccept", net_nothing_yet),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetSend", net_unreachable),
     HLE_FUNC_ENTRY("libSceNet", "sceNetSendto", net_sendto),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetRecv", net_bad_socket),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetRecv", net_nothing_yet),
     HLE_FUNC_ENTRY("libSceNet", "sceNetRecvfrom", net_recvfrom),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetGetsockname", net_bad_socket),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetGetsockname", net_getsockname),
     HLE_FUNC_ENTRY("libSceNet", "sceNetGetpeername", net_bad_socket),
     HLE_FUNC_ENTRY("libSceNet", "sceNetGetsockopt", net_bad_socket),
     HLE_FUNC_ENTRY("libSceNet", "sceNetGetSockInfo", net_bad_socket),
     HLE_FUNC_ENTRY("libSceNet", "sceNetGetSockInfo6", net_bad_socket),
-    HLE_FUNC_ENTRY("libSceNet", "sceNetShutdown", net_bad_socket),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetShutdown", net_offline_ok),
     HLE_FUNC_ENTRY("libSceNet", "sceNetSocketAbort", ok),
     HLE_FUNC_ENTRY("libSceNet", "sceNetEpollCreate", new_id),
     HLE_FUNC_ENTRY("libSceNet", "sceNetEpollControl", ok),
@@ -829,5 +930,6 @@ void hle_register_net_offline(void) {
         LOG_E(HLE, "cannot initialize local socket channels");
         return;
     }
+    if (!g_offline_lock) pal_mutex_create(&g_offline_lock);
     hle_register_table(k_exports, PS5C_ARRAY_COUNT(k_exports));
 }

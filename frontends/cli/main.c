@@ -107,6 +107,17 @@ typedef struct options {
     bool trace_hle;
 } options;
 
+/* whether the n bytes of needle occur in [hay, hay + size) */
+static bool memmem_bytes(const uint8_t *hay, size_t size, const char *needle, size_t n) {
+    for (size_t i = 0; n && i + n <= size; i++) {
+        const uint8_t *p = memchr(hay + i, (uint8_t)needle[0], size - n + 1 - i);
+        if (!p) return false;
+        i = (size_t)(p - hay);
+        if (!memcmp(p, needle, n)) return true;
+    }
+    return false;
+}
+
 static bool parse_args(int argc, char **argv, options *o) {
     memset(o, 0, sizeof(*o));
     o->output = "game_profile.json";
@@ -1303,12 +1314,53 @@ static int cmd_run(const options *o, const nid_db *db) {
         else if(quake3) LOG_I(MEM,"Quake III homebrew: PS5 shader address32 memory window enabled");
         else LOG_I(MEM,"Unleashed Recompiled homebrew: PS5 shader address32 memory window enabled");
     }
+    /* Per-title defaults for experimental renderer modes, measured on that title only (an
+     * environment variable the user sets wins). Halloween's (PPSA29340) title screen runs
+     * ~400 compute dispatches a frame whose buffer results the next pass samples: resident
+     * buffers, local compute inputs and no rehash of GPU-written textures take it from
+     * ~0.8 to ~2 frames a second in its loading phase and remove a garbage background. */
+    static const struct { const char *title, *vars; } k_title_env[] = {
+        {"PPSA29340", "PS5C_RESIDENT_BUFFERS=1;PS5C_GPU_WATCH=1;PS5C_LOCAL_COMPUTE=1;PS5C_NO_TEX_RECHECK=1"},
+    };
+    for (size_t t = 0; compatibility_title[0] && t < sizeof(k_title_env) / sizeof(k_title_env[0]); t++) {
+        if (strcmp(compatibility_title, k_title_env[t].title)) continue;
+        for (const char *v = k_title_env[t].vars; *v;) {
+            const char *end = strchr(v, ';'), *eq = strchr(v, '=');
+            size_t n = end ? (size_t)(end - v) : strlen(v);
+            char name[64];
+            if (eq && (size_t)(eq - v) < sizeof(name) && eq < v + n) {
+                memcpy(name, v, (size_t)(eq - v));
+                name[eq - v] = 0;
+                char value[192];
+                size_t vn = n - (size_t)(eq - v) - 1;
+                if (!getenv(name) && vn < sizeof(value)) {
+                    memcpy(value, eq + 1, vn);
+                    value[vn] = 0;
+                    ps5c_env_set(name, value);
+                    LOG_I(CORE, "title profile %s: %s=%s", k_title_env[t].title, name, value);
+                }
+            }
+            v += n + (end != NULL);
+        }
+    }
     if (longshot) {
         /* The bundled PS5 RADV probes a low address32 pool as well as the
          * high guest window. The same placeholder split supports both. */
         ro.direct_memory_window = true;
         if (gmem_set_shared_area_base(0x280000000ull) != PS5C_OK)
             LOG_W(MEM, "cannot reserve Longshot's shared memory and RADV address32 window");
+    }
+    /* Other homebrew ports with the same PS5 RADV inside (Prince of Persia's reSOT
+     * PPSA99024, Burnout Revenge's Xerenge PPSA92006): its device probe maps 16 MiB of
+     * direct memory with no address and wants it at 8-12 GiB, or Vulkan has no device. */
+    if (!ro.direct_memory_window && main_module && main_module->img.file &&
+        memmem_bytes(main_module->img.file, main_module->img.file_size, "radv-src/src/amd/vulkan/", 24)) {
+        ro.direct_memory_window = true;
+        if (gmem_set_shared_area_base(0x280000000ull) != PS5C_OK)
+            LOG_W(MEM, "cannot reserve the PS5 RADV address32 window");
+        else
+            LOG_I(MEM, "homebrew with PS5 RADV inside: shader address32 memory window enabled");
+        renderer_set_radv_homebrew(true);
     }
     ro.stop_on_missing = o->stop_on_missing;
     ro.trace_hle = o->trace_hle;

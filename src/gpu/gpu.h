@@ -130,6 +130,8 @@ gpu_exec_result gpu_submit_resume(gpu *g, gpu_submission *s, guest_addr addr, ui
 
 /* Writes the label and raises the interrupt of a release (any thread; does not take the GPU lock). */
 void gpu_perform_release(gpu *g, const gpu_release *rel);
+/* The last command-processor write to a label (hashed, may be forgotten): false if none seen. */
+bool gpu_last_write(guest_addr a, char *out, size_t size);
 
 /* Length in dwords of the shader program at `addr` (through s_endpgm), 0 if unknown. */
 uint32_t gpu_shader_size(const gpu *g, guest_addr addr);

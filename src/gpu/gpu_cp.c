@@ -78,11 +78,31 @@ ps5c_err gpu_init(gpu *g, gmem *mem, const gpu_callbacks *cb) {
     g->regs[mmPA_SC_AA_MASK_X0Y1_X1Y1] = UINT32_MAX;
     if (!sh_gds_base && gmem_map(mem, 0, SH_GDS_SIZE, GPROT_RW, 0, "gds", &sh_gds_base) != PS5C_OK) sh_gds_base = 0;
     const char *dump = getenv("PS5C_GPU_DUMP");
-    g->dump_frame = dump && dump[0] != '@' ? atoll(dump) : -1;
+    g->dump_frame = dump && dump[0] != '@' ? atoll(dump + (dump[0] == '+')) : -1;
     return PS5C_OK;
 }
 
-static bool dumping(const gpu *g) { return g->dump_frame >= 0 && (int64_t)g->stats.flips == g->dump_frame; }
+/* PS5C_GPU_DUMP=+<frame>: that frame and every later one */
+/* Whether real commands follow dword `pos` of a command block (NOP packets and type-2
+ * filler are padding). */
+static bool packets_after(const uint32_t *cmd, uint32_t pos, uint32_t dwords) {
+    while (cmd && pos < dwords) {
+        uint32_t hdr = cmd[pos];
+        if (hdr >> 30 == 2 || hdr == 0xFFFF1000u) {
+            pos++;
+            continue;
+        }
+        if (hdr >> 30 != 3 || ((hdr >> 8) & 0xFF) != 0x10) return true;
+        pos += ((hdr >> 16) & 0x3FFF) + 2;
+    }
+    return false;
+}
+
+static bool dumping(const gpu *g) {
+    static int from = -1;
+    if (from < 0) from = getenv("PS5C_GPU_DUMP") && getenv("PS5C_GPU_DUMP")[0] == '+';
+    return g->dump_frame >= 0 && (from ? (int64_t)g->stats.flips >= g->dump_frame : (int64_t)g->stats.flips == g->dump_frame);
+}
 
 /* ---- Registers ---- */
 
@@ -799,7 +819,35 @@ static void end_of_pipe(gpu *g) {
     if (g->cb.sync_mem) g->cb.sync_mem(g->cb.user, 0, ~0ull);
 }
 
+/* The last command-processor write to each (hashed) address: a queue blocked on a
+ * label reports who advanced it last (lib_agc_driver.c). */
+typedef struct cp_last_write {
+    guest_addr addr;
+    uint64_t value, ns;
+    const char *what;
+    int32_t queue_event;
+} cp_last_write;
+static cp_last_write g_last_writes[4096];
+
+static void note_write(guest_addr a, uint64_t value, const char *what, int32_t queue_event) {
+    cp_last_write *w = &g_last_writes[(a >> 3) & 4095];
+    w->addr = a & ~7ull;
+    w->value = value;
+    w->ns = pal_time_ns();
+    w->what = what;
+    w->queue_event = queue_event;
+}
+
+bool gpu_last_write(guest_addr a, char *out, size_t size) {
+    const cp_last_write *w = &g_last_writes[(a >> 3) & 4095];
+    if (!w->what || w->addr != (a & ~7ull)) return false;
+    snprintf(out, size, "%s value 0x%llx (queue event %d) %.1f s ago", w->what, (unsigned long long)w->value,
+             w->queue_event, (double)(pal_time_ns() - w->ns) / 1e9);
+    return true;
+}
+
 void gpu_perform_release(gpu *g, const gpu_release *rel) {
+    if (rel->data_sel >= 1 && rel->data_sel <= 4) note_write(rel->addr, rel->data, "RELEASE_MEM", rel->queue_event);
     switch (rel->data_sel) {
     case 1: write32(g, rel->addr & ~3ull, (uint32_t)rel->data); break;
     case 2: write64(g, rel->addr & ~7ull, rel->data); break;
@@ -958,6 +1006,7 @@ static void atomic_mem(gpu *g, const uint32_t *p, uint32_t len) {
         return;
     }
     gmem_write(g->mem, a, &v, wide ? 8 : 4);
+    note_write(a, v, "ATOMIC_MEM", -1);
     if (g->cb.mem_written) g->cb.mem_written(g->cb.user, a, wide ? 8 : 4);
 }
 
@@ -969,6 +1018,7 @@ static void write_data(gpu *g, const uint32_t *p, uint32_t len) {
     guest_addr addr = (guest_addr)p[2] | ((guest_addr)p[3] << 32);
     if (addr_logged(addr, (uint64_t)(len - 4) * 4))
         LOG_I(GPU, "GPU write: WRITE_DATA addr 0x%llx first dword 0x%x (%u dwords)", (unsigned long long)addr, p[4], len - 4);
+    note_write(addr, len >= 6 ? (uint64_t)p[4] | (uint64_t)p[5] << 32 : p[4], "WRITE_DATA", -1);
     if (cp_ordered_write(g, addr, p + 4, (len - 4) * 4)) return;
     cp_write(g, "WRITE_DATA", addr, (uint64_t)(len - 4) * 4);
     if (!gmem_write(g->mem, addr, p + 4, (uint64_t)(len - 4) * 4)) {
@@ -991,6 +1041,7 @@ static void dma_data(gpu *g, const uint32_t *p, uint32_t len) {
     /* sel 0 = memory, 3 = memory through the L2 cache (same memory here), 1 = GDS
      * (guest memory at sh_gds_base); source 2 = fill with the dword in dw2 */
     if (dst_sel == 2 || count == 0) return;
+    note_write(dst, src_sel == 2 ? p[2] : src, src_sel == 2 ? "DMA_DATA fill" : "DMA_DATA copy from", -1);
     if (dst_sel == 1 || src_sel == 1) {
         if (!sh_gds_base) return;
         if (dst_sel == 1) dst = sh_gds_base + (dst & (SH_GDS_SIZE - 1));
@@ -1056,7 +1107,9 @@ static void trace_cp_wait(gpu *g, const uint32_t *p, uint32_t len, guest_addr pa
     uint32_t op = (p[0] >> 8) & 255;
     uint32_t slot = op == 0x3c ? 0 : op == 0x93 ? 1 : 2;
     uint64_t n = ++counts[slot];
-    if (n > 8 && (n & (n - 1))) return;
+    static int all = -1; /* PS5C_TRACE_CP_WAIT=all: every wait */
+    if (all < 0) all = !strcmp(getenv("PS5C_TRACE_CP_WAIT"), "all");
+    if (!all && n > 8 && (n & (n - 1))) return;
     uint64_t value = 0, ref = 0, mask = 0;
     guest_addr a = 0;
     bool mapped = false;
@@ -1365,7 +1418,11 @@ static void run_packets(gpu *g, guest_addr addr, uint32_t dwords, int32_t queue_
                 ib = (guest_addr)(p[target] & ~3u) | ((guest_addr)p[target + 1] << 32);
                 ib_dwords = p[target + 2] & 0xFFFFF;
                 if (!ib_dwords) break; /* empty conditional target: no commands */
-                chained = true;
+                /* At the end of its block (padding at most) it is a tail chain; with commands
+                 * after it, the selected block is called and they run when it ends (Halloween's
+                 * RHI calls a second pipe's chain mid-block, then releases the frame's labels:
+                 * jumping skipped those releases and its graphics queue waited for ever). */
+                chained = !packets_after(cmd, pos, dwords);
             } else {
                 if (len < 4) break;
                 ib = (guest_addr)(p[1] & ~3u) | ((guest_addr)(p[2] & 0xFFFF) << 32);

@@ -13,6 +13,9 @@ typedef struct renderer renderer;
 
 /* NULL when no usable host GPU is found (callers fall back to the software presenter). */
 renderer *renderer_create(pal_window *window, gmem *mem);
+/* Homebrew with Mesa's PS5 RADV inside (frontends): its NGG vertex shaders cull triangles
+ * through LDS, as Longshot's and Quake III's; set before renderer_create. */
+void renderer_set_radv_homebrew(bool on);
 void renderer_destroy(renderer *r);
 
 /* Persistent shader cache (vk_shader_cache.c): the game's user directory

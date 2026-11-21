@@ -16,6 +16,8 @@ char *ps5c_getenv(const char *name);
 /* Test-only reset at a quiescent point: no concurrent lookups, and no borrowed
  * values may be used afterwards. This invalidates all previously returned pointers. */
 void ps5c_env_reset(void);
+/* Sets a variable for the rest of the run, cache included (start-up profiles). */
+void ps5c_env_set(const char *name, const char *value);
 #define getenv(name) ps5c_getenv(name)
 
 /* ---- Error codes (host side). Guest SCE error codes (0x8002xxxx) are a

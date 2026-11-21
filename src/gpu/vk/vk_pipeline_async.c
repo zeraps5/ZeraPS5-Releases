@@ -70,6 +70,10 @@ static struct {
     pal_thread *workers[MAX_WORKERS];
     uint32_t nworkers, running, busy, busy_late;
     uint64_t wait_budget;
+    /* all waits within one second share wait_window (PS5C_PIPELINE_WAIT_WINDOW_MS, 500): a
+     * shader warm-up draws hundreds of new pipelines in one submission, and one budget each
+     * held the GPU for 10 s (Prince of Persia's RADV then declared the device lost) */
+    uint64_t wait_window, window_start, window_spent;
     pal_file *list;
     uint64_t list_end;
     uint64_t list_limit, recipe_budget, source_budget;
@@ -372,6 +376,8 @@ void vk_pipeline_async_start(renderer *r) {
     if (!n) n = 1; /* draws' builds need one */
     const char *wait = getenv("PS5C_PIPELINE_WAIT_MS");
     g.wait_budget = (wait ? (uint64_t)atoll(wait) : 2000) * 1000000ull;
+    const char *window = getenv("PS5C_PIPELINE_WAIT_WINDOW_MS");
+    g.wait_window = (window ? (uint64_t)atoll(window) : 500) * 1000000ull;
     g.pre_start = pal_time_ns();
     /* workers start by taking the lock: each is counted before any can finish */
     pal_mutex_lock(g.lock);
@@ -476,6 +482,11 @@ retry_build:
         handed = true;
     }
     uint64_t budget = must_complete ? 0 : g.wait_budget;
+    if (budget && g.wait_window) { /* what this second's waits left (at least 1 ns: 0 waits for ever) */
+        if (t0 - g.window_start >= 1000000000ull) g.window_start = t0, g.window_spent = 0;
+        uint64_t left = g.window_spent < g.wait_window ? g.wait_window - g.window_spent : 1;
+        if (left < budget) budget = left;
+    }
     while (j->state == J_QUEUED || j->state == J_RUNNING) {
         uint64_t spent = pal_time_ns() - t0;
         if (budget && spent >= budget) {
@@ -483,6 +494,7 @@ retry_build:
             if (told++ < 16)
                 LOG_W(GPU, "pipeline build over %.0f ms: its draws are skipped until it is done", (double)g.wait_budget / 1e6);
             j->over = true; /* the next draws do not wait for it */
+            g.window_spent += spent;
             pal_mutex_unlock(g.lock);
             vk_pipeline_async_note_wait(spent, handed);
             *pending = true;
@@ -502,6 +514,7 @@ retry_build:
         if (handed) g.built_here++;
         else g.adopted++;
     }
+    if (!must_complete) g.window_spent += pal_time_ns() - t0;
     pal_mutex_unlock(g.lock);
     vk_pipeline_async_note_wait(pal_time_ns() - t0, handed);
     return ok;

@@ -531,6 +531,16 @@ static bool break_hit(ps5_runtime *rt, pal_fault_info *info) {
         }
     }
     if (getenv("PS5C_BREAK_PUBLISH")) g_debug_addr = info->gpr[atoi(getenv("PS5C_BREAK_PUBLISH")) & 15];
+    /* PS5C_BREAK_WATCH=<reg>[+<hex>]: the write watch (PS5C_WATCH_WRITE, any address, with
+     * PS5C_WATCH_EXACT) moves to that register plus offset: who writes a field of an object
+     * found only at run time */
+    const char *bw = getenv("PS5C_BREAK_WATCH");
+    static bool bw_moved; /* the first hit only */
+    if (bw && g_watch_page && !bw_moved) {
+        bw_moved = true;
+        const char *plus = strchr(bw, '+');
+        runtime_watch_move(&rt->mem, info->gpr[atoi(bw) & 15] + (plus ? strtoull(plus + 1, NULL, 16) : 0));
+    }
     break_poke(&rt->mem, g_break_orig);
     t_break_step = true;
     info->single_step = true;
@@ -714,6 +724,62 @@ bool runtime_longshot_commit(ps5_runtime *rt, guest_addr addr, uint64_t size) {
     return true;
 }
 
+/* A fault in guest code goes to the SIGSEGV (or SIGBUS) handler the guest installed, as
+ * FreeBSD delivers it: handler(sig, siginfo_t *, ucontext_t *), then execution resumes with
+ * the registers the handler left in the context. Xbox recompilations (Prince of Persia's
+ * reSOT, Burnout's Xerenge) leave device apertures unmapped and emulate each access there.
+ * siginfo_t: signo, errno, code, pid, uid, status (int), addr at 24; ucontext_t: 64 bytes
+ * on the PS5 (FreeBSD's sigmask is 16: reSOT's handler reads rax at +0x78, rip at +0xe0),
+ * then mcontext: onstack, rdi, rsi, rdx, rcx, r8, r9, rax, rbx, rbp, r10-r15,
+ * trapno (u32), fs, gs, addr, flags (u32), es, ds, err, rip, cs, rflags, rsp, ss, len,
+ * fpformat, ownedfp, then 512 bytes of fxsave state (xmm0 at +160) at +224. */
+static bool deliver_signal(ps5_runtime *rt, pal_fault_info *info) {
+    static _Thread_local int depth;
+    int sig = info->kind == PAL_FAULT_ACCESS ? 11 : 0;
+    guest_addr handler = sig ? __atomic_load_n(&rt->sig_handler[sig], __ATOMIC_ACQUIRE) : 0;
+    if (!handler || !rt->mem.identity || depth || info->execute || !runtime_current_thread(rt) ||
+        info->pc < rt->mem.res_start || info->pc >= rt->mem.res_end)
+        return false;
+    /* gpr: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15; mcontext order below */
+    static const int k_mc[] = {7, 6, 2, 1, 8, 9, 0, 3, 5, 10, 11, 12, 13, 14, 15}; /* rdi..r15 */
+    _Alignas(64) uint8_t frame[128 + 64 + 800 + 64];
+    memset(frame, 0, sizeof frame);
+    uint8_t *si = frame, *uc = frame + 128, *mc = uc + 64;
+    int32_t ints[3] = {sig, 0, gmem_is_mapped(&rt->mem, info->addr, 1) ? 2 : 1}; /* SEGV_ACCERR : SEGV_MAPERR */
+    memcpy(si, ints, sizeof ints);
+    memcpy(si + 24, &info->addr, 8);
+    for (int i = 0; i < 15; i++) memcpy(mc + 8 + i * 8, &info->gpr[k_mc[i]], 8);
+    uint32_t trapno = 12;
+    uint64_t err = info->write ? 6 : 4; /* user, write */
+    memcpy(mc + 128, &trapno, 4);
+    memcpy(mc + 136, &info->addr, 8);
+    memcpy(mc + 152, &err, 8);
+    memcpy(mc + 160, &info->pc, 8);
+    memcpy(mc + 176, &info->rflags, 8);
+    memcpy(mc + 184, &info->gpr[4], 8);
+    uint64_t len = 800, fmt = 0x10002, owned = 0x20001;
+    memcpy(mc + 200, &len, 8);
+    memcpy(mc + 208, &fmt, 8);
+    memcpy(mc + 216, &owned, 8);
+    uint32_t mxcsr = 0x1f80;
+    memcpy(mc + 224 + 24, &mxcsr, 4);
+    for (int i = 0; i < 16; i++) memcpy(mc + 224 + 160 + i * 16, info->xmm[i], 16);
+    depth++;
+    uint64_t rax = 0;
+    bool ok = runtime_call_nested4(rt, handler, (uint64_t)sig, (uint64_t)(uintptr_t)si, (uint64_t)(uintptr_t)uc, 0, &rax);
+    depth--;
+    if (!ok) return false;
+    for (int i = 0; i < 15; i++) memcpy(&info->gpr[k_mc[i]], mc + 8 + i * 8, 8);
+    memcpy(&info->pc, mc + 160, 8);
+    memcpy(&info->rflags, mc + 176, 8);
+    for (int i = 0; i < 16; i++) memcpy(info->xmm[i], mc + 224 + 160 + i * 16, 16);
+    static uint32_t delivered;
+    if (__atomic_add_fetch(&delivered, 1, __ATOMIC_RELAXED) <= 3)
+        LOG_I(CPU, "SIGSEGV at 0x%llx (pc 0x%llx) handled by the guest; resuming at 0x%llx",
+              (unsigned long long)info->addr, (unsigned long long)*(uint64_t *)(mc + 136), (unsigned long long)info->pc);
+    return true;
+}
+
 static bool fault_handler(void *user, pal_fault_info *info) {
     ps5_runtime *rt = (ps5_runtime *)user;
 #ifdef _WIN32
@@ -764,6 +830,7 @@ static bool fault_handler(void *user, pal_fault_info *info) {
             runtime_longshot_commit(rt, info->addr, 1))
             return true;
     }
+    if (deliver_signal(rt, info)) return true;
     /* One report: the process ends after it, and threads faulting meanwhile
      * (often because of the first fault) would interleave their lines. */
     static atomic_flag reporting = ATOMIC_FLAG_INIT;

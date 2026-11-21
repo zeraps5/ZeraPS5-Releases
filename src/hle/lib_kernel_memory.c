@@ -315,11 +315,41 @@ static void allocate_main_direct_memory(hle_call *c) {
 /* Releases every allocated page in [start, start + len): blocks inside are
  * dropped, blocks crossing an edge are trimmed or split. `checked` fails with
  * ENOENT when nothing in the range was allocated. */
-static int32_t release_direct(uint64_t start, uint64_t len, bool checked) {
+/* The console unmaps what is still mapped of released memory: Halloween
+ * releases a 137 MB file buffer without unmapping it, and its view would go on
+ * sharing the bytes of the pages handed out again (free lists overwritten).
+ * Views of most of direct memory (1 GiB or more) stay: other views of their
+ * parts are placed on them (map_direct_at). */
+static void release_unmap(gmem *mem, uint64_t start, uint64_t end) {
+    guest_addr va[16];
+    uint64_t vlen[16];
+    uint32_t n;
+again:
+    n = 0;
+    pal_mutex_lock(g_lock);
+    for (size_t i = 0; i < g_dmaps.len && n < 16; i++) {
+        const dmem_map *m = &g_dmaps.data[i];
+        if (m->phys >= end || m->phys + m->len <= start || m->len >= (1ull << 30)) continue;
+        uint64_t a = PS5C_MAX(start, m->phys), b = PS5C_MIN(end, m->phys + m->len);
+        va[n] = m->addr + (a - m->phys);
+        vlen[n++] = b - a;
+    }
+    for (uint32_t k = 0; k < n; k++) dmaps_forget(va[k], vlen[k]);
+    pal_mutex_unlock(g_lock);
+    for (uint32_t k = 0; k < n; k++) {
+        LOG_D(KERNEL, "released direct memory unmapped at 0x%llx (0x%llx bytes)", (unsigned long long)va[k],
+              (unsigned long long)vlen[k]);
+        gmem_unmap(mem, va[k], vlen[k]);
+    }
+    if (n == 16) goto again; /* more views than one pass takes */
+}
+
+static int32_t release_direct(gmem *mem, uint64_t start, uint64_t len, bool checked) {
     if (!len || start % GUEST_PAGE_SIZE || len % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
     uint64_t end = start + len;
     bool touched = false;
     int32_t ret = 0;
+    if (mem && !getenv("PS5C_RELEASE_KEEPS_MAPS")) release_unmap(mem, start, end);
     pal_mutex_lock(g_lock);
     stale_mark(start, end);
     for (size_t i = 0; i < g_dmem.len;) {
@@ -365,9 +395,9 @@ static int32_t release_direct(uint64_t start, uint64_t len, bool checked) {
     return ret;
 }
 
-static void release_direct_memory(hle_call *c) { hle_ret_s32(c, release_direct(hle_arg(c, 0), hle_arg(c, 1), false)); }
+static void release_direct_memory(hle_call *c) { hle_ret_s32(c, release_direct(c->mem, hle_arg(c, 0), hle_arg(c, 1), false)); }
 static void checked_release_direct_memory(hle_call *c) {
-    hle_ret_s32(c, release_direct(hle_arg(c, 0), hle_arg(c, 1), true));
+    hle_ret_s32(c, release_direct(c->mem, hle_arg(c, 0), hle_arg(c, 1), true));
 }
 
 /* int sceKernelDirectMemoryQuery(off_t offset, int flags, info *out, size_t size):
@@ -782,19 +812,36 @@ static void posix_mprotect(hle_call *c) {
     hle_ret_s32(c, do_mprotect(c, hle_arg_ptr(c, 0), hle_arg(c, 1), hle_arg_u32(c, 2)) ? -1 : 0);
 }
 
-/* mmap(addr, len, prot, flags, fd, offset): anonymous mappings only for now. */
-static int32_t do_mmap(hle_call *c, guest_addr *addr, uint64_t len, uint32_t prot, uint32_t flags, int32_t fd) {
-    if (!(flags & MAP_ANON) && fd != -1) {
-        LOG_W(KERNEL, "mmap of file descriptor %d not implemented", fd);
-        return SCE_KERNEL_ERROR_ENOSYS;
-    }
+int64_t kernel_fs_pread_host(int32_t fd, void *buf, uint64_t size, uint64_t off); /* lib_kernel_fs.c */
+
+/* mmap(addr, len, prot, flags, fd, offset). A file is mapped as a private copy
+ * of its bytes (Burnout Revenge, a PS2 game in a PS5 wrapper, maps its data
+ * file); writes to a shared file mapping do not reach the file. */
+static int32_t do_mmap(hle_call *c, guest_addr *addr, uint64_t len, uint32_t prot, uint32_t flags, int32_t fd,
+                       uint64_t off) {
     len = PS5C_ALIGN_UP(len, GUEST_PAGE_SIZE);
-    return map_memory(c, addr, len, prot, flags, 0, "mmap", false,false);
+    if ((flags & MAP_ANON) || fd == -1) return map_memory(c, addr, len, prot, flags, 0, "mmap", false,false);
+    if (off % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
+    int32_t err = map_memory(c, addr, len, prot | 3 /* read, write while filling */, flags, 0, "mmap file", false, false);
+    if (err) return err;
+    uint8_t *host = (uint8_t *)hle_mem(c, *addr, len);
+    int64_t got = host ? kernel_fs_pread_host(fd, host, len, off) : -14;
+    if (got < 0) {
+        do_munmap(c, *addr, len);
+        LOG_W(KERNEL, "mmap of file descriptor %d: read failed (%lld)", fd, (long long)got);
+        return (int32_t)0x80020009; /* EBADF */
+    }
+    static uint32_t logged;
+    if (logged++ < 8)
+        LOG_I(KERNEL, "mmap of file descriptor %d: %llu bytes at offset 0x%llx copied to 0x%llx", fd,
+              (unsigned long long)got, (unsigned long long)off, (unsigned long long)*addr);
+    if ((prot & 3) != 3) do_mprotect(c, *addr, len, prot);
+    return 0;
 }
 
 static void posix_mmap(hle_call *c) {
     guest_addr addr = hle_arg_ptr(c, 0);
-    int32_t ret = do_mmap(c, &addr, hle_arg(c, 1), hle_arg_u32(c, 2), hle_arg_u32(c, 3), hle_arg_s32(c, 4));
+    int32_t ret = do_mmap(c, &addr, hle_arg(c, 1), hle_arg_u32(c, 2), hle_arg_u32(c, 3), hle_arg_s32(c, 4), hle_arg(c, 5));
     hle_ret_u64(c, ret ? MAP_FAILED_ADDR : addr);
 }
 
@@ -802,7 +849,8 @@ static void posix_mmap(hle_call *c) {
 static void kernel_mmap(hle_call *c) {
     uint64_t *res = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 6), 8);
     guest_addr addr = hle_arg_ptr(c, 0);
-    int32_t ret = res ? do_mmap(c, &addr, hle_arg(c, 1), hle_arg_u32(c, 2), hle_arg_u32(c, 3), hle_arg_s32(c, 4))
+    int32_t ret = res ? do_mmap(c, &addr, hle_arg(c, 1), hle_arg_u32(c, 2), hle_arg_u32(c, 3), hle_arg_s32(c, 4),
+                                hle_arg(c, 5))
                       : SCE_KERNEL_ERROR_EINVAL;
     if (ret == 0) *res = addr;
     hle_ret_s32(c, ret);
