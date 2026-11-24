@@ -10,6 +10,12 @@ The [b1152 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/t
 
 Gameplay means player-controlled progress in the tested section. FPS applies to the named hardware, scene and settings. Menus, videos and demonstrations are recorded separately. Earlier milestones remain visible alongside later checks when profiles or test scope differ.
 
+## Older CPU test
+
+**KAGE: Shadow of the Ninja reached 60 FPS on a third-generation Intel Core i5 (Ivy Bridge)** in a project test reported on 24 November 2026. GPU, tested build, scene, and settings are unspecified.
+
+ZeraPS5 detects the host CPU features automatically. When loading game code, it replaces selected instructions the host lacks, including forms of AVX2, BMI1/BMI2, and FMA3, with software routines or sequences supported by the host. [CPU compatibility code in b1152](https://github.com/zeraps5/ZeraPS5-Releases/blob/v0.1.1-b1152/src/cpu/x64_compat.h).
+
 ## Gameplay records
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
