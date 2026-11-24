@@ -2,11 +2,13 @@
 
 ## v0.1.1-b1152 — 24 November 2026 UTC
 
-- Vulkan and shader compatibility updates, including experimental PS4 geometry shader paths and improved render-target and memory handling.
-- Vulkan writeback compares against the same input snapshot uploaded to the GPU, preserving unrelated CPU writes.
-- Runtime and HLE coverage for compression, JSON, dialogs, game memory and additional imports used by tested titles.
-- Read-only support for exFAT images stored inside supported .ffpfsc containers and continued support for nested PFS.
-- Launcher accessory settings for keyboard, mouse, controllers and compatible cameras. Camera features depend on the selected device and supported game configuration.
+- **System libraries (HLE).** Added **125 function exports** across the emulated libraries, counted by library and symbol ID. This includes full or partial implementations and compatibility stubs. Highlights include **5 zlib exports** for decompression and result handling, **4 JPEG encoding exports**, **5 JSON2 exports**, and **5 AJM exports** for MP3 frame parsing and batched audio jobs. The kernel paths also gained flexible-memory release and page-table statistics.
+- **Experimental PS4 compatibility.** Added **21 PS4 Gnm driver exports** within that HLE count. The graphics path now handles selected legacy GCN geometry shaders through an export-shader, geometry-shader, and copy-vertex-shader pipeline on Vulkan.
+- **Camera support on Windows.** Added **7 `libSceCamera` exports**, covering device detection, opening, configuration, capture and frame delivery. The launcher can select a webcam through Windows Media Foundation or a compatible **PS4 Camera** through Sony's USB adapter. The PS4 Camera path can deliver separate feeds from its two lenses. A standard webcam supplies a single feed to both views. Some PS4 Camera setups require WinUSB and user-provided firmware.
+- **Vulkan and shader translation.** Updated **18 graphics source files**, including **6 files in the shader translator**. Changes include relative VGPR addressing (`V_MOVREL`), scalar register analysis for relocation, and wave64 execution-mask handling. The Vulkan writeback path compares GPU results against the exact input snapshot to preserve unrelated CPU writes. Vertex buffers also receive tighter index-range bounds and snapshot handling.
+- **Launcher and updates.** Added an Accessories panel with camera selection and shortcuts to keyboard, mouse and DualSense settings. The Windows updater now retries temporary file-sharing locks when replacing files.
+
+The Windows test suite grew from 190 to 196 checks. The three new Vulkan cases cover vertex snapshots, shader execution masks, and relative register addressing. All 196 checks passed, including 35 GPU checks.
 
 [Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152).
 

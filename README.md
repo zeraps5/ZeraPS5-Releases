@@ -16,7 +16,7 @@
 
 **Current release: v0.1.1-b1152.**
 
-**Vulkan, PS4 shader and runtime compatibility updates.** The [b1152 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) cover GPU writeback, read-only exFAT in supported .ffpfsc images, and launcher accessory settings.
+**b1152 technical highlights.** 125 new HLE function exports, including 21 for PS4 Gnm and 7 for camera support. The build expands experimental PS4 geometry shader handling, adds webcam and PS4 Camera support on Windows, and updates 18 graphics source files, including 6 in shader translation. [Full technical release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152).
 
 **Latest recorded gameplay:** Quake reached the first map at approximately 33–37 FPS on Intel Iris Xe in a 23 November development session. The compatibility list gives the scope and hardware of every record, including earlier runs of Sonic Origins Plus, Sonic Superstars and Quake II.
 
