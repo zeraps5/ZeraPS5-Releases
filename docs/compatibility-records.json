@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "reviewed": "2026-11-15",
-  "current_release": "v0.1.1-b1080",
-  "source_commit": "de3949fe50cece287585ecfbe73d2dafa36b684e",
+  "reviewed": "2026-11-24",
+  "current_release": "v0.1.1-b1152",
+  "source_commit": "c7f3f09daedfb06e04a35195aab5dff9fe4825c1",
   "records": [
     {
       "game": "Alone in the Dark 2 — PS1 classic",
@@ -926,6 +926,36 @@
       "notes": "Opening video with sound, language selection and main menu; New Game/difficulty reaches first-mission loading during a ten-minute test. Rendering was below 1 FPS in the recorded 4K Unreal profile. Branch fixes are integrated into 0.1.1; this is not a new packaged-gameplay result.",
       "section": "menu",
       "evidence": "source-b984-developer"
+    },
+    {
+      "game": "Quake",
+      "title_id": "PPSA01880",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-23 development session",
+      "stage": "Gameplay",
+      "notes": "The first map reached gameplay with HUD and weapon at approximately 33–37 FPS during the 150-second session.",
+      "section": "gameplay",
+      "evidence": "b1152-source-development-records"
+    },
+    {
+      "game": "Plants vs. Zombies: Replanted",
+      "title_id": "PPSA29802",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-23 development session",
+      "stage": "Title and agreement screens",
+      "notes": "Readable user agreement and privacy screens at approximately 58 FPS. The session stopped at the agreements.",
+      "section": "menus",
+      "evidence": "b1152-source-development-records"
+    },
+    {
+      "game": "LEGO Party",
+      "title_id": "PPSA29141",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-23 development session",
+      "stage": "Title screen",
+      "notes": "Reached the LET’S PARTY! title screen at approximately 7–16 FPS in the 150-second session on the 4.xx+ backport.",
+      "section": "menus",
+      "evidence": "b1152-source-development-records"
     }
   ],
   "startup_survey": {
@@ -939,6 +969,7 @@
     "public-history": "Previously published compatibility records retained in docs/compatibility-history-through-b838.md.",
     "source-b898+public-history": "Packaged source record reconciled with the earlier published test history.",
     "candidate-011-rtx": "Dated RTX candidate runs on b974/b981, packaged source COMPATIBILIDADE.md and docs/colaboracao/RELEASE-CANDIDATE-0.1.1-2026-11-15.md; English summary in docs/release-candidate-b984.md. Actual tested builds retained.",
-    "source-b984-developer": "Matching b984 source archive, COMPATIBILIDADE.md: dated Intel game records and the identified earlier RTX homebrew run. No new b984-package or notebook performance measurement inferred."
+    "source-b984-developer": "Matching b984 source archive, COMPATIBILIDADE.md: dated Intel game records and the identified earlier RTX homebrew run. No new b984-package or notebook performance measurement inferred.",
+    "b1152-source-development-records": "Matching b1152 source archive, COMPATIBILIDADE.md, 23 November 2026 Intel Iris Xe entries. The affected rows identify development sessions. The per-session commits are unrecorded."
   }
 }

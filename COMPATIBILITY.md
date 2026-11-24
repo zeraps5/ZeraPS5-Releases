@@ -1,10 +1,10 @@
 # Game compatibility and tested builds
 
-**Current public release [b1080](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) · Game records reviewed 15 November 2026.**
+**Current public release [b1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) · Game records reviewed 24 November 2026.**
 
-**New records: Sonic Origins Plus reaches Green Hill Zone on Intel Iris Xe; Sonic Superstars reaches Bridge Island; Quake II reaches Outer Base with movement and firing on RTX.** Each row names its actual tested revision and hardware.
+**New records on Intel Iris Xe: Quake reached the first map, Plants vs. Zombies: Replanted reached the user agreements, and LEGO Party reached its title screen.** Each row gives the date, hardware and test scope.
 
-The [b1080 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) describe the latest code and automated validation. The game sessions below keep their original test revisions and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
+The [b1152 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) describe the latest code and automated validation. The game sessions below keep their original test revisions and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
 
 [Gameplay](#gameplay-records) · [Scenes](#scene-progress) · [Menus](#menus-and-title-screens) · [Startup](#opening-and-startup-records) · [PS4](#experimental-ps4-records) · [28-session RTX follow-up](#latest-rtx-startup-survey) · [Report a result](CONTRIBUTING.md#compatibility-reports)
 
@@ -14,6 +14,7 @@ Gameplay means player-controlled progress in the tested section. FPS applies to 
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
 | --- | --- | --- | --- | --- |
+| Quake / PPSA01880 | Intel Iris Xe | 2026-11-23 development session | Gameplay | The first map reached gameplay with HUD and weapon at approximately 33–37 FPS during the 150-second session. |
 | Alone in the Dark 2 — PS1 classic / PPSA24515 | Core i5-1235U / Intel Iris Xe | b861 · `540ebaf` · 2026-11-08 | Gameplay | Character movement and combat at about 60 FPS in the tested section. Language selection, opening and text rendering work in this record. |
 | Arkanoid: Eternal Battle / PPSA06328 | Core i5-1235U / Intel Iris Xe | 2026-11-01 developer assessment; per-run build not recorded | Gameplay | RETRO mode recorded. |
 | BUBBLE BOBBLE Sugar Dungeons / PPSA26356 | Ryzen 7 5700G / RTX 5060 Ti 16 GB | Latest RTX startup: b837 · `913a5ec` · 2026-11-06<br>Result below: b756 · `1c4893f` · 2026-11-02 | Gameplay tutorial | Bub responds to controls and reaches Training Room movement/bubble tutorial. FPS not measured. Later b837 startup check stopped at the autosave notice; see the startup survey. RTX startup follow-up: Autosave notice ([survey details](#latest-rtx-startup-survey)). |
@@ -56,6 +57,8 @@ Gameplay means player-controlled progress in the tested section. FPS applies to 
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
 | --- | --- | --- | --- | --- |
+| Plants vs. Zombies: Replanted / PPSA29802 | Intel Iris Xe | 2026-11-23 development session | Title and agreement screens | Readable user agreement and privacy screens at approximately 58 FPS. The session stopped at the agreements. |
+| LEGO Party / PPSA29141 | Intel Iris Xe | 2026-11-23 development session | Title screen | Reached the LET’S PARTY! title screen at approximately 7–16 FPS in the 150-second session on the 4.xx+ backport. |
 | Alone in the Dark (2024) / PPSA08240 | Core i5-1235U / Intel Iris Xe | Latest RTX startup: b837 · `913a5ec` · 2026-11-06<br>Result below: `d9d6194` · 2026-11-06 | Main menu | Continue / New Game / Options visible after an Intel shader issue. RTX b837 survey separately recorded loading. RTX startup follow-up: Loading ([survey details](#latest-rtx-startup-survey)). |
 | Atari 50: The Anniversary Celebration / PPSA08601 | Ryzen 7 5700G / RTX 5060 Ti 16 GB | b837 · `913a5ec` · 2026-11-06 | Gallery / menu | Pong cabinet and gallery text. Minigame controls were not exercised. |
 | Balan Wonderworld / PPSA02058 | Ryzen 7 5700G / RTX 5060 Ti 16 GB | b897 · `a1e7371` · 2026-11-10 | Main menu | Portuguese menus and language selection. New Game produced a black image and repeated ATRAC9 errors in the 182-second run. |
@@ -154,6 +157,8 @@ Three PKG-only folders were excluded by choice. The survey used 27 extracted gam
 </details>
 
 ## Test history and evidence
+
+- [Matching b1152 source archive](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1152/ZeraPS5-v0.1.1-b1152-win64-source.zip) contains the 23 November development records in COMPATIBILIDADE.md.
 
 - [15 November candidate test summary](docs/release-candidate-b984.md) identifies the seven RTX sessions, development records and update validation.
 - [Earlier published records through b838](docs/compatibility-history-through-b838.md) retain the original tests, settings and hardware context.

@@ -14,15 +14,15 @@
 
 ## Download and run
 
-**Current release: v0.1.1-b1080.**
+**Current release: v0.1.1-b1152.**
 
-**Vulkan and runtime compatibility, plus direct PFS image loading.** The [b1080 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) cover Longshot shader and startup changes, R-Type Delta HD audio and input fixes, and read-only loading of supported .ffpfsc images.
+**Vulkan, PS4 shader and runtime compatibility updates.** The [b1152 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) cover GPU writeback, read-only exFAT in supported .ffpfsc images, and launcher accessory settings.
 
-**Earlier recorded gameplay:** Sonic Origins Plus reaches Green Hill Zone on Intel Iris Xe (about 23 FPS at 1080p; 35–38 FPS in the dated 720p internal-resolution follow-up). Sonic Superstars reaches Bridge Island (about 15–16 FPS on Iris Xe). Quake II reaches Outer Base with movement and firing (31–53 FPS, median 43 in the final active window on RTX 5060 Ti, b981). These are measured development scenes, not universal performance promises; the compatibility list retains each actual tested revision and configuration.
+**Latest recorded gameplay:** Quake reached the first map at approximately 33–37 FPS on Intel Iris Xe in a 23 November development session. The compatibility list gives the scope and hardware of every record, including earlier runs of Sonic Origins Plus, Sonic Superstars and Quake II.
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 1080](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1080/ZeraPS5-v0.1.1-b1080-win64.zip)
-- [Download matching source — build 1080](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1080/ZeraPS5-v0.1.1-b1080-win64-source.zip)
+- [Download for Windows x64 — build 1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1152/ZeraPS5-v0.1.1-b1152-win64.zip)
+- [Download matching source — build 1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1152/ZeraPS5-v0.1.1-b1152-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
@@ -30,15 +30,15 @@
 
 ## Game compatibility
 
-**b1080 passed 190 automated Windows checks, including 32 Vulkan GPU checks.** The [release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1080) describe the package validation. Game records retain their tested revisions.
+**b1152 passed 196 automated Windows checks, including 35 GPU checks.** The [release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) describe the package validation. Game records retain their tested revisions.
 
-[Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 15 November 2026, with dated Intel/RTX development and candidate results, each title's actual tested revision, and the preserved startup survey/history.
+[Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 24 November 2026, with dated Intel and RTX sessions, tested revisions where recorded, and the startup survey.
 
 [Technical changelog](CHANGELOG.md) · [Contribute or report a result](CONTRIBUTING.md) · [Matching source revision and checksums](SOURCE-VERSION.txt)
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 
-The default branch includes the b1080 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1080) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
+The default branch includes the b1152 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1152) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
 
 ## Experimental software
 

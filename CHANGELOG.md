@@ -1,5 +1,15 @@
 # Release changelog
 
+## v0.1.1-b1152 — 24 November 2026 UTC
+
+- Vulkan and shader compatibility updates, including experimental PS4 geometry shader paths and improved render-target and memory handling.
+- Vulkan writeback compares against the same input snapshot uploaded to the GPU, preserving unrelated CPU writes.
+- Runtime and HLE coverage for compression, JSON, dialogs, game memory and additional imports used by tested titles.
+- Read-only support for exFAT images stored inside supported .ffpfsc containers and continued support for nested PFS.
+- Launcher accessory settings for keyboard, mouse, controllers and compatible cameras. Camera features depend on the selected device and supported game configuration.
+
+[Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152).
+
 ## v0.1.1-b1080 — 20 November 2026 UTC
 
 - **Vulkan and shader compatibility.** Includes fixes for RADV-generated shaders, texture modes 25 and 26, 8-bit index streams, sub-dword typed buffer loads, and render targets that share guest memory. GPU-only pixels can be restored from R32 to an RGBA8 view without changing their bytes.
