@@ -13,6 +13,7 @@
 #include "base/log.h"
 #include "core/runtime.h"
 #include "core/settings.h"
+#include "gpu/gpu_watch.h"
 #include "hle/hle.h"
 #include "hle/avplayer_timing.h"
 #include "hle/avplayer_picture.h"
@@ -45,7 +46,7 @@ int kernel_fs_resolve(hle_call *c, const char *guest, char *host, size_t host_si
 static bool ps4_title(hle_call *c) {
     static int known = -1;
     if (known < 0) {
-        const loaded_module *m = module_set_main(c->rt->ms);
+        const loaded_module *m = c->rt && c->rt->ms ? module_set_main(c->rt->ms) : NULL;
         known = 0;
         for (uint32_t i = 0; m && i < m->img.import_lib_count; i++)
             if (m->img.import_libs[i].name && !strcmp(m->img.import_libs[i].name, "libSceGnmDriver")) known = 1;
@@ -642,8 +643,10 @@ static void stream_info(hle_call *c, bool ex) {
     uint8_t info[0x68];
     memset(info, 0, sizeof(info));
     /* PS5 stream types: 0 = unknown, 1 = video, 2 = audio. Unity's
-     * PS5Player branches on 1/2; reporting 0 made it ignore the video. */
-    uint32_t t = (uint32_t)type + 1;
+     * PS5Player branches on 1/2; reporting 0 made it ignore the video.
+     * PS4 ones (SceAvPlayerStreamType): 0 = video, 1 = audio, 2 = timed text.
+     * Tearaway Unfolded took its video for sound and never started its intro. */
+    uint32_t t = ps4_title(c) ? (uint32_t)type : (uint32_t)type + 1;
     memcpy(info, &t, 4);
     if (type == 0) {
         uint32_t wh[2] = {p->info.width, p->info.height};
@@ -705,6 +708,9 @@ static bool take_picture(hle_call *c, av_player *p, guest_addr *data, uint64_t *
         guest_addr dst_addr = p->vbuf + p->vbuf_next * p->vbuf_size;
         uint8_t *dst = (uint8_t *)gmem_host(c->mem, dst_addr, p->vbuf_size);
         uint32_t w = p->info.width, h = p->info.height;
+        /* not a guest instruction: the GPU's write tracking would keep the texture of the
+         * buffer's previous picture (Tearaway Unfolded's intro showed only the first, black) */
+        if (dst) gpu_watch_prepare_write(dst_addr, p->vbuf_size);
         if (dst) avp_picture_pack(dst, pic->nv12, w, h, p->pitch, p->plane_h);
         *data = dst_addr;
         *ts_us = pic->pos_us;

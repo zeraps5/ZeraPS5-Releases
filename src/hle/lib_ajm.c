@@ -683,6 +683,64 @@ static void ajm_initialize(hle_call *c) {
 
 static void ajm_ok(hle_call *c) { hle_ret_s32(c, 0); }
 
+/* int sceAjmDecMp3ParseFrame(const u8 *stream, u32 size, int parseOfl, frame *):
+ * frame { u64 frameSize; u32 channels, samplesPerChannel, bitrate, sampleRate, encoderDelay,
+ * numFrames, totalSamples, oflType }. With parseOfl, a Xing/Info tag gives the frame count and
+ * its LAME extension the encoder delay and total samples; a VBRI tag the delay. Layout and
+ * rules as in the AnyPS5 project's Ajm (its MP3 header parser). */
+static void ajm_mp3_parse_frame(hle_call *c) {
+    uint32_t size = hle_arg_u32(c, 1);
+    int parse_ofl = hle_arg_s32(c, 2);
+    const uint8_t *s = hle_arg_ptr(c, 0) && size >= 4 ? (const uint8_t *)hle_mem(c, hle_arg_ptr(c, 0), size) : NULL;
+    uint8_t *f = hle_arg_ptr(c, 3) ? (uint8_t *)hle_mem(c, hle_arg_ptr(c, 3), 40) : NULL;
+    if (!s || !f) { hle_ret_s32(c, AJM_ERR_INVALID_PARAMETER); return; }
+    static const uint32_t rates[4][4] = {{11025, 12000, 8000, 0}, {0}, {22050, 24000, 16000, 0}, {44100, 48000, 32000, 0}};
+    static const uint16_t kbps[4][16] = {{0, 8, 16, 24, 32, 40, 48, 56, 64},
+                                         {0},
+                                         {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
+                                         {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320}};
+    uint32_t h = (uint32_t)s[0] << 24 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 8 | s[3];
+    uint32_t version = (h >> 19) & 3, layer = (h >> 17) & 3;
+    uint32_t rate = rates[version][(h >> 10) & 3], bitrate = kbps[version][(h >> 12) & 15] * 1000u;
+    if ((h >> 21) != 0x7FF || !layer || !rate || !bitrate || (parse_ofl && layer != 1)) {
+        hle_ret_s32(c, AJM_ERR_INVALID_PARAMETER);
+        return;
+    }
+    bool mpeg1 = version == 3, mono = ((h >> 6) & 3) == 3;
+    uint64_t frame_size = (mpeg1 ? 144u : 72u) * bitrate / rate + ((h >> 9) & 1);
+    uint32_t v[8] = {mono ? 1u : 2u, mpeg1 ? 1152u : 576u, bitrate, rate, 0, 0, 0, 0};
+    if (parse_ofl) {
+        size_t end = size < frame_size ? size : (size_t)frame_size;
+        size_t at = mpeg1 ? (mono ? 21 : 36) : (mono ? 13 : 21);
+        if (at + 8 <= end && (!memcmp(s + at, "Xing", 4) || !memcmp(s + at, "Info", 4))) {
+            uint8_t flags = s[at + 7];
+            size_t field = at + 8;
+            uint32_t frames = 0;
+            if ((flags & 1) && field + 4 <= end) {
+                frames = (uint32_t)s[field] << 24 | (uint32_t)s[field + 1] << 16 | (uint32_t)s[field + 2] << 8 | s[field + 3];
+                v[5] = frames;
+            }
+            field += (flags & 1 ? 4 : 0) + (flags & 2 ? 4 : 0) + (flags & 4 ? 100 : 0) + (flags & 8 ? 4 : 0);
+            if (field + 0x18 <= end && !memcmp(s + field, "LAME", 4)) {
+                uint32_t delay = (uint32_t)s[field + 0x15] << 4 | s[field + 0x16] >> 4;
+                uint32_t padding = ((uint32_t)s[field + 0x16] & 15) << 8 | s[field + 0x17];
+                if ((flags & 1) && frames) {
+                    uint64_t samples = (uint64_t)frames * v[1], trim = (uint64_t)delay + padding;
+                    v[6] = samples > trim ? (uint32_t)PS5C_MIN(samples - trim, UINT32_MAX) : 0;
+                }
+                v[4] = v[1] + delay + 529;
+                v[7] = 1; /* LAME */
+            }
+        } else if (end >= 62 && !memcmp(s + 36, "VBRI", 4)) {
+            v[4] = (uint32_t)s[42] << 8 | s[43];
+            v[7] = 2; /* VBRI */
+        }
+    }
+    memcpy(f, &frame_size, 8);
+    memcpy(f + 8, v, 32);
+    hle_ret_s32(c, 0);
+}
+
 /* int sceAjmModuleRegister(ctx, codec, int64_t reserved) */
 static void ajm_module_register(hle_call *c) {
     uint32_t codec = hle_arg_u32(c, 1);
@@ -818,7 +876,7 @@ static void ajm_job_initialize(hle_call *c) {
  * bits 45-47 sideband gapless, format, stream. The input holds (gapless flag) the gapless state to set
  * {u32 total, u16 skip, u16}, then the codec's initialize parameters (R-Type Delta HD: 25 0c 00 00 40 00 00 00
  * fe 10 05 e0 00 00 00 00); the output gets the result, then the gapless state. */
-static void ajm_job_control(hle_call *c) {
+static void control_job(hle_call *c) {
     job_result r = {0};
     uint64_t flags = hle_arg(c, 2), in_size = hle_arg(c, 4), out_size = hle_arg(c, 6);
     bool reset = flags >> 13 & 1, init = flags >> 14 & 1, gapless = flags >> 45 & 1;
@@ -851,6 +909,10 @@ static void ajm_job_control(hle_call *c) {
     memcpy(buf + 4, &r.internal, 4);
     if (hle_arg_ptr(c, 5) && out_size)
         gmem_write(c->mem, hle_arg_ptr(c, 5), buf, out_size < sizeof(buf) ? out_size : sizeof(buf));
+}
+
+static void ajm_job_control(hle_call *c) {
+    control_job(c);
     hle_ret_s32(c, reserve_job(c, hle_arg_ptr(c, 0), JOB_CONTROL_SIZE));
 }
 
@@ -1200,11 +1262,139 @@ static void ajm_at9_parse_config(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
+/* ---- Jobs written into a raw batch buffer (PS4 FMOD: Tearaway Unfolded) ----
+ * As with the BatchInfo calls, a job runs when it is written. The game steps through the
+ * buffer by itself (0x40 bytes a control job, 0x50 a run job) and only submits it to
+ * sceAjmBatchStartBuffer, which then has nothing left to do. Flags as in shadPS4's AjmJobFlags. */
+#define JOB_FLAG_CODEC_INFO (1ull << 11)
+#define JOB_FLAG_MULTIPLE (1ull << 12)
+#define JOB_FLAG_GAPLESS (1ull << 45)
+#define JOB_FLAG_FORMAT (1ull << 46)
+#define JOB_FLAG_STREAM (1ull << 47)
+#define JOB_BUFFER_CONTROL 0x40
+#define JOB_BUFFER_RUN 0x50
+
+/* void *sceAjmBatchJobControlBufferRa(void *buffer, instance, flags, const void *in, size_t in_size,
+ * void *out, size_t out_size, void *return_address): sceAjmBatchJobControl's arguments */
+static void ajm_job_control_buffer(hle_call *c) {
+    guest_addr buf = hle_arg_ptr(c, 0);
+    control_job(c);
+    hle_ret_u64(c, buf ? buf + JOB_BUFFER_CONTROL : 0);
+}
+
+/* The codec's information after a job's result (sceAjmBatchJobGetCodecInfo): up to 24 bytes */
+static void codec_info(const ajm_instance *in, uint8_t *dst) {
+    if (in->codec == CODEC_AT9) {
+        uint32_t v[4] = {in->at9_frame_bytes * in->at9_frames_per_superframe, in->at9_frames_per_superframe,
+                         in->at9_frame_bytes, in->at9_frame_samples};
+        memcpy(dst, v, sizeof(v));
+    } else if (in->codec == CODEC_MP3) {
+        uint32_t h = in->mp3_header;
+        memcpy(dst, &h, 4);
+        dst[4] = (uint8_t)(!((h >> 16) & 1));
+        dst[5] = (uint8_t)((h >> 6) & 3);
+        dst[6] = (uint8_t)((h >> 4) & 3);
+        dst[7] = (uint8_t)((h >> 3) & 1);
+        dst[8] = (uint8_t)((h >> 2) & 1);
+        dst[9] = (uint8_t)(h & 3);
+    } else if (in->codec == CODEC_OPUS) {
+        memcpy(dst, &in->opus_frames_per_packet, 4);
+    }
+}
+
+/* void *sceAjmBatchJobRunBufferRa(void *buffer, instance, flags, const void *in, size_t in_size, void *out,
+ * size_t out_size, void *sideband, size_t sideband_size, void *return_address). The sideband holds the
+ * result, then by flag: stream {consumed, written, u64 samples}, format {channels, mask, rate, encoding,
+ * 8 reserved bytes}, gapless {u32 total, u16 skip, u16 skipped}, frames {u32, u32}, codec information. */
+static void ajm_job_run_buffer(hle_call *c) {
+    guest_addr buf = hle_arg_ptr(c, 0), in_addr = hle_arg_ptr(c, 3), out_addr = hle_arg_ptr(c, 5), sb = hle_arg_ptr(c, 7);
+    uint64_t flags = hle_arg(c, 2), in_size = hle_arg(c, 4), out_size = hle_arg(c, 6), sb_size = hle_arg(c, 8);
+    uint32_t id = hle_arg_u32(c, 1);
+    job_result r = {0};
+    uint8_t side[96];
+    memset(side, 0, sizeof(side));
+    size_t n = 8;
+    pal_mutex_lock(g_ajm.lock);
+    ajm_instance *in = find(id);
+    if (!in) r.result = RES_INVALID_PARAMETER;
+    else if (in_size || out_size) run_decode(c, id, in_addr, in_size, out_addr, out_size, (flags & JOB_FLAG_MULTIPLE) != 0, &r);
+    if (flags & JOB_FLAG_STREAM) {
+        int32_t consumed = (int32_t)(r.consumed > 0x7FFFFFFF ? 0x7FFFFFFF : r.consumed);
+        int32_t written = (int32_t)(r.written > 0x7FFFFFFF ? 0x7FFFFFFF : r.written);
+        uint64_t total = in ? in->total_samples : 0;
+        memcpy(side + n, &consumed, 4);
+        memcpy(side + n + 4, &written, 4);
+        memcpy(side + n + 8, &total, 8);
+        n += 16;
+    }
+    if (flags & JOB_FLAG_FORMAT) {
+        uint32_t v[6] = {0};
+        if (in) v[0] = in->channels, v[1] = channel_mask(in->channels), v[2] = in->rate, v[3] = in->encoding;
+        memcpy(side + n, v, sizeof(v));
+        n += 24;
+    }
+    if (flags & JOB_FLAG_GAPLESS) {
+        if (in) {
+            memcpy(side + n, &in->g_cur.total, 4);
+            memcpy(side + n + 4, &in->g_cur.skip, 2);
+            memcpy(side + n + 6, &in->g_cur.skipped, 2);
+        }
+        n += 8;
+    }
+    if (flags & JOB_FLAG_MULTIPLE) {
+        memcpy(side + n, &r.frames, 4);
+        n += 8;
+    }
+    if (flags & JOB_FLAG_CODEC_INFO) {
+        if (in) codec_info(in, side + n);
+        n += 24;
+    }
+    pal_mutex_unlock(g_ajm.lock);
+    memcpy(side, &r.result, 4);
+    memcpy(side + 4, &r.internal, 4);
+    if (sb && sb_size) gmem_write(c->mem, sb, side, sb_size < n ? sb_size : n);
+    static uint32_t logged;
+    if (logged++ < 8)
+        LOG_I(HLE, "sceAjmBatchJobRunBufferRa(0x%x, flags 0x%llx, in %llu, out %llu, sideband %llu) -> 0x%x, consumed %llu written %llu",
+              id, (unsigned long long)flags, (unsigned long long)in_size, (unsigned long long)out_size,
+              (unsigned long long)sb_size, (unsigned)r.result, (unsigned long long)r.consumed, (unsigned long long)r.written);
+    hle_ret_u64(c, buf ? buf + JOB_BUFFER_RUN : 0);
+}
+
+/* void *sceAjmBatchJobInlineBuffer(void *buffer, const void *data, size_t size, void **data_in_batch):
+ * the data copied into the batch after an 8-byte header */
+static void ajm_job_inline_buffer(hle_call *c) {
+    guest_addr buf = hle_arg_ptr(c, 0), data = hle_arg_ptr(c, 1), out = hle_arg_ptr(c, 3);
+    uint64_t size = hle_arg(c, 2);
+    const void *src = size ? gmem_host(c->mem, data, size) : NULL;
+    if (!buf || (size && !src)) {
+        hle_ret_u64(c, 0);
+        return;
+    }
+    if (size) gmem_write(c->mem, buf + 8, src, size);
+    guest_addr at = buf + 8;
+    if (out) gmem_write(c->mem, out, &at, 8);
+    hle_ret_u64(c, buf + 8 + ((size + 7) & ~7ull));
+}
+
+/* int sceAjmBatchStartBuffer(ctx, const void *batch, size_t size, int priority, SceAjmBatchError *error,
+ * SceAjmBatchId *out): the jobs already ran */
+static void ajm_batch_start_buffer(hle_call *c) {
+    uint8_t zero[32] = {0};
+    if (hle_arg_ptr(c, 4)) gmem_write(c->mem, hle_arg_ptr(c, 4), zero, sizeof(zero));
+    pal_mutex_lock(g_ajm.lock);
+    uint32_t id = ++g_ajm.next_batch;
+    pal_mutex_unlock(g_ajm.lock);
+    if (hle_arg_ptr(c, 5)) gmem_write(c->mem, hle_arg_ptr(c, 5), &id, 4);
+    hle_ret_s32(c, 0);
+}
+
 #define A "libSceAjm"
 
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(A, "sceAjmInitialize", ajm_initialize),
     HLE_FUNC_ENTRY(A, "sceAjmFinalize", ajm_ok),
+    HLE_FUNC_ENTRY(A, "sceAjmDecMp3ParseFrame", ajm_mp3_parse_frame),
     HLE_FUNC_ENTRY(A, "sceAjmModuleRegister", ajm_module_register),
     HLE_FUNC_ENTRY(A, "sceAjmModuleUnregister", ajm_ok),
     HLE_FUNC_ENTRY(A, "sceAjmMemoryRegister", ajm_ok),
@@ -1227,7 +1417,11 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobSetResampleParameters", ajm_job_set_resample),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobSetResampleParametersEx", ajm_job_set_resample_ex),
     HLE_FUNC_ENTRY(A, "sceAjmBatchJobGetResampleInfo", ajm_job_get_resample_info),
+    HLE_FUNC_ENTRY(A, "sceAjmBatchJobControlBufferRa", ajm_job_control_buffer),
+    HLE_FUNC_ENTRY(A, "sceAjmBatchJobRunBufferRa", ajm_job_run_buffer),
+    HLE_FUNC_ENTRY(A, "sceAjmBatchJobInlineBuffer", ajm_job_inline_buffer),
     HLE_FUNC_ENTRY(A, "sceAjmBatchStart", ajm_batch_start),
+    HLE_FUNC_ENTRY(A, "sceAjmBatchStartBuffer", ajm_batch_start_buffer),
     HLE_FUNC_ENTRY(A, "sceAjmBatchWait", ajm_batch_wait),
     HLE_FUNC_ENTRY(A, "sceAjmBatchCancel", ajm_ok),
     HLE_FUNC_ENTRY(A, "sceAjmBatchErrorDump", ajm_batch_error_dump),

@@ -54,12 +54,42 @@ static uint32_t g_pimp_extra[SH_MAX_SITES];
 /* The imported buffer and offset that show guest [addr, addr + range), or VK_NULL_HANDLE.
  * shiftable: the shader adds a distance to its offsets, so a binding may start up to
  * align - 4 bytes before addr (*extra); otherwise addr must sit on the alignment. */
+/* The VMAs binds found lately, valid while the mapping generation stays (every map, unmap and
+ * protect moves it under the map lock): Minecraft binds ~30k ranges a second, and the locked
+ * query of each one contended with the game's threads (28% of the GPU thread in its loading). */
+#define PIMP_VMA_CACHE 8
+static struct { uint64_t gen; uint32_t next; gmem_vma v[PIMP_VMA_CACHE]; bool ok[PIMP_VMA_CACHE]; } g_pimp_vmas;
+static bool phys_import_vma(renderer *r, guest_addr addr, gmem_vma *out) {
+    uint64_t gen = __atomic_load_n(&r->mem->mapping_generation, __ATOMIC_ACQUIRE);
+    if (gen != g_pimp_vmas.gen) {
+        memset(g_pimp_vmas.ok, 0, sizeof(g_pimp_vmas.ok));
+        g_pimp_vmas.gen = gen;
+    }
+    for (uint32_t i = 0; i < PIMP_VMA_CACHE; i++)
+        if (g_pimp_vmas.ok[i] && addr >= g_pimp_vmas.v[i].start && addr - g_pimp_vmas.v[i].start < g_pimp_vmas.v[i].size) {
+            *out = g_pimp_vmas.v[i];
+            return true;
+        }
+    if (!gmem_query_vma(r->mem, addr, false, out)) return false;
+    if (addr < out->start || addr - out->start >= out->size) return true; /* a hole: not kept */
+    uint32_t k = g_pimp_vmas.next++ % PIMP_VMA_CACHE;
+    g_pimp_vmas.v[k] = *out;
+    g_pimp_vmas.ok[k] = true;
+    return true;
+}
+
 static VkBuffer phys_import_bind(renderer *r, guest_addr addr, uint64_t range, VkDeviceSize align, bool shiftable,
                                  VkDeviceSize *offset, uint32_t *extra) {
     *extra = 0;
     gmem_vma v;
-    if (!gmem_query_vma(r->mem, addr, false, &v) || v.kind != GVMA_VIEW || v.reserved || v.demand ||
+    if (!phys_import_vma(r, addr, &v) || v.kind != GVMA_VIEW || v.reserved || v.demand ||
         !(v.prot & GPROT_READ) || addr < v.start || addr + range > v.start + v.size) {
+        static uint32_t told;
+        if (getenv("PS5C_PHYS_IMPORT_WHY") && told++ < 24)
+            LOG_I(GPU, "direct memory import outside a view: 0x%llx + %llu in [0x%llx + %llu] kind %u%s%s%s prot %x '%s'",
+                  (unsigned long long)addr, (unsigned long long)range, (unsigned long long)v.start,
+                  (unsigned long long)v.size, v.kind, v.reserved ? " reserved" : "", v.demand ? " demand" : "",
+                  v.flexible ? " flexible" : "", v.prot, v.name);
         g_pimp.outside++;
         return VK_NULL_HANDLE;
     }
@@ -98,8 +128,14 @@ static VkBuffer phys_import_bind(renderer *r, guest_addr addr, uint64_t range, V
     return e->buffer.buffer;
 }
 
+static uint64_t g_pimp_mis[64];
 static void phys_import_stats(void) {
     if (g_pimp.on <= 0) return;
+    char ml[400]; int mn = 0;
+    for (int k = 0; k < 64 && mn < 360; k++)
+        if (g_pimp_mis[k]) mn += snprintf(ml + mn, sizeof(ml) - (size_t)mn, " st%d/k%d/e%d %llu", k / 8, (k / 2) & 3, k & 1, (unsigned long long)g_pimp_mis[k]);
+    if (mn) LOG_I(GPU, "direct memory reads misaligned by stage/kind/eligible:%s", ml);
+    memset(g_pimp_mis, 0, sizeof(g_pimp_mis));
     LOG_I(GPU, "direct memory reads: %llu bound (%llu shifted), %.1f MiB not copied; copied instead: %llu misaligned, %llu outside views, %llu failed, %llu over the limit",
           (unsigned long long)g_pimp.hits, (unsigned long long)g_pimp.shifted, g_pimp.bytes / 1048576.0, (unsigned long long)g_pimp.misaligned,
           (unsigned long long)g_pimp.outside, (unsigned long long)g_pimp.failed, (unsigned long long)g_pimp.full);

@@ -13,6 +13,7 @@
 #include "base/log.h"
 #include "core/runtime.h"
 #include "core/settings.h"
+#include "cpu/x64_compat.h"
 #include "hle/hle.h"
 #include "hle/kernel_objects.h"
 #include "pal/pal.h"
@@ -105,11 +106,14 @@ static void get_process_time_counter(hle_call *c) {
 
 static void get_process_time_counter_frequency(hle_call *c) { hle_ret_u64(c, 1000000000ull); }
 
-/* The TSC: the host's, since guest code may also read it with rdtsc; its
- * rate is measured once against the host clock (Astro Bot divides by it) */
-static void read_tsc(hle_call *c) { hle_ret_u64(c, __rdtsc()); }
+static void read_tsc(hle_call *c) { hle_ret_u64(c, x64_guest_tsc_read()); }
 
 static void get_tsc_frequency(hle_call *c) {
+    if (x64_guest_tsc_enabled()) {
+        hle_ret_u64(c, X64_GUEST_TSC_HZ);
+        return;
+    }
+    /* Native mode calibrates the same host counter that inline code reads. */
     static uint64_t freq;
     if (!freq) {
         uint64_t t0 = pal_time_ns(), c0 = __rdtsc();
@@ -354,6 +358,22 @@ static void get_compiled_sdk_version(hle_call *c) {
     }
     *out = compiled_sdk_version(c);
     hle_ret_s32(c, 0);
+}
+
+/* int sceKernelGetProsperoSystemSwVersion({u64 size; char text[0x1C]; u32 version} *info):
+ * only the text (+8) and version (+0x24) are written, NULL returns 0 (rps5e). We report the
+ * system software the executable was built for: its SDK version, e.g. 0x04508001 "04.508.001". */
+static void get_prospero_system_sw_version(hle_call *c) {
+    guest_addr info = hle_arg_ptr(c, 0);
+    if (!info) {
+        hle_ret_s32(c, 0);
+        return;
+    }
+    uint32_t v = compiled_sdk_version(c);
+    char text[0x1C] = {0};
+    snprintf(text, sizeof(text), "%02x.%03x.%03x", v >> 24, (v >> 12) & 0xFFFu, v & 0xFFFu);
+    bool ok = gmem_write(c->mem, info + 8, text, sizeof(text)) && gmem_write(c->mem, info + 0x24, &v, 4);
+    hle_ret_s32(c, ok ? 0 : SCE_KERNEL_ERROR_EFAULT);
 }
 
 static void exit_(hle_call *c) {
@@ -922,6 +942,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceKernelGetTscFrequency", get_tsc_frequency),
     HLE_FUNC_ENTRY(LIB, "sceKernelUsleep", usleep_),
     HLE_FUNC_ENTRY(LIB, "sceKernelSleep", sleep_),
+    HLE_FUNC_ENTRY("libScePosix", "sleep", sleep_),
     HLE_FUNC_ENTRY(LIB, "usleep", usleep_),
     HLE_FUNC_ENTRY("libScePosix", "usleep", usleep_),
     HLE_FUNC_ENTRY(LIB, "nanosleep", nanosleep_),
@@ -943,6 +964,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceKernelGettimeofday", gettimeofday_),
     HLE_FUNC_ENTRY(LIB, "sceKernelDebugOutText", debug_out_text),
     HLE_FUNC_ENTRY(LIB, "sceKernelGetCompiledSdkVersion", get_compiled_sdk_version),
+    HLE_FUNC_ENTRY(LIB, "sceKernelGetProsperoSystemSwVersion", get_prospero_system_sw_version),
     HLE_FUNC_ENTRY(LIB, "sceKernelIsNeoMode", is_neo_mode),
     /* unnamed: libSceAgc reads the executable's SDK version through it at
      * initialization (a top byte of 4 turns on its SDK 4 title workarounds) */

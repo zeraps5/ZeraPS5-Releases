@@ -347,6 +347,12 @@ void *pal_tls_get(uint32_t slot) { return pthread_getspecific((pthread_key_t)slo
 void pal_thread_get_stack_bounds(pal_stack_bounds *out) { memset(out, 0, sizeof(*out)); }
 void pal_thread_set_stack_bounds(const pal_stack_bounds *b) { PS5C_UNUSED(b); }
 bool pal_thread_prefer_fast_cores(void) { return false; }
+uint64_t pal_thread_cpu_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) ? 0 : (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+bool pal_thread_raise_priority(void) { return false; }
+bool pal_process_full_speed(void) { return false; }
 
 uint32_t pal_tls_slot_gs_offset(uint32_t slot) {
     PS5C_UNUSED(slot);

@@ -64,6 +64,9 @@ void renderer_sync_mem(renderer *r, guest_addr addr, uint64_t size);
 bool renderer_release(renderer *r, gpu *g, const gpu_release *rel);
 /* A guest command buffer starts (the CPU may have written memory since the last one). */
 void renderer_submit_begin(renderer *r);
+/* PS5C_EVAL_PREFETCH: a command buffer was submitted (any thread) / the command processor runs this ticket's */
+void renderer_prefetch_submit(renderer *r, guest_addr addr, uint32_t dwords, uint64_t ticket);
+void renderer_prefetch_running(renderer *r, uint64_t ticket);
 /* The command processor has no more work queued: held releases complete. */
 void renderer_gpu_idle(renderer *r);
 /* Explicit guest suspension: submit and finish all preceding host work. */
@@ -74,6 +77,14 @@ void renderer_wait_idle(renderer *r);
 void renderer_suspend_point(renderer *r);
 /* The command processor writes guest memory now: held releases complete first. */
 void renderer_cp_write(renderer *r);
+/* A flip, a suspend point or the queues going idle (RENDERER_DEFER_*): the work recorded so far is submitted
+ * without waiting; *point is what renderer_complete_deferred waits for (0: nothing is owed to guest memory,
+ * except at a flip). False when the renderer cannot defer it: the caller waits now, as before. */
+enum { RENDERER_DEFER_SUSPEND, RENDERER_DEFER_FLIP, RENDERER_DEFER_IDLE };
+bool renderer_submit_deferred(renderer *r, int kind, uint64_t *point);
+/* Waits (from another thread) until the work submitted up to `point` has completed and its results and the
+ * releases held behind it have reached guest memory. */
+void renderer_complete_deferred(renderer *r, uint64_t point);
 /* Opt-in binding feedback; disabled renderers return false without changing memory. */
 bool renderer_lod_stats(renderer *r,void *out,uint32_t bytes,uint32_t flags);
 bool renderer_sample_counter(renderer *r,uint64_t *value);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Isolated update tests. No GitHub calls, game launch, or process termination."""
-import argparse, contextlib, hashlib, http.server, json, os, pathlib, subprocess, tempfile, threading, zipfile
+import argparse, contextlib, hashlib, http.server, json, os, pathlib, subprocess, sys, tempfile, threading, zipfile
 
 p=argparse.ArgumentParser();p.add_argument('--build',required=True);p.add_argument('--work',required=True)
 a=p.parse_args();build=pathlib.Path(a.build).resolve();work=pathlib.Path(a.work).resolve();work.mkdir(parents=True,exist_ok=True)
@@ -65,6 +65,12 @@ with tempfile.TemporaryDirectory(prefix='update-tests-',dir=work) as temp:
     run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',installer,'-InstallRoot',dest,'-Package',z,'-ExpectedSha256','0'*64],False)
     verify(dest,old,True);passed('reject outer checksum mismatch')
     dest=t/'wrong-build';old=installation(dest);apply(dest,z,False,'-ExpectedBuild','1000');verify(dest,old,True);passed('reject payload build mismatch')
+    # Exercise actual Windows sharing/byte-range locks, including recovery and
+    # an active installer lock. Keep this in the normal distribution gate.
+    lock_work=t/'file-lock-tests'
+    run([sys.executable,root/'tools/test_update_file_locks.py','--installer',installer,'--work',lock_work])
+    for test in json.loads((lock_work/'RESULT.json').read_text(encoding='utf8'))['tests']:
+        passed('Windows file locks: '+test['test'])
     # Native WinHTTP, same parser and SHA implementation the launcher ships.
     requests=[]
     notes=json.loads((root/'frontends/launcher/translations_extra.json').read_text(encoding='utf8'))['Versão experimental. Consulte LEIA-ME e limitações conhecidas.']

@@ -328,6 +328,13 @@ static void node_set_type(guest_addr n, uint32_t type) {
 
 static guest_addr g_defaults[8], g_null_cb, g_null_ctx;
 
+/* Value::setNullAccessCallBack: callbacks of single Values (by the Value's address), taken
+ * before the global one for accesses through that Value */
+#define VALUE_CALLBACKS 32
+static struct {
+    guest_addr value, cb, ctx;
+} g_value_cb[VALUE_CALLBACKS];
+
 static guest_addr default_value(uint32_t type) {
     if (type > 7) type = T_NULL;
     if (!g_defaults[type]) {
@@ -343,6 +350,11 @@ static guest_addr default_value(uint32_t type) {
 /* The Value to return when `parent` has no `type` value to give (lock held, released for the call) */
 static guest_addr null_access(hle_call *c, uint32_t type, guest_addr parent) {
     guest_addr cb = g_null_cb, ctx = g_null_ctx;
+    for (int i = 0; parent && i < VALUE_CALLBACKS; i++)
+        if (g_value_cb[i].value == parent) {
+            cb = g_value_cb[i].cb, ctx = g_value_cb[i].ctx;
+            break;
+        }
     if (cb && c->rt) {
         junlock();
         uint64_t rax = 0;
@@ -694,6 +706,30 @@ static double arg_double(hle_call *c) {
 }
 
 /* Initializer / InitParameter2 { allocator, user data, file buffer size, special float format (+0x18) } */
+/* int Value::setNullAccessCallBack(callback, void *context) */
+static void value_set_null_callback(hle_call *c) {
+    guest_addr v = hle_arg_ptr(c, 0), cb = hle_arg_ptr(c, 1), ctx = hle_arg_ptr(c, 2);
+    int slot = -1;
+    jlock();
+    for (int i = 0; i < VALUE_CALLBACKS; i++) {
+        if (g_value_cb[i].value == v) { slot = i; break; }
+        if (slot < 0 && !g_value_cb[i].value) slot = i;
+    }
+    if (slot >= 0) {
+        g_value_cb[slot].value = cb ? v : 0;
+        g_value_cb[slot].cb = cb;
+        g_value_cb[slot].ctx = ctx;
+    }
+    junlock();
+    static int logged;
+    if (slot < 0 && logged++ < 2) LOG_W(HLE, "Json2: more than %d values with a null access callback", VALUE_CALLBACKS);
+    hle_ret_s32(c, 0);
+}
+
+/* int Value::setSpecialFloatHandler(handler, void *context): NaN and infinities are written in the
+ * InitParameter2 format (setSpecialFloatFormatType); the handler is not called */
+static void value_set_special_float_handler(hle_call *c) { hle_ret_s32(c, 0); }
+
 static void initializer_set_null_callback(hle_call *c) {
     BEGIN(c);
     g_null_cb = hle_arg_ptr(c, 1);
@@ -1285,6 +1321,13 @@ static const hle_export k_exports[] = {
     F("_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", init_param2_set_allocator),
     F("_ZN3sce4Json14InitParameter217setFileBufferSizeEm", init_param2_set_file_buffer_size),
     F("_ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE", init_param2_set_float_format),
+    F("_ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_", value_set_null_callback),
+    F("_ZN3sce4Json5Value22setSpecialFloatHandlerEPFKS1_NS0_12FunctionTypeEdPS2_PvPbES5_", value_set_special_float_handler),
+    /* wrong types and missing elements go to the null access callback, as described at the top */
+    F("_ZN3sce4Json5Value22setTypeMismatchHandlerEPFRKS1_NS0_9ValueTypeEPS2_S5_PvES6_", value_set_special_float_handler),
+    F("_ZN3sce4Json5Value30setElementAccessFailureHandlerEPFviPKNS0_6StringEPKmPKS1_S8_PvES9_", value_set_special_float_handler),
+    /* MemAllocator::notifyError(int, size_t, void *): the base class does nothing */
+    F("_ZN3sce4Json12MemAllocator11notifyErrorEimPv", value_set_special_float_handler),
     F("_ZN3sce4Json17InitParameterRttiC1EPNS0_14AllocParamRttiEPvm", init_param_rtti_ctor),
     F("_ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv", init_param2_set_allocator),
     /* Value */

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "mem/gmem.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,36 @@ struct gmem_history {
 };
 
 static void trace_memory_locked(gmem *m, const char *phase, guest_addr changed_addr, uint64_t changed_size);
+
+/* PS5C_KMEM_STATS=1: where the mapping changes spend their time (gmem_stats_line) */
+enum { GS_LOCK, GS_PIN, GS_SPLIT, GS_VIEW, GS_UNVIEW, GS_MERGE, GS_COW, GS_COUNT };
+static const char *const k_gs_names[GS_COUNT] = {"map lock wait", "pin wait", "host split", "host view",
+                                                 "host unview", "host merge", "tracker release"};
+static _Atomic uint64_t g_gs_n[GS_COUNT], g_gs_ns[GS_COUNT], g_gs_max[GS_COUNT];
+static bool gs_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("PS5C_KMEM_STATS") && atoi(getenv("PS5C_KMEM_STATS"));
+    return on;
+}
+static uint64_t gs_t0(void) { return gs_on() ? pal_time_ns() : 0; }
+static void gs_add(int id, uint64_t t0) {
+    if (!t0) return;
+    uint64_t ns = pal_time_ns() - t0, mx = atomic_load(&g_gs_max[id]);
+    atomic_fetch_add(&g_gs_n[id], 1);
+    atomic_fetch_add(&g_gs_ns[id], ns);
+    while (ns > mx && !atomic_compare_exchange_weak(&g_gs_max[id], &mx, ns)) {}
+}
+int gmem_stats_line(char *buf, size_t size) {
+    int n = 0;
+    for (int i = 0; i < GS_COUNT; i++) {
+        uint64_t calls = atomic_exchange(&g_gs_n[i], 0), t = atomic_exchange(&g_gs_ns[i], 0);
+        uint64_t mx = atomic_exchange(&g_gs_max[i], 0);
+        if (calls && n < (int)size - 1)
+            n += snprintf(buf + n, size - (size_t)n, " %s %llu/%.1fms (max %.2f);", k_gs_names[i],
+                          (unsigned long long)calls, t / 1e6, mx / 1e6);
+    }
+    return n;
+}
 
 /* Caller holds the map lock. No file logging on the mapping hot path. */
 static void record_map_locked(gmem *m, const char *op, guest_addr addr, uint64_t size,
@@ -315,7 +346,9 @@ void gmem_unpin_mappings(gmem *m) {
 static void mapping_write_wait(gmem *m) {
     __atomic_add_fetch(&m->mapping_writers, 1, __ATOMIC_SEQ_CST);
     bool waited = false;
+    uint64_t pt = __atomic_load_n(&m->mapping_pins, __ATOMIC_SEQ_CST) ? gs_t0() : 0;
     while (__atomic_load_n(&m->mapping_pins, __ATOMIC_SEQ_CST)) pal_cond_wait(m->mapping_idle, m->lock), waited = true;
+    gs_add(GS_PIN, pt);
     /* Conservative invalidation also covers a mutation that later fails after
      * changing part of a range. No borrowed pointer may span this generation. */
     __atomic_add_fetch(&m->mapping_generation, 1, __ATOMIC_SEQ_CST);
@@ -416,6 +449,12 @@ static void changed(guest_addr addr, uint64_t size) {
         g_demand_done[b >> 3] &= (uint8_t)~(1u << (b & 7));
     }
     if (g_change_hook) g_change_hook(addr, size);
+}
+
+void gmem_note_change(gmem *m, guest_addr addr, uint64_t size) {
+    pal_mutex_lock(m->lock);
+    changed(addr, size);
+    pal_mutex_unlock(m->lock);
 }
 
 /* Index of the first VMA whose end is above `addr` (VMAs are sorted and disjoint). */
@@ -526,7 +565,9 @@ static ps5c_err ph_carve(gmem *m, guest_addr a, uint64_t size) {
     guest_addr r0, r1;
     free_run(m, a, a + size, &r0, &r1);
     if (r0 == a && r1 == a + size) return PS5C_OK;
+    uint64_t ht = gs_t0();
     ps5c_err err = pal_ph_split(host_ptr(m, a), size);
+    gs_add(GS_SPLIT, ht);
     if (err != PS5C_OK)
         LOG_E(MEM, "placeholder split 0x%llx+0x%llx (run 0x%llx-0x%llx) failed", (unsigned long long)a,
               (unsigned long long)size, (unsigned long long)r0, (unsigned long long)r1);
@@ -537,14 +578,18 @@ static ps5c_err ph_carve(gmem *m, guest_addr a, uint64_t size) {
 static void ph_merge(gmem *m, guest_addr a, guest_addr b) {
     guest_addr r0, r1;
     free_run(m, a, b, &r0, &r1);
+    uint64_t ht = gs_t0();
     pal_ph_coalesce(host_ptr(m, r0), r1 - r0); /* fails harmlessly when it is one placeholder already */
+    gs_add(GS_MERGE, ht);
 }
 
 /* Backs the carved placeholder [a, a + size): a view of phys, or private memory. */
 static ps5c_err ph_back(gmem *m, guest_addr a, uint64_t size, uint32_t prot, bool view, uint64_t phys, bool demand) {
     ps5c_err err = ph_carve(m, a, size);
     if (err != PS5C_OK) return err;
+    uint64_t ht = gs_t0();
     err = view ? pal_ph_map_view(m->shm, phys, host_ptr(m, a), size, prot, demand) : pal_ph_alloc(host_ptr(m, a), size, prot);
+    gs_add(GS_VIEW, ht);
     if (err != PS5C_OK) {
         if (err == PS5C_ERR_NOMEM) /* a large view is then tried again, committed as it is used */
             LOG_W(MEM, "%s 0x%llx+0x%llx: out of host memory", view ? "view" : "placeholder memory",
@@ -601,9 +646,13 @@ static ps5c_err ph_release_unit(gmem *m, guest_addr os_base, guest_addr addr, gu
     if (g_release_hook) { /* only views reach here: preserve the COW tracker's private pages */
         uint8_t *win = phys_window(m);
         stopped = g_world_stop && g_alias_hook && g_alias_hook(os_base, os_size) && g_world_stop(g_world_user);
+        uint64_t ct = gs_t0();
         g_release_hook(os_base, os_size, win ? win + phys : NULL);
+        gs_add(GS_COW, ct);
     }
+    uint64_t ut = gs_t0();
     ps5c_err result=pal_ph_unmap_view(host_ptr(m,os_base));
+    gs_add(GS_UNVIEW, ut);
     if(result!=PS5C_OK) {
         if (stopped) g_world_resume(g_world_user);
         return result;
@@ -698,7 +747,9 @@ static ps5c_err map_common(gmem *m, guest_addr addr, uint64_t size, uint64_t ali
     if (align & (align - 1)) return PS5C_ERR_INVALID;
     size = PS5C_ALIGN_UP(size, GUEST_PAGE_SIZE);
     ps5c_err err = PS5C_OK;
+    uint64_t lt = gs_t0();
     pal_mutex_lock(m->lock);
+    gs_add(GS_LOCK, lt);
     /* The game's own reserve + map pairs (Minecraft: ~1-2k a second while a
      * world loads) waited for the GPU's pin at every draw, and it for them. */
     mapping_place_wait(m, !(flags & GMAP_FIXED), addr, size);
@@ -870,7 +921,9 @@ static ps5c_err protect_range(gmem *m, guest_addr addr, uint64_t size, uint32_t 
         return PS5C_ERR_INVALID;
     }
     size = PS5C_ALIGN_UP(size, GUEST_PAGE_SIZE);
+    uint64_t lt = gs_t0();
     pal_mutex_lock(m->lock);
+    gs_add(GS_LOCK, lt);
     mapping_write_wait(m);
     ps5c_err err = PS5C_OK;
     /* Whole range must be mapped with no holes. */
@@ -945,6 +998,21 @@ ps5c_err gmem_protect(gmem *m, guest_addr addr, uint64_t size, uint32_t prot) {
     return protect_range(m, addr, size, prot, false);
 }
 
+ps5c_err gmem_release_flexible(gmem *m, guest_addr addr, uint64_t size) {
+    if (addr % GUEST_PAGE_SIZE || size % GUEST_PAGE_SIZE || addr > UINT64_MAX - size) return PS5C_ERR_INVALID;
+    if (!size) return PS5C_OK;
+    pal_mutex_lock(m->lock);
+    ps5c_err err = PS5C_OK;
+    if (flexible_used_locked(m, addr, size)) {
+        mapping_write_wait(m);
+        if (!split_at(m, addr) || !split_at(m, addr + size)) err = PS5C_ERR_NOMEM;
+        for (size_t i = lower_bound(m, addr); err == PS5C_OK && i < m->vmas.len && m->vmas.data[i].start < addr + size; i++)
+            m->vmas.data[i].flexible = false;
+    }
+    pal_mutex_unlock(m->lock);
+    return err;
+}
+
 ps5c_err gmem_protect_title_image(gmem *m, guest_addr addr, uint64_t size, uint32_t prot) {
     return protect_range(m, addr, size, prot, prot != GPROT_NONE);
 }
@@ -968,6 +1036,23 @@ bool gmem_is_mapped(gmem *m, guest_addr addr, uint64_t size) {
     bool ok = is_mapped_locked(m, addr, size);
     pal_mutex_unlock(m->lock);
     return ok;
+}
+
+bool gmem_hole(gmem *m, guest_addr addr, guest_addr *lo, guest_addr *hi, uint64_t *generation) {
+    pal_mutex_lock(m->lock);
+    size_t i = lower_bound(m, addr); /* the first VMA ending after addr */
+    bool hole = true;
+    if (i < m->vmas.len && m->vmas.data[i].start <= addr) {
+        const gmem_vma *v = &m->vmas.data[i];
+        hole = v->reserved;
+        *lo = v->start, *hi = v->start + v->size;
+    } else {
+        *lo = i ? m->vmas.data[i - 1].start + m->vmas.data[i - 1].size : 0;
+        *hi = i < m->vmas.len ? m->vmas.data[i].start : UINT64_MAX;
+    }
+    *generation = __atomic_load_n(&m->mapping_generation, __ATOMIC_SEQ_CST);
+    pal_mutex_unlock(m->lock);
+    return hole;
 }
 
 /* Host-side copies may run with the map lock held: commit their exact requested
@@ -1164,7 +1249,9 @@ ps5c_err gmem_unmap(gmem *m, guest_addr addr, uint64_t size) {
     if (addr % GUEST_PAGE_SIZE || size == 0 || addr < m->res_start || addr > m->res_end - size) {
         return PS5C_ERR_INVALID;
     }
+    uint64_t lt = gs_t0();
     pal_mutex_lock(m->lock);
+    gs_add(GS_LOCK, lt);
     mapping_write_wait(m);
     ps5c_err err = unmap_locked(m, addr, size);
     pal_mutex_unlock(m->lock);

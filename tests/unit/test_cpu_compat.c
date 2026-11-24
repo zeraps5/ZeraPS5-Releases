@@ -5,6 +5,7 @@
 #include "test.h"
 static bool compat_off;
 static bool compat_auto;
+static bool guest_tsc;
 
 /* Assemble native reference instructions without enabling AVX2 for the host
  * binary. Both runs execute the same bytes, before/after the guest patcher.
@@ -54,6 +55,13 @@ VECTOR(f_fma, "vfmadd213ps %ymm0,%ymm1,%ymm2");
 VECTOR(f_extract, "vextracti128 $1,%ymm0,%xmm2");
 VECTOR(f_gather, "vpgatherdd %ymm1,(%rcx,%ymm0,4),%ymm2");
 
+#define TSC_FIXTURE(name, insn) FIXTURE(name, \
+    "mov %rcx,%r8\nmov $-1,%rax\nmov %rax,%rcx\nmov %rax,%rdx\nstc\npushfq\npop %r9\n" \
+    insn "\nmov %rax,(%r8)\nmov %rdx,8(%r8)\nmov %rcx,16(%r8)\npushfq\npop %r10\n" \
+    "mov %r9,24(%r8)\nmov %r10,32(%r8)")
+TSC_FIXTURE(f_rdtsc, "rdtsc");
+TSC_FIXTURE(f_rdtscp, "rdtscp");
+
 typedef void (*fixture_fn)(uint64_t *);
 typedef struct fixture { const char *name; const unsigned char *start, *end; } fixture;
 #define ENTRY(name) {#name, name, name##_end}
@@ -69,6 +77,40 @@ static uint64_t seed = 0x123456789abcdef0ull;
 static uint64_t random64(void) { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; }
 
 static bool fault(void *unused, pal_fault_info *info) { (void)unused; return x64_compat_fault(info); }
+
+static void guest_tsc_instructions(void) {
+    gmem m;
+    gmem_config cfg = gmem_default_config();
+    CHECK(gmem_init(&m, &cfg) == PS5C_OK);
+    guest_addr code = 0;
+    CHECK(gmem_map(&m, 0, GUEST_PAGE_SIZE, GPROT_RW | GPROT_EXEC, 0, "TSC fixtures", &code) == PS5C_OK);
+    uint8_t *p = gmem_host(&m, code, GUEST_PAGE_SIZE);
+    const fixture tsc[] = {ENTRY(f_rdtsc), ENTRY(f_rdtscp)};
+    enum { STRIDE = 64 };
+    memset(p, 0x90, GUEST_PAGE_SIZE);
+    CHECK(pal_fault_handler_install(fault, NULL) == PS5C_OK);
+    for (unsigned i = 0; i < PS5C_ARRAY_COUNT(tsc); i++) {
+        size_t size = (size_t)(tsc[i].end - tsc[i].start);
+        CHECK(size <= STRIDE);
+        void *entry = p + i * STRIDE;
+        memcpy(entry, tsc[i].start, size);
+        x64_compat_patch(&m, tsc[i].name, code + i * STRIDE, STRIDE, code + GUEST_PAGE_SIZE);
+        CHECK(memcmp(entry, tsc[i].start, size) != 0);
+        fixture_fn fn;
+        memcpy(&fn, &entry, sizeof(fn));
+        uint64_t out[5] = {0};
+        uint64_t before = x64_guest_tsc_read();
+        fn(out);
+        uint64_t after = x64_guest_tsc_read();
+        CHECK(out[0] <= UINT32_MAX && out[1] <= UINT32_MAX);
+        uint64_t ticks = out[0] | (out[1] << 32);
+        CHECK(before <= ticks && ticks <= after);
+        CHECK(i == 0 ? out[2] == UINT64_MAX : out[2] <= UINT32_MAX);
+        CHECK(out[3] == out[4] && (out[4] & 1));
+    }
+    CHECK(pal_fault_handler_install(NULL, NULL) == PS5C_OK);
+    gmem_free(&m);
+}
 
 static void differential(bool off) {
     __builtin_cpu_init();
@@ -144,6 +186,22 @@ static void decoder(void) {
     const uint8_t rip[] = {0x48,0x8b,0x05,0x10,0,0,0};
     CHECK(x64_decode(rip,sizeof(rip),&in));
     CHECK(in.rip_rel && in.disp_off == 3 && in.disp == 16 && in.len == 7);
+    const uint8_t rdtsc[] = {0x0f, 0x31};
+    const uint8_t rdtscp[] = {0x0f, 0x01, 0xf9};
+    CHECK(x64_decode(rdtsc, sizeof(rdtsc), &in) && x64_compat_set(&in) == X64_SET_TSC);
+    CHECK(x64_decode(rdtscp, sizeof(rdtscp), &in) && x64_compat_set(&in) == X64_SET_TSC);
+}
+
+static void virtual_clock(void) {
+    CHECK(pal_init() == PS5C_OK);
+    CHECK(x64_guest_tsc_enabled());
+    uint64_t before = pal_time_ns();
+    uint64_t ticks = x64_guest_tsc_read();
+    uint64_t after = pal_time_ns();
+    CHECK(before * 8 / 5 <= ticks && ticks <= after * 8 / 5);
+#if defined(__GNUC__) && defined(__x86_64__) && defined(_WIN32)
+    guest_tsc_instructions();
+#endif
 }
 
 static void execution(void) {
@@ -154,12 +212,17 @@ static void execution(void) {
 }
 
 int main(int argc, char **argv) {
-    compat_off = argc > 1 && !strcmp(argv[1], "--off");
+    guest_tsc = argc > 1 && !strcmp(argv[1], "--guest-tsc");
+    compat_off = guest_tsc || (argc > 1 && !strcmp(argv[1], "--off"));
     compat_auto = argc > 1 && !strcmp(argv[1], "--auto");
 #ifdef _WIN32
     _putenv_s("PS5C_CPU_COMPAT", compat_auto ? "" : compat_off ? "off" : "ivb");
     _putenv_s("PS5C_CPU_COMPAT_TRAPALL", argc > 1 && !strcmp(argv[1], "--trap") ? "1" : "");
 #endif
+    if (guest_tsc) {
+        const test_case clock_tests[] = {{"guest TSC rate and instruction state", virtual_clock}};
+        return test_run_all("guest_tsc", clock_tests, PS5C_ARRAY_COUNT(clock_tests));
+    }
     const test_case tests[] = {{"decoder bounds and operands", decoder}, {"native/compatible execution", execution}};
     return test_run_all("cpu_compat", tests, PS5C_ARRAY_COUNT(tests));
 }

@@ -8,6 +8,11 @@
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>
 #endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 #include "base/log.h"
 #include "core/settings.h"
@@ -354,6 +359,11 @@ static bool lane_count(const x64_insn *in) { /* shift by an xmm count: the same 
 }
 
 uint32_t x64_compat_set(const x64_insn *in) {
+    if (!in->vex && in->map == 1 &&
+        ((in->op == 0x31 && in->len == 2) ||
+         (in->op == 0x01 && in->len == 3 && in->mod == 3 && in->reg == 7 && in->rm == 1))) {
+        return X64_SET_TSC;
+    }
     if (in->seg == 0x64 || in->seg == 0x65) return 0; /* thread-pointer forms: not seen, not handled */
     if (in->vex) {
         if (avx2_kind(in)) return X64_SET_AVX2;
@@ -762,8 +772,47 @@ static void exec_avx2_c(const x64_insn *in, uint64_t pc, cpu_state *s) {
 
 typedef void (COMPAT_ABI *lane_kernel)(uint8_t (*ymm)[32], const void *mem);
 
+bool x64_guest_tsc_enabled(void) {
+    static int mode;
+    int value = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+    if (!value) {
+        const char *env = getenv("PS5C_GUEST_TSC");
+        value = env && !strcmp(env, "1") ? 1 : -1;
+        __atomic_store_n(&mode, value, __ATOMIC_RELAXED);
+        if (value > 0) LOG_I(CPU, "guest TSC: %llu Hz", X64_GUEST_TSC_HZ);
+    }
+    return value > 0;
+}
+
+static uint64_t guest_tsc_ticks(void) {
+    uint64_t ns = pal_time_ns();
+    /* 1.6 ticks per nanosecond, without overflowing the multiplication. */
+    return (ns / 5) * 8 + (ns % 5) * 8 / 5;
+}
+
+uint64_t x64_guest_tsc_read(void) {
+    return x64_guest_tsc_enabled() ? guest_tsc_ticks() : __rdtsc();
+}
+
 static bool exec_insn(const x64_insn *in, uint64_t pc, cpu_state *s, const void *kernel) {
     uint32_t set = x64_compat_set(in);
+    if (set == X64_SET_TSC) {
+        if (in->op == 0x01) {
+            unsigned aux = 0;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+            unsigned a, b, c, d;
+            if (__get_cpuid(0x80000001, &a, &b, &c, &d) && (d & (1u << 27)))
+                (void)__rdtscp(&aux);
+#else
+            (void)__rdtscp(&aux);
+#endif
+            s->gpr[1] = aux;
+        }
+        uint64_t ticks = guest_tsc_ticks();
+        s->gpr[0] = (uint32_t)ticks;
+        s->gpr[2] = (uint32_t)(ticks >> 32);
+        return true;
+    }
     if (set == X64_SET_AVX2) {
         if (!s->ymm) return false;
         if (avx2_kind(in) == AVX2_C) {
@@ -1249,6 +1298,7 @@ static int cmp_ret(const void *a, const void *b) {
 
 void x64_compat_patch(gmem *mem, const char *module, guest_addr code, uint64_t size, guest_addr near_hint) {
     uint32_t missing = x64_compat_missing();
+    if (x64_guest_tsc_enabled()) missing |= X64_SET_TSC;
     if (!missing || !size) return;
     g_trap_all = getenv("PS5C_CPU_COMPAT_TRAPALL") != NULL;
     uint8_t *p = (uint8_t *)gmem_host(mem, code, size);
@@ -1258,7 +1308,7 @@ void x64_compat_patch(gmem *mem, const char *module, guest_addr code, uint64_t s
      * segments hold no data in PS5 modules) */
     uint8_t *targets = (uint8_t *)calloc((size_t)(size / 8 + 1), 1);
     compat_site *sites = NULL;
-    uint32_t count = 0, cap = 0, per_set[6] = {0};
+    uint32_t count = 0, cap = 0, per_set[7] = {0};
     for (uint64_t off = 0; targets && off < size;) {
         x64_insn in;
         if (!x64_decode(p + off, (size_t)PS5C_MIN(size - off, 15), &in)) {
@@ -1420,9 +1470,10 @@ void x64_compat_patch(gmem *mem, const char *module, guest_addr code, uint64_t s
     pal_icache_flush(ab, (size_t)area_size);
     free(done);
     free(targets);
-    LOG_I(CPU, "%s: replaced %u instructions (BMI1 %u, BMI2 %u, LZCNT %u, MOVBE %u, FMA3 %u, AVX2 %u): %u stubs (%u "
+    LOG_I(CPU, "%s: replaced %u instructions (BMI1 %u, BMI2 %u, LZCNT %u, MOVBE %u, FMA3 %u, AVX2 %u, TSC %u): %u stubs (%u "
                "instructions moved along), %u by faults",
-          module, count - bad, per_set[0], per_set[1], per_set[2], per_set[3], per_set[4], per_set[5], nstubs, moved, ti);
+          module, count - bad, per_set[0], per_set[1], per_set[2], per_set[3], per_set[4], per_set[5],
+          per_set[6], nstubs, moved, ti);
 }
 
 static const compat_site *find_trap(uint64_t pc) {
@@ -1449,6 +1500,7 @@ bool x64_compat_fault(pal_fault_info *info) {
         in = &s->in;
     } else { /* not found by the scan (an instruction the sweep did not reach) */
         if (!x64_decode((const uint8_t *)(uintptr_t)info->pc, 15, &local) || !x64_compat_set(&local)) return false;
+        if (x64_compat_set(&local) == X64_SET_TSC && !x64_guest_tsc_enabled()) return false;
         in = &local;
     }
     uint64_t gpr[16];

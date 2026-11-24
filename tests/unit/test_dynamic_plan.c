@@ -31,6 +31,11 @@ static LONG CALLBACK trace_exception(EXCEPTION_POINTERS *ep) {
 #endif
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"line %d: %s\n",__LINE__,#x);return 1;}}while(0)
 static const sh_stage_info test_info={.stage=SH_STAGE_CS,.cs_tgid_sgpr=16,.cs_tgid_enable=1};
+static bool count_memory_prepares(void *context) {
+    uint32_t *calls = context;
+    (*calls)++;
+    return true;
+}
 static void desc(uint32_t *d,guest_addr a,uint32_t stride,uint32_t n) {
     d[0]=(uint32_t)a;d[1]=(uint32_t)(a>>32)|(stride<<16);d[2]=n;d[3]=0x00016204;
 }
@@ -338,8 +343,10 @@ int main(void) {
     e->group_sgpr=16;e->group_sgprs=1; /* the workgroup id, as the renderer sets it */
     CHECK(sh_analyze(code,PS5C_ARRAY_COUNT(code),base,p) && p->back_branch);
     CHECK(sh_evaluate(p,&mem,e) && e->site[2].desc_unknown);
-    bool ok=sh_dynamic_plan_build(p,e,&test_info,&mem,plan);if(!ok)fprintf(stderr,"plan: %s\n",plan->reason);
-    CHECK(ok && plan->choices==2);
+    uint32_t prepares=0;
+    bool ok=sh_dynamic_plan_build_with_prepare(p,e,&test_info,&mem,plan,count_memory_prepares,&prepares);
+    if(!ok)fprintf(stderr,"plan: %s\n",plan->reason);
+    CHECK(ok && plan->choices==2 && prepares==1);
     CHECK(plan->spans[0].snapshot && plan->spans[0].size==64);
     CHECK(plan->spans[2].base==base+0x1000 && plan->spans[2].size==0x600);
     CHECK(plan->spans[3].base==base+0x2000 && plan->spans[3].size==0x500 && plan->spans[3].store);
@@ -371,7 +378,9 @@ int main(void) {
     CHECK(sh_analyze(code,PS5C_ARRAY_COUNT(code),base,p) && !sh_dynamic_plan_build(p,e,&test_info,&mem,plan));
     code[2]=0x2c040290;
     code[16]=0xbf85fff2; /* another iteration reaches scalarization after overwriting its vector source */
-    CHECK(sh_analyze(code,PS5C_ARRAY_COUNT(code),base,p) && !sh_dynamic_plan_build(p,e,&test_info,&mem,plan));
+    CHECK(sh_analyze(code,PS5C_ARRAY_COUNT(code),base,p));
+    CHECK(!sh_dynamic_plan_build_with_prepare(p,e,&test_info,&mem,plan,count_memory_prepares,&prepares));
+    CHECK(prepares==1 && strstr(plan->reason,"ambiguous vector index source"));
     code[16]=0xbf85fff9;
     desc(data+0x100/4+4,base+0x100,4,64); /* store would change the immutable table */
     CHECK(sh_analyze(code,PS5C_ARRAY_COUNT(code),base,p) && !sh_dynamic_plan_build(p,e,&test_info,&mem,plan));

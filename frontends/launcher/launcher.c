@@ -484,6 +484,9 @@ static int internal_res_value(int64_t v) {
     return 0;
 }
 /* [video] tela: how the game window shows (pal_window_set_mode) */
+/* [geral] nitidez_fsr: the RCAS strength of the FSR 1 upscale (vk_renderer.c fsr_sharpness) */
+static const choice k_fsr_sharpness[] = {{0, L"Suave"}, {1, L"Normal"}, {2, L"Forte"}};
+#define FSR_SHARPNESS_COUNT 3
 static const choice k_screen_modes[] = {{0, L"Janela"}, {1, L"Tela cheia (Esc sai)"}, {2, L"Janela maximizada"}};
 #define SCREEN_MODE_COUNT 3
 
@@ -1224,15 +1227,16 @@ static char g_gpu_names[MAX_GPUS][256];
 static bool g_gpu_discrete[MAX_GPUS];
 static int g_gpu_count;
 
-static void list_gpus(void) {
-    g_gpu_count = 0;
+/* Runs ps5c.exe with one option and returns what it printed (buf: cap bytes, ends with 0) */
+static void ps5c_output(const wchar_t *option, char *buf, DWORD cap) {
+    buf[0] = 0;
     SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
     HANDLE rd, wr;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return;
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32];
     swprintf(exe, MAX_PATH, L"%ls\\ps5c.exe", g_base);
-    swprintf(cmd, MAX_PATH + 32, L"\"%ls\" --list-gpus", exe);
+    swprintf(cmd, MAX_PATH + 32, L"\"%ls\" %ls", exe, option);
     STARTUPINFOW si = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -1241,9 +1245,8 @@ static void list_gpus(void) {
     PROCESS_INFORMATION pi;
     BOOL ok = CreateProcessW(exe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, g_base, &si, &pi);
     CloseHandle(wr);
-    char buf[8192];
     DWORD len = 0, got;
-    while (ok && len < sizeof(buf) - 1 && ReadFile(rd, buf + len, (DWORD)(sizeof(buf) - 1 - len), &got, NULL) && got) len += got;
+    while (ok && len < cap - 1 && ReadFile(rd, buf + len, cap - 1 - len, &got, NULL) && got) len += got;
     buf[len] = 0;
     CloseHandle(rd);
     if (ok) {
@@ -1251,6 +1254,12 @@ static void list_gpus(void) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
+}
+
+static void list_gpus(void) {
+    g_gpu_count = 0;
+    char buf[8192];
+    ps5c_output(L"--list-gpus", buf, sizeof(buf));
     for (char *line = buf; *line && g_gpu_count < MAX_GPUS;) {
         char *next = strchr(line, '\n');
         if (next) *next++ = 0;
@@ -1265,13 +1274,117 @@ static void list_gpus(void) {
     }
 }
 
+/* ---- Accessories: keyboard and mouse, controller, camera ([acessorios] camera) ---- */
+
+#define MAX_CAMERAS 16
+static HWND g_acc_camera, g_acc_state;
+static char g_acc_names[MAX_CAMERAS][128]; /* host cameras that are not a PS4 Camera */
+static int g_acc_count;
+static char g_acc_other[128];              /* a camera of the settings this PC does not have (kept) */
+enum { ID_ACC_KEYS = 370, ID_ACC_PAD, ID_ACC_REFRESH };
+
+/* combo items: 0 off, 1 the first webcam, 2 the PS4 Camera, 3+i webcam i, 99 g_acc_other */
+static void accessories_fill(void) {
+    char buf[8192], state[32] = "absent";
+    ps5c_output(L"--list-cameras", buf, sizeof(buf));
+    g_acc_count = 0;
+    for (char *line = buf; *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
+        if (!strncmp(line, "ps4\t", 4)) snprintf(state, sizeof(state), "%s", line + 4);
+        else if (!strncmp(line, "camera\t", 7) && !strstr(line, "OV580") && g_acc_count < MAX_CAMERAS)
+            snprintf(g_acc_names[g_acc_count++], 128, "%s", line + 7);
+        line = next ? next : line + n;
+    }
+    const char *v = ini_get(g_global, "acessorios", "camera");
+    int want = 0;
+    g_acc_other[0] = 0;
+    if (v && (!strcmp(v, "generica") || !strcmp(v, "1"))) want = 1;
+    else if (v && !strcmp(v, "ps4")) want = 2;
+    else if (v && *v && strcmp(v, "desligada") && strcmp(v, "0")) {
+        want = 99;
+        for (int i = 0; i < g_acc_count; i++)
+            if (!strcmp(g_acc_names[i], v)) want = 3 + i;
+        if (want == 99) snprintf(g_acc_other, sizeof(g_acc_other), "%s", v);
+    }
+    SendMessageW(g_acc_camera, CB_RESETCONTENT, 0, 0);
+    static const choice fixed[] = {{0, L"Desligada"}, {1, L"Webcam do PC (a primeira)"}, {2, L"PS4 Camera (com o adaptador da Sony)"}};
+    int sel = 0;
+    for (int i = 0; i < 3 + g_acc_count + (g_acc_other[0] != 0); i++) {
+        wchar_t name[160];
+        int value = i < 3 ? i : i < 3 + g_acc_count ? i : 99;
+        if (i < 3) wcsncpy(name, ui_string(fixed[i].name), 159), name[159] = 0;
+        else utf8_to_wide(value == 99 ? g_acc_other : g_acc_names[i - 3], name, 160);
+        LRESULT item = SendMessageW(g_acc_camera, CB_ADDSTRING, 0, (LPARAM)name);
+        if (item < 0) continue;
+        SendMessageW(g_acc_camera, CB_SETITEMDATA, (WPARAM)item, value);
+        if (value == want) sel = (int)item;
+    }
+    SendMessageW(g_acc_camera, CB_SETCURSEL, (WPARAM)sel, 0);
+    wchar_t fw[MAX_PATH];
+    swprintf(fw, MAX_PATH, L"%ls\\user\\ps4_camera_firmware.bin", g_base);
+    const wchar_t *text = ui_string(L"PS4 Camera não encontrada.");
+    if (!strcmp(state, "ready")) text = ui_string(L"PS4 Camera pronta.");
+    else if (!strcmp(state, "driver"))
+        text = ui_string(L"PS4 Camera conectada, mas sem o driver WinUSB no USB Boot (05A9:0580): instale-o com o Zadig.");
+    else if (!strcmp(state, "firmware"))
+        text = file_exists(fw) ? ui_string(L"PS4 Camera conectada: o firmware é enviado quando o jogo abrir a câmera.")
+                               : ui_string(L"PS4 Camera conectada, mas falta o firmware do seu console em user/ps4_camera_firmware.bin.");
+    wchar_t all[1024];
+    swprintf(all, 1024, ui_string(L"Webcams neste PC: %d. %ls"), g_acc_count, text);
+    SetWindowTextW(g_acc_state, all);
+}
+
+static LRESULT CALLBACK accessories_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_ACC_KEYS: configure_keys(w); break;
+        case ID_ACC_PAD: configure_pad(w); break;
+        case ID_ACC_REFRESH: accessories_fill(); break;
+        case IDOK: {
+            int value = combo_value(g_acc_camera);
+            const char *v = value == 1 ? "generica" : value == 2 ? "ps4" : value == 99 ? g_acc_other
+                          : value >= 3 && value - 3 < g_acc_count ? g_acc_names[value - 3] : "desligada";
+            ini_set(g_global, "acessorios", "camera", v);
+            save_global();
+            DestroyWindow(w);
+            break;
+        }
+        case IDCANCEL: DestroyWindow(w); break;
+        }
+        return 0;
+    case WM_CLOSE: DestroyWindow(w); return 0;
+    }
+    return DefWindowProcW(w, msg, wp, lp);
+}
+
+static void configure_accessories(HWND owner) {
+    HWND w = create_dialog(L"ZeraPS5Accessories", ui_string(L"Acessórios"), 520, 300, owner);
+    add_control(w, L"STATIC", ui_string(L"Teclado, mouse e controle:"), 0, 16, 16, 490, 20, 0);
+    add_button(w, ui_string(L"Teclado e mouse..."), 16, 40, 170, ID_ACC_KEYS);
+    add_button(w, ui_string(L"Controle (DualSense)..."), 196, 40, 170, ID_ACC_PAD);
+    add_control(w, L"STATIC", ui_string(L"Câmera (PlayStation Camera):"), 0, 16, 92, 200, 20, 0);
+    g_acc_camera = add_control(w, WC_COMBOBOXW, NULL, WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 220, 88, 286, 260, 0);
+    g_acc_state = add_control(w, L"STATIC", L"", 0, 16, 124, 370, 54, 0);
+    add_button(w, ui_string(L"Procurar de novo"), 396, 124, 110, ID_ACC_REFRESH);
+    add_control(w, L"STATIC", ui_string(L"Com uma webcam comum as duas lentes veem a mesma imagem: o que depende de profundidade não funciona."),
+                0, 16, 190, 490, 40, 0);
+    accessories_fill();
+    add_button(w, ui_string(L"Salvar"), 316, 256, 90, IDOK);
+    add_button(w, ui_string(L"Cancelar"), 416, 256, 90, IDCANCEL);
+    run_modal(w, owner, true);
+}
+
 /* ---- General settings ---- */
 
 static HWND g_set_lang, g_set_res, g_set_screen, g_set_gpu, g_set_folders, g_set_system, g_set_update, g_set_autoupd, g_set_autolog, g_set_panel,
     g_set_music, g_set_intro, g_set_nosound, g_set_cpu;
-static HWND g_set_ue, g_set_internal;
+static HWND g_set_ue, g_set_internal, g_set_fsr, g_set_fsr_sharp;
 static char g_set_gpu_other[256]; /* a GPU of the settings this PC does not have (kept as it is) */
-enum { ID_FOLDER_ADD = 400, ID_FOLDER_REMOVE, ID_SYSTEM_BROWSE, ID_KEYS, ID_UPDATE_CHECK, ID_PAD };
+enum { ID_FOLDER_ADD = 400, ID_FOLDER_REMOVE, ID_SYSTEM_BROWSE, ID_ACCESSORIES, ID_UPDATE_CHECK, ID_PAD };
 
 static void settings_save(void) {
     char v[3 * MAX_PATH];
@@ -1286,6 +1399,8 @@ static void settings_save(void) {
     ini_set(g_global, "geral", "escala_unreal", v);
     snprintf(v, sizeof(v), "%d", combo_value(g_set_internal));
     ini_set(g_global, "geral", "resolucao_interna", v);
+    snprintf(v, sizeof(v), "%d", combo_value(g_set_fsr_sharp));
+    ini_set(g_global, "geral", "nitidez_fsr", v);
     /* the folder list replaces jogos1..N */
     const char *old[64];
     char keys[64][16];
@@ -1312,6 +1427,7 @@ static void settings_save(void) {
     ini_set(g_global, "atualizacao", "ao_iniciar", SendMessageW(g_set_autoupd, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0");
     ini_set(g_global, "relatorios", "enviar_ao_fechar", SendMessageW(g_set_autolog, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0");
     ini_set(g_global, "geral", "painel", SendMessageW(g_set_panel, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0");
+    ini_set(g_global, "geral", "upscale_fsr", SendMessageW(g_set_fsr, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0");
     ini_set(g_global, "geral", "musica", SendMessageW(g_set_music, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0");
     ini_set(g_global, "geral", "abertura", SendMessageW(g_set_intro, BM_GETCHECK, 0, 0) == BST_CHECKED ? "0" : "1");
     ini_set(g_global, "geral", "som", SendMessageW(g_set_nosound, BM_GETCHECK, 0, 0) == BST_CHECKED ? "0" : "1");
@@ -1350,7 +1466,7 @@ static LRESULT CALLBACK settings_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextW(g_set_system, path);
         }
         break;
-    case ID_KEYS: configure_keys(w); break;
+    case ID_ACCESSORIES: configure_accessories(w); break;
     case ID_PAD: configure_pad(w); break;
     case ID_UI_LANGUAGES: configure_languages(w); break;
     case ID_UPDATE_CHECK: check_updates(NULL, true); break;
@@ -1369,7 +1485,7 @@ static LRESULT CALLBACK settings_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
 static void configure_general(void) {
     load_global(); /* the file may have been edited by hand */
-    HWND w = create_dialog(L"ZeraPS5Settings", ui_string(L"Configurações"), 520, 720, g_main);
+    HWND w = create_dialog(L"ZeraPS5Settings", ui_string(L"Configurações"), 520, 746, g_main);
     add_control(w, L"STATIC", ui_string(L"Idioma do console:"), 0, 16, 18, 150, 20, 0);
     g_set_lang = add_combo(w, 170, 14, 220, k_languages, LANGUAGE_COUNT,
                            (int)ini_get_int(g_global, "geral", "idioma", USER_LANGUAGE_DEFAULT), NULL);
@@ -1413,8 +1529,14 @@ static void configure_general(void) {
     add_control(w, L"STATIC", L"Escala Unreal (avançado):", 0, 16, 186, 205, 20, 0);
     g_set_ue = add_ue_scale_combo(w, 226, 182, 220, ini_get_int(g_global, "geral", "escala_unreal", 0), NULL);
     add_control(w, L"STATIC", L"Jogos Unreal, Sonic Origins Plus e TMNT: Splintered Fate.", 0, 16, 212, 490, 20, 0);
-    add_control(w, L"STATIC", ui_string(L"Pastas de jogos:"), 0, 16, 240, 300, 20, 0);
-    g_set_folders = add_control(w, L"LISTBOX", NULL, WS_TABSTOP | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 16, 262, 360, 58, 0);
+    g_set_fsr = add_control(w, L"BUTTON", L"Upscale FSR 1 (tela cheia ou maximizada)",
+                            WS_TABSTOP | BS_AUTOCHECKBOX, 16, 236, 290, 22, 0);
+    add_control(w, L"STATIC", L"Nitidez:", 0, 316, 240, 64, 20, 0);
+    g_set_fsr_sharp = add_combo(w, 386, 234, 120, k_fsr_sharpness, FSR_SHARPNESS_COUNT,
+                                (int)ini_get_int(g_global, "geral", "nitidez_fsr", 1), NULL);
+    SendMessageW(g_set_fsr, BM_SETCHECK, ini_get_int(g_global, "geral", "upscale_fsr", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
+    add_control(w, L"STATIC", ui_string(L"Pastas de jogos:"), 0, 16, 266, 300, 20, 0);
+    g_set_folders = add_control(w, L"LISTBOX", NULL, WS_TABSTOP | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 16, 288, 360, 58, 0);
     const char *folders[64];
     int n = game_folders(folders, 64);
     for (int i = 0; i < n; i++) {
@@ -1422,49 +1544,49 @@ static void configure_general(void) {
         utf8_to_wide(folders[i], f, MAX_PATH);
         SendMessageW(g_set_folders, LB_ADDSTRING, 0, (LPARAM)f);
     }
-    add_button(w, ui_string(L"Adicionar..."), 390, 262, 116, ID_FOLDER_ADD);
-    add_button(w, ui_string(L"Remover"), 390, 296, 116, ID_FOLDER_REMOVE);
-    add_control(w, L"STATIC", ui_string(L"Bibliotecas de sistema do console:"), 0, 16, 332, 300, 20, 0);
+    add_button(w, ui_string(L"Adicionar..."), 390, 288, 116, ID_FOLDER_ADD);
+    add_button(w, ui_string(L"Remover"), 390, 322, 116, ID_FOLDER_REMOVE);
+    add_control(w, L"STATIC", ui_string(L"Bibliotecas de sistema do console:"), 0, 16, 358, 300, 20, 0);
     const char *sys = ini_get(g_global, "pastas", "sistema");
     wchar_t sysw[MAX_PATH];
     utf8_to_wide(sys && *sys ? sys : "system\\modules", sysw, MAX_PATH);
-    g_set_system = add_control(w, L"EDIT", sysw, WS_TABSTOP | ES_AUTOHSCROLL, 16, 354, 360, 24, 0);
+    g_set_system = add_control(w, L"EDIT", sysw, WS_TABSTOP | ES_AUTOHSCROLL, 16, 380, 360, 24, 0);
     SetPropW(g_set_system,L"ZeraPS5.LTR",(HANDLE)1);
     ui_apply_control(g_set_system,0);
-    add_button(w, ui_string(L"Procurar..."), 390, 352, 116, ID_SYSTEM_BROWSE);
-    add_control(w, L"STATIC", ui_string(L"Atualizações vêm de:"), 0, 16, 392, 360, 20, 0);
+    add_button(w, ui_string(L"Procurar..."), 390, 378, 116, ID_SYSTEM_BROWSE);
+    add_control(w, L"STATIC", ui_string(L"Atualizações vêm de:"), 0, 16, 418, 360, 20, 0);
     wchar_t updw[2 * MAX_PATH];
     utf8_to_wide(update_source(), updw, 2 * MAX_PATH);
-    g_set_update = add_control(w, L"EDIT", updw, ES_READONLY | ES_AUTOHSCROLL, 16, 414, 360, 24, 0);
+    g_set_update = add_control(w, L"EDIT", updw, ES_READONLY | ES_AUTOHSCROLL, 16, 440, 360, 24, 0);
     SetPropW(g_set_update,L"ZeraPS5.LTR",(HANDLE)1);
     ui_apply_control(g_set_update,0);
-    add_button(w, ui_string(L"Verificar agora"), 390, 412, 116, ID_UPDATE_CHECK);
-    g_set_autoupd = add_control(w, L"BUTTON", ui_string(L"Verificar atualizações ao iniciar"), WS_TABSTOP | BS_AUTOCHECKBOX, 16, 444, 360, 22, 0);
+    add_button(w, ui_string(L"Verificar agora"), 390, 438, 116, ID_UPDATE_CHECK);
+    g_set_autoupd = add_control(w, L"BUTTON", ui_string(L"Verificar atualizações ao iniciar"), WS_TABSTOP | BS_AUTOCHECKBOX, 16, 470, 360, 22, 0);
     SendMessageW(g_set_autoupd, BM_SETCHECK, ini_get_int(g_global, "atualizacao", "ao_iniciar", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
     g_set_autolog = add_control(w, L"BUTTON", ui_string(L"Enviar o log para análise quando o jogo fechar"), WS_TABSTOP | BS_AUTOCHECKBOX,
-                                16, 468, 400, 22, 0);
+                                16, 494, 400, 22, 0);
     SendMessageW(g_set_autolog, BM_SETCHECK,
                  ini_get_int(g_global, "relatorios", "enviar_ao_fechar", 0) ? BST_CHECKED : BST_UNCHECKED, 0);
     g_set_panel = add_control(w, L"BUTTON", ui_string(L"Painel de desempenho no jogo (F10 mostra e esconde)"), WS_TABSTOP | BS_AUTOCHECKBOX,
-                              16, 492, 420, 22, 0);
+                              16, 518, 420, 22, 0);
     SendMessageW(g_set_panel, BM_SETCHECK, ini_get_int(g_global, "geral", "painel", 0) ? BST_CHECKED : BST_UNCHECKED, 0);
     g_set_music = add_control(w, L"BUTTON", ui_string(L"Tocar a música do jogo selecionado na lista"), WS_TABSTOP | BS_AUTOCHECKBOX,
-                              16, 516, 420, 22, 0);
+                              16, 542, 420, 22, 0);
     SendMessageW(g_set_music, BM_SETCHECK, ini_get_int(g_global, "geral", "musica", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
     g_set_intro = add_control(w, L"BUTTON", ui_string(L"Pular a intro (vídeo de abertura dos jogos)"), WS_TABSTOP | BS_AUTOCHECKBOX,
-                              16, 540, 420, 22, 0);
+                              16, 566, 420, 22, 0);
     SendMessageW(g_set_intro, BM_SETCHECK, ini_get_int(g_global, "geral", "abertura", 1) ? BST_UNCHECKED : BST_CHECKED, 0);
     g_set_nosound = add_control(w, L"BUTTON", ui_string(L"Sem som (PC sem saída de áudio)"), WS_TABSTOP | BS_AUTOCHECKBOX,
-                                16, 564, 420, 22, 0);
+                                16, 590, 420, 22, 0);
     SendMessageW(g_set_nosound, BM_SETCHECK, ini_get_int(g_global, "geral", "som", 1) ? BST_UNCHECKED : BST_CHECKED, 0);
-    add_control(w, L"STATIC", ui_string(L"Processador antigo:"), 0, 16, 596, 150, 20, 0);
-    g_set_cpu = add_combo(w, 170, 592, 336, k_cpu_modes, CPU_MODE_COUNT,
+    add_control(w, L"STATIC", ui_string(L"Processador antigo:"), 0, 16, 622, 150, 20, 0);
+    g_set_cpu = add_combo(w, 170, 618, 336, k_cpu_modes, CPU_MODE_COUNT,
                           (int)ini_get_int(g_global, "geral", "cpu_antiga", 0), NULL);
-    add_button(w, ui_string(L"Teclado e mouse..."), 16, 630, 170, ID_KEYS);
-    add_button(w, ui_string(L"Controle (DualSense)..."), 196, 630, 170, ID_PAD);
-    add_button(w,L"Idiomas...",376,630,130,ID_UI_LANGUAGES);
-    add_button(w, ui_string(L"Salvar"), 316, 678, 90, IDOK);
-    add_button(w, ui_string(L"Cancelar"), 416, 678, 90, IDCANCEL);
+    add_button(w, ui_string(L"Acessórios..."), 16, 656, 170, ID_ACCESSORIES);
+    add_button(w, ui_string(L"Controle (DualSense)..."), 196, 656, 170, ID_PAD);
+    add_button(w,L"Idiomas...",376,656,130,ID_UI_LANGUAGES);
+    add_button(w, ui_string(L"Salvar"), 316, 704, 90, IDOK);
+    add_button(w, ui_string(L"Cancelar"), 416, 704, 90, IDCANCEL);
     run_modal(w, g_main, true);
 }
 
@@ -3518,6 +3640,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
                      {keys_proc, L"ZeraPS5Keys"},
                      {text_view_proc, L"ZeraPS5Text"},
                      {pad_proc, L"ZeraPS5Pad"},
+                     {accessories_proc, L"ZeraPS5Accessories"},
                      {capture_proc, L"ZeraPS5Capture"},
                      {report_proc, L"ZeraPS5Report"},
                      {languages_proc,L"ZeraPS5Languages"}};

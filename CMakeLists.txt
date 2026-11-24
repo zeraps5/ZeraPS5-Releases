@@ -96,14 +96,14 @@ ps5c_target_defaults(ps5c_base)
 # ---- pal: host operating system services ----
 if(WIN32)
     add_library(ps5c_pal STATIC src/pal_win32/report_session.c src/pal_win32/report_archive.c src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pfs_volume.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_win32/pal_win32.c
-                src/pal_win32/pal_media_win32.c src/pal_win32/dualsense.c src/pal_win32/pal_bundled_assets.c)
+                src/pal_win32/pal_media_win32.c src/pal_win32/dualsense.c src/pal_win32/pal_bundled_assets.c src/pal_win32/ps4_camera_win32.c src/pal_win32/pal_camera_win32.c)
     target_link_libraries(ps5c_pal PUBLIC user32 gdi32 shell32 shlwapi ole32 mfuuid uuid synchronization winmm setupapi
-                          hid advapi32)
+                          hid advapi32 winusb)
     target_sources(ps5c_pal PRIVATE src/pal_win32/pal_host_info.c)
     target_sources(ps5c_pal PRIVATE src/pal_win32/udp_lan.c)
     target_link_libraries(ps5c_pal PUBLIC ws2_32)
 else()
-    add_library(ps5c_pal STATIC src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pfs_volume.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_posix/pal_posix.c)
+    add_library(ps5c_pal STATIC src/pal/pal_exfat.c src/pal/pal_pkg.c src/pal/pal_pfs.c src/pal/pal_pfs_volume.c src/pal/pal_pkg_inner.c src/pal/pal_pkg_ps4.c src/pal/pal_common.c src/pal/pal_media.c src/pal_posix/pal_posix.c src/pal/pal_camera_none.c)
     find_package(Threads REQUIRED)
     target_link_libraries(ps5c_pal PUBLIC Threads::Threads)
     target_compile_definitions(ps5c_pal PRIVATE _GNU_SOURCE)
@@ -191,6 +191,8 @@ add_library(ps5c_core STATIC
     src/hle/lib_png_dec.c
     src/hle/lib_audiodec.c
     src/hle/lib_compat_stubs.c
+    src/hle/lib_zlib.c
+    src/hle/lib_jpeg_enc.c
     src/hle/png_decode.c
     src/hle/lib_ajm.c
     src/hle/lib_acm.c
@@ -199,6 +201,7 @@ add_library(ps5c_core STATIC
     src/hle/lib_font.c
     src/hle/lib_font_text.c
     src/hle/lib_voice.c
+    src/hle/lib_camera.c
     src/hle/lib_np_trophy.c
     src/hle/lib_fiber.c
     src/hle/lib_net_offline.c
@@ -395,6 +398,15 @@ if(PS5C_BUILD_TESTS)
     target_link_libraries(test_shader_calls PRIVATE ps5c_test_support)
     ps5c_target_defaults(test_shader_calls)
     add_test(NAME shader_calls COMMAND test_shader_calls)
+    add_executable(test_vertex_snapshot tests/unit/test_vertex_snapshot.c)
+    target_link_libraries(test_vertex_snapshot PRIVATE ps5c_test_support)
+    ps5c_target_defaults(test_vertex_snapshot)
+    add_test(NAME vertex_snapshot COMMAND test_vertex_snapshot)
+    if(PS5C_RUN_GPU_TESTS)
+        add_test(NAME vertex_snapshot_gpu COMMAND test_vertex_snapshot)
+        set_tests_properties(vertex_snapshot_gpu PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS GPU
+            ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_VERTEX_CACHE=0")
+    endif()
     add_executable(test_image_atomic_raw tests/unit/test_image_atomic_raw.c)
     target_link_libraries(test_image_atomic_raw PRIVATE ps5c_test_support)
     ps5c_target_defaults(test_image_atomic_raw)
@@ -436,6 +448,12 @@ if(PS5C_BUILD_TESTS)
         ps5c_guest_host(test_${t})
         add_test(NAME ${t} COMMAND test_${t})
     endforeach()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/settings-sfo")
+    add_executable(test_settings_sfo tests/unit/test_settings_sfo.c)
+    target_link_libraries(test_settings_sfo PRIVATE ps5c_test_support)
+    ps5c_target_defaults(test_settings_sfo)
+    add_test(NAME settings_sfo COMMAND test_settings_sfo)
+    set_tests_properties(settings_sfo PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/settings-sfo")
     add_executable(test_kernel_readv tests/unit/test_kernel_readv.c)
     target_link_libraries(test_kernel_readv PRIVATE ps5c_test_support)
     ps5c_target_defaults(test_kernel_readv)
@@ -484,7 +502,9 @@ if(PS5C_BUILD_TESTS)
     add_test(NAME cpu_compat_off COMMAND test_cpu_compat --off)
     add_test(NAME cpu_compat_auto COMMAND test_cpu_compat --auto)
     add_test(NAME cpu_compat_vector_fault COMMAND test_cpu_compat --trap)
-    set_tests_properties(cpu_compat cpu_compat_off cpu_compat_auto cpu_compat_vector_fault PROPERTIES TIMEOUT 30)
+    add_test(NAME cpu_compat_guest_tsc COMMAND test_cpu_compat --guest-tsc)
+    set_tests_properties(cpu_compat_guest_tsc PROPERTIES ENVIRONMENT "PS5C_GUEST_TSC=1")
+    set_tests_properties(cpu_compat cpu_compat_off cpu_compat_auto cpu_compat_vector_fault cpu_compat_guest_tsc PROPERTIES TIMEOUT 30)
     add_executable(test_apr_pending tests/unit/test_apr_pending.c)
     target_link_libraries(test_apr_pending PRIVATE ps5c_test_support)
     ps5c_target_defaults(test_apr_pending)
@@ -602,6 +622,9 @@ if(PS5C_BUILD_TESTS)
         set_tests_properties(dpp8_native32 dpp8_paired64 PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS GPU)
         set_tests_properties(dpp8_native32 PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_CS_WAVE_FROM_PACKET=1;PS5C_CS_NATIVE32=1;PS5C_TEST_DPP_NATIVE32=1")
         set_tests_properties(dpp8_paired64 PROPERTIES ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_CS_WAVE_FROM_PACKET=1;PS5C_CS_WAVE64=1;PS5C_TEST_DPP_PAIRED64=1")
+        add_test(NAME shader_masks_gpu COMMAND test_shader_masks)
+        set_tests_properties(shader_masks_gpu PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS GPU
+            ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_NO_CPU_FILL=1")
         add_test(NAME pseudoflags_gpu COMMAND test_shader_masks)
         set_tests_properties(pseudoflags_gpu PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS GPU
             ENVIRONMENT "PS5C_TEST_GPU=1;PS5C_TEST_PSEUDOFLAGS=1;PS5C_CS_WAVE_FROM_PACKET=1;PS5C_CS_NATIVE32=1;PS5C_CS_WAVE64=1")
@@ -756,6 +779,11 @@ if(PS5C_BUILD_TESTS)
     ps5c_target_defaults(test_shader_movrel)
     ps5c_guest_host(test_shader_movrel)
     add_test(NAME shader_movrel COMMAND test_shader_movrel)
+    if(PS5C_RUN_GPU_TESTS)
+        add_test(NAME shader_movrel_gpu COMMAND test_shader_movrel)
+        set_tests_properties(shader_movrel_gpu PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS GPU
+            ENVIRONMENT "PS5C_TEST_GPU=1")
+    endif()
     add_executable(test_pixel_interlock tests/unit/test_pixel_interlock.c)
     target_link_libraries(test_pixel_interlock PRIVATE ps5c_test_support)
     ps5c_target_defaults(test_pixel_interlock)

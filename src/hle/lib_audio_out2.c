@@ -438,6 +438,7 @@ static void speaker_array_call(hle_call *c) {
 
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(L, "sceAudioOut2Initialize", ok),
+    HLE_FUNC_ENTRY(L, "sceAudioOut2EnableChat", ok), /* there is no voice chat to mix in */
     HLE_FUNC_ENTRY(L, "sceAudioOut2ContextResetParam", context_reset_param),
     HLE_FUNC_ENTRY(L, "sceAudioOut2ContextQueryMemory", context_query_memory),
     HLE_FUNC_ENTRY(L, "sceAudioOut2ContextCreate", context_create),

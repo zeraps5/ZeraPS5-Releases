@@ -696,6 +696,15 @@ void pal_thread_get_stack_bounds(pal_stack_bounds *out) {
     memcpy(&out->dealloc, (const uint8_t *)tib + TEB_DEALLOCATION_STACK, 8);
 }
 
+uint64_t pal_thread_cpu_ns(void) {
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    uint64_t kt = ((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime, ut = ((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime;
+    return (kt + ut) * 100;
+}
+
+bool pal_thread_raise_priority(void) { return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0; }
+
 bool pal_thread_prefer_fast_cores(void) {
     ULONG len = 0;
     GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
@@ -723,6 +732,14 @@ bool pal_thread_prefer_fast_cores(void) {
     }
     free(info);
     return n && n < total && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n);
+}
+
+bool pal_process_full_speed(void) {
+    PROCESS_POWER_THROTTLING_STATE s = {.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                                                       PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                                        .StateMask = 0};
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof(s)) != 0;
 }
 
 void pal_thread_set_stack_bounds(const pal_stack_bounds *b) {

@@ -126,6 +126,13 @@ void pal_thread_yield(void);
 /* Keeps the calling thread on the fastest cores of a hybrid CPU (P-cores);
  * false when the CPU has one kind of core or the host cannot tell. */
 bool pal_thread_prefer_fast_cores(void);
+/* CPU time the calling thread has run (user + kernel), in ns; 0 when the host cannot tell */
+uint64_t pal_thread_cpu_ns(void);
+/* Runs the calling thread ahead of the process's ordinary threads; false when the host refuses */
+bool pal_thread_raise_priority(void);
+/* Asks the host not to slow the process down to save power (Windows: no EcoQoS / power throttling, which
+ * moves a background process to the efficient cores of a hybrid CPU); false when not supported. */
+bool pal_process_full_speed(void);
 
 /* Waits while the 4- or 8-byte value at `addr` equals `expected`, up to
  * `timeout_ns` (UINT64_MAX: no limit). True when woken or the value differs,

@@ -407,7 +407,8 @@ static bool scalar_bound(analysis *a,uint32_t at,uint32_t soff,uint32_t *max_off
     return false;
 }
 
-bool sh_dynamic_plan_build(const sh_program *p,const sh_eval *initial,const sh_stage_info *info,gmem *mem,sh_dynamic_plan *out) {
+bool sh_dynamic_plan_build_with_prepare(const sh_program *p,const sh_eval *initial,const sh_stage_info *info,
+                                        gmem *mem,sh_dynamic_plan *out,bool (*prepare)(void *),void *context) {
     memset(out,0,sizeof(*out));analysis a={.p=p,.initial=initial,.info=info,.mem=mem,.out=out,.root=UINT32_MAX};
     if(!info || info->stage!=SH_STAGE_CS){snprintf(out->reason,sizeof(out->reason),"compute stage metadata required");return false;}
     /* Appended offsets and out->words are u32 even on a 64-bit host. Check
@@ -417,10 +418,7 @@ bool sh_dynamic_plan_build(const sh_program *p,const sh_eval *initial,const sh_s
         snprintf(out->reason,sizeof(out->reason),"uniform word capacity overflow");return false;
     }
     a.heads=malloc(p->count*sizeof(*a.heads));a.edges=calloc(2*p->count,sizeof(*a.edges));
-    a.cache=calloc((size_t)p->count*SH_SGPRS,sizeof(*a.cache));
-    a.shape_eval=calloc(1,sizeof(*a.shape_eval));
-    a.limits=calloc(4096,sizeof(*a.limits));
-    if(!a.heads || !a.edges || !a.cache || !a.shape_eval || !a.limits){fail(&a,"allocation",0);goto done;}
+    if(!a.heads || !a.edges){fail(&a,"allocation",0);goto done;}
     for(uint32_t i=0;i<p->count;i++)a.heads[i]=-1;
     uint32_t ne=0;
     for(uint32_t i=0;i<p->count;i++) {
@@ -446,6 +444,11 @@ bool sh_dynamic_plan_build(const sh_program *p,const sh_eval *initial,const sh_s
        !sh_inline_const(shift->src[0],shift->literal,&bits) || (bits&31)<16)
         {fail(&a,"index is not bounded by a logical shift",a.root);goto done;}
     a.maximum=UINT32_MAX>>(bits&31);
+    a.cache=calloc((size_t)p->count*SH_SGPRS,sizeof(*a.cache));
+    a.shape_eval=calloc(1,sizeof(*a.shape_eval));
+    a.limits=calloc(4096,sizeof(*a.limits));
+    if(!a.cache || !a.shape_eval || !a.limits){fail(&a,"allocation",0);goto done;}
+    if(prepare && !prepare(context)){fail(&a,"guest memory preparation failed",a.root);goto done;}
     /* Discover/check the table through every SBUFFER instruction. */
     for(uint32_t s=0;s<p->site_count;s++)if(p->sites[s].kind==SH_SITE_SBUFFER)
         (void)defined(&a,p->sites[s].inst,p->insts[p->sites[s].inst].dst);
@@ -566,6 +569,9 @@ done:
     free(a.heads);free(a.edges);free(a.cache);free(a.table);free(a.shape_eval);free(a.limits);
     if(a.failed){char reason[sizeof(out->reason)];memcpy(reason,out->reason,sizeof(reason));sh_dynamic_plan_free(out);memcpy(out->reason,reason,sizeof(reason));return false;}
     return true;
+}
+bool sh_dynamic_plan_build(const sh_program *p,const sh_eval *initial,const sh_stage_info *info,gmem *mem,sh_dynamic_plan *out) {
+    return sh_dynamic_plan_build_with_prepare(p,initial,info,mem,out,NULL,NULL);
 }
 void sh_dynamic_plan_free(sh_dynamic_plan *plan) {
     for(uint32_t s=0;s<SH_MAX_SITES;s++){free(plan->spans[s].snapshot);free(plan->spans[s].ranges);}

@@ -92,6 +92,7 @@ typedef struct sh_program {
     uint32_t eval_sgpr_lo; /* SGPRs 0..31 read by scalar/uniform evaluation */
     uint64_t hash;
     uint8_t aperture_flags;
+    bool wave_compaction; /* full mask count, prefix rank and scalar broadcast */
     uint16_t eval_sgpr_hi; /* SGPRs 32..47 read by scalar/uniform evaluation */
     /* Of those, SGPRs read only as word 0 (the base address) of S_BUFFER_LOAD
      * descriptors and never written: another draw with the same constants at
@@ -216,6 +217,11 @@ typedef struct sh_eval {
     guest_addr call_target;
     /* during a `host` read: the base SGPR of the S_BUFFER_LOAD reading, else 0xFF */
     uint8_t host_sbase;
+    uint8_t host_soff; /* and its offset SGPR, else 0xFF */
+    /* a branch on a known scalar condition takes its side only: the other side is not
+     * explored for the descriptors of its sites (the renderer sets it for PS4 draws, whose
+     * constants are in place when the command processor reaches the draw) */
+    bool known_side_only;
 } sh_eval;
 
 /* Runs the scalar part of `p` from e->sgpr_init; fills the sites and the
@@ -244,6 +250,10 @@ typedef struct sh_site_shape {
 
 #define SH_BUFFER_LENGTH 1  /* the actual bound dwords (opt-in) */
 #define SH_BUFFER_SHIFTED 2 /* bytes from the binding's start to the descriptor base, added to every offset */
+
+/* dst_sel[0..3] of a sampled image site: the T# DST_SEL fields (word 3, bits 11:0) are read
+ * at run time from the site's SH_U_SITE word instead of being part of the translation */
+#define SH_DST_SEL_DYNAMIC 8
 
 static inline bool sh_site_storage(const sh_site *site, const sh_site_shape *shape) {
     return site->store || shape->ordered_load;
@@ -332,6 +342,9 @@ typedef struct sh_stage_info {
 #define SH_JOIN_PREFIX 32u /* opt-in acyclic first-barrier prefix; stage/cache/corpus identity */
 #define SH_JOIN_SUFFIX 64u /* emit a proven forward-only suffix directly after that barrier */
 #define SH_MESH_NGG_CULL 128u /* NGG no-GS culling ABI: three 16-bit input vertex indices */
+/* PS4 geometry shader passes (gpu_cp): MUBUF through a GCN V# with ADD_TID_ENABLE or
+ * SWIZZLE_ENABLE addresses the swizzled ring layout of the lane; stage/cache identity */
+#define SH_GCN_SWIZZLE 256u
 
 /* Compact output buffer: eight header dwords, per-vertex position/parameters,
  * then packed primitive words. Header starts with VkDrawIndirectCommand. */

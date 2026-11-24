@@ -13,6 +13,12 @@ typedef struct gmem_access {
     bool pinned;
     uint32_t count, next;
     struct { guest_addr start, end; uint8_t *host; } spans[32];
+    /* address space with no backed memory, as of mapping generation hole_generation:
+     * reads there fail without the map lock (scalar shader evaluation follows stale
+     * pointers of unused descriptor slots: Tearaway ~200000 such reads a second) */
+    uint64_t hole_generation;
+    uint32_t hole_count, hole_next;
+    struct { guest_addr start, end; } holes[8];
 } gmem_access;
 
 bool gmem_access_begin(gmem_access *access, gmem *mem, bool retain);

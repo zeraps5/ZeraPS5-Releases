@@ -597,6 +597,11 @@ static void sce_cond_timedwait(hle_call *c) {
     RET_SCE(do_cond_wait(c, hle_arg_ptr(c, 0), hle_arg_ptr(c, 1), usec_arg(c, 2)));
 }
 static void sce_cond_signal(hle_call *c) { RET_SCE(do_cond_signal(c, hle_arg_ptr(c, 0), false)); }
+/* scePthreadCondSignalto(cond, thread): wakes every waiter, which a condition variable
+ * allows (spurious wakeups); AnyPS5 does the same */
+static void sce_cond_signalto(hle_call *c) {
+    RET_SCE(hle_arg_ptr(c, 1) ? do_cond_signal(c, hle_arg_ptr(c, 0), true) : G_EINVAL);
+}
 static void sce_cond_broadcast(hle_call *c) { RET_SCE(do_cond_signal(c, hle_arg_ptr(c, 0), true)); }
 static void sce_condattr_init(hle_call *c) { RET_SCE(do_condattr_init(c, hle_arg_ptr(c, 0))); }
 static void sce_condattr_destroy(hle_call *c) { RET_SCE(do_condattr_destroy(c, hle_arg_ptr(c, 0))); }
@@ -1345,6 +1350,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "scePthreadCondWait", sce_cond_wait),
     HLE_FUNC_ENTRY(K, "scePthreadCondTimedwait", sce_cond_timedwait),
     HLE_FUNC_ENTRY(K, "scePthreadCondSignal", sce_cond_signal),
+    HLE_FUNC_ENTRY(K, "scePthreadCondSignalto", sce_cond_signalto),
     HLE_FUNC_ENTRY(K, "scePthreadCondBroadcast", sce_cond_broadcast),
     HLE_FUNC_ENTRY(K, "scePthreadCondattrInit", sce_condattr_init),
     HLE_FUNC_ENTRY(K, "scePthreadCondattrDestroy", sce_condattr_destroy),
@@ -1374,6 +1380,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "scePthreadRwlockattrSettype", rwlockattr_noop),
     HLE_FUNC_ENTRY(K, "scePthreadRwlockattrGettype", rwlockattr_gettype),
     POSIX_ENTRY("pthread_rwlockattr_setpshared", rwlockattr_noop),
+    POSIX_ENTRY("pthread_mutexattr_setpshared", rwlockattr_noop), /* one process: nothing to share */
     POSIX_ENTRY("pthread_rwlockattr_getpshared", rwlockattr_getpshared),
 
     HLE_FUNC_ENTRY(K, "sceKernelCreateEventFlag", create_event_flag),

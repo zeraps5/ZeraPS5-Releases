@@ -39,7 +39,8 @@ void hle_register_table(const hle_export *table, size_t count);
 
 typedef struct eq_registration {
     uint64_t eq;
-    int32_t id;
+    int32_t id;     /* the queue whose interrupts it receives (queue_event) */
+    uint64_t ident; /* the id the game registered: the same on PS5, a Gnm event type on PS4 */
 } eq_registration;
 
 /* Submissions run on a GPU thread, after the submit call returns, as on the
@@ -70,6 +71,8 @@ typedef struct gpu_job {
     bool done;
     bool reported_stuck;
     gpu_submission stream;
+    guest_addr rptr;     /* PS4 compute ring: its read pointer, written once this job has run */
+    uint32_t rptr_value; /* (dwords from the ring base) */
 } gpu_job;
 
 static struct {
@@ -142,9 +145,116 @@ static void on_flip(void *user, int32_t handle, int32_t index, int32_t mode, int
         LOG_W(GPU, "flip of buffer %d dropped: the display queue stayed full", index);
 }
 
+/* Flips, suspend points and idle queues the GPU thread hands over (renderer_submit_deferred): this thread waits
+ * for each one's work, lets its results and held labels land (renderer_complete_deferred) and queues a flip for
+ * the display, in order. PS5C_FLIP_DEFER=0 / PS5C_SUSPEND_DEFER=0 / PS5C_IDLE_DEFER=0: the GPU thread waits
+ * there itself (the old way). */
+#define DEFERRED_ENTRIES 8u
+static struct {
+    pal_mutex *lock;
+    pal_cond *changed;
+    pal_thread *thread;
+    struct { bool flip; int32_t handle, index, mode; int64_t arg; uint64_t point; } q[DEFERRED_ENTRIES];
+    uint32_t head, tail; /* lock: [tail, head) not completed yet */
+    uint64_t newest;     /* lock: point of the entry head - 1 */
+    bool failed;
+} g_deferred;
+
+static int32_t deferred_thread(void *arg) {
+    PS5C_UNUSED(arg);
+    pal_mutex_lock(g_deferred.lock);
+    for (;;) {
+        while (g_deferred.head == g_deferred.tail) pal_cond_wait(g_deferred.changed, g_deferred.lock);
+        uint32_t k = g_deferred.tail % DEFERRED_ENTRIES;
+        bool flip = g_deferred.q[k].flip;
+        int32_t handle = g_deferred.q[k].handle, index = g_deferred.q[k].index, mode = g_deferred.q[k].mode;
+        int64_t flip_arg = g_deferred.q[k].arg;
+        uint64_t point = g_deferred.q[k].point;
+        pal_mutex_unlock(g_deferred.lock);
+        renderer *r = video_out_renderer();
+        if (r) renderer_complete_deferred(r, point);
+        if (flip) on_flip(NULL, handle, index, mode, flip_arg);
+        pal_mutex_lock(g_deferred.lock);
+        g_deferred.tail++;
+        pal_cond_broadcast(g_deferred.changed);
+    }
+    return 0;
+}
+
+/* Everything handed over is completed (flips on the display queue) */
+static void deferred_settle(void) {
+    if (!g_deferred.thread) return;
+    pal_mutex_lock(g_deferred.lock);
+    while (g_deferred.head != g_deferred.tail) pal_cond_wait(g_deferred.changed, g_deferred.lock);
+    pal_mutex_unlock(g_deferred.lock);
+}
+
+static bool deferred_enabled(int kind) {
+    static int flips = -1, suspends = -1, idles = -1;
+    if (flips < 0) flips = !getenv("PS5C_FLIP_DEFER") || atoi(getenv("PS5C_FLIP_DEFER"));
+    if (suspends < 0) suspends = !getenv("PS5C_SUSPEND_DEFER") || atoi(getenv("PS5C_SUSPEND_DEFER"));
+    if (idles < 0) idles = !getenv("PS5C_IDLE_DEFER") || atoi(getenv("PS5C_IDLE_DEFER"));
+    return !g_deferred.failed &&
+           (kind == RENDERER_DEFER_FLIP ? flips : kind == RENDERER_DEFER_IDLE ? idles : suspends);
+}
+
+/* Hands a flip, a suspend point or an idle queue over; false: the caller waits now (the ones handed over
+ * complete first) */
+static bool hand_over(renderer *r, int kind, int32_t handle, int32_t index, int32_t mode, int64_t arg) {
+    bool flip = kind == RENDERER_DEFER_FLIP;
+    uint64_t point = 0;
+    if (!r || !deferred_enabled(kind) || !renderer_submit_deferred(r, kind, &point)) {
+        deferred_settle();
+        return false;
+    }
+    if (!point) return true; /* nothing owed to guest memory */
+    if (!flip && g_deferred.thread) {
+        /* an entry still waiting completes every batch submitted up to its point: no second one for them
+         * (an idle GPU thread asks again every millisecond) */
+        pal_mutex_lock(g_deferred.lock);
+        bool covered = g_deferred.head != g_deferred.tail && g_deferred.newest >= point;
+        pal_mutex_unlock(g_deferred.lock);
+        if (covered) return true;
+    }
+    if (!g_deferred.thread) {
+        if (pal_mutex_create(&g_deferred.lock) != PS5C_OK || pal_cond_create(&g_deferred.changed) != PS5C_OK ||
+            pal_thread_create(&g_deferred.thread, deferred_thread, NULL, "gpu completions", 0) != PS5C_OK) {
+            g_deferred.failed = true;
+            g_deferred.thread = NULL;
+            LOG_W(GPU, "no thread for GPU completions: the GPU thread waits for them");
+            renderer_complete_deferred(r, point); /* its work is submitted: wait for it here */
+            if (flip) on_flip(NULL, handle, index, mode, arg);
+            return true;
+        }
+        LOG_I(GPU, "flips and suspend points: completed by their own thread after the GPU work "
+                   "(PS5C_FLIP_DEFER=0, PS5C_SUSPEND_DEFER=0: the GPU thread waits)");
+    }
+    pal_mutex_lock(g_deferred.lock);
+    while (g_deferred.head - g_deferred.tail == DEFERRED_ENTRIES) pal_cond_wait(g_deferred.changed, g_deferred.lock);
+    uint32_t k = g_deferred.head % DEFERRED_ENTRIES;
+    g_deferred.q[k].flip = flip;
+    g_deferred.q[k].handle = handle;
+    g_deferred.q[k].index = index;
+    g_deferred.q[k].mode = mode;
+    g_deferred.q[k].arg = arg;
+    g_deferred.q[k].point = point;
+    g_deferred.newest = point;
+    g_deferred.head++;
+    pal_cond_broadcast(g_deferred.changed);
+    pal_mutex_unlock(g_deferred.lock);
+    return true;
+}
+
+static bool on_flip_deferred(void *user, int32_t handle, int32_t index, int32_t mode, int64_t arg) {
+    PS5C_UNUSED(user);
+    worker_phase("flip (deferred)");
+    return hand_over(video_out_renderer(), RENDERER_DEFER_FLIP, handle, index, mode, arg);
+}
+
 static void on_wait_display(void *user, int32_t handle, int32_t index) {
     PS5C_UNUSED(user);
     worker_phase("wait for display buffer");
+    deferred_settle(); /* a flip of that buffer still handed over is not on the display queue yet */
     video_out_wait_buffer(handle, index, 100000000ull);
 }
 
@@ -159,7 +269,7 @@ static void on_interrupt(void *user, int32_t queue_event, uint32_t context_id) {
     for (uint32_t i = 0; i < g_drv.event_count; i++) {
         if (g_drv.events[i].id == queue_event) {
             /* one event per interrupt: the data (context id) of each is needed */
-            equeue_push(g_drv.events[i].eq, (uint64_t)queue_event, EVFILT_GRAPHICS_, data);
+            equeue_push(g_drv.events[i].eq, g_drv.events[i].ident, EVFILT_GRAPHICS_, data);
         }
     }
     pal_mutex_unlock(g_drv.lock);
@@ -248,10 +358,30 @@ static int32_t gpu_worker(void *arg) {
     /* PS5C_GPU_FAST_CORES=1: the command processor and recording run on P-cores (experiment) */
     const char *fast = getenv("PS5C_GPU_FAST_CORES");
     if (fast && atoi(fast)) LOG_I(GPU, "GPU thread on the fast cores: %s", pal_thread_prefer_fast_cores() ? "yes" : "no (one kind of core)");
+    /* PS5C_FULL_SPEED=1: the host does not slow the process down to save power (experiment) */
+    const char *full = getenv("PS5C_FULL_SPEED");
+    if (full && atoi(full)) LOG_I(GPU, "process at full speed (no power throttling): %s", pal_process_full_speed() ? "yes" : "no");
+    /* PS5C_GPU_STATS=1: where the command processor's second goes (commands, no work, only blocked jobs) */
+    const char *st_env = getenv("PS5C_GPU_STATS");
+    bool st = st_env && atoi(st_env);
+    uint64_t st_at = pal_time_ns(), st_run = 0, st_empty = 0, st_blocked = 0, st_jobs = 0, st_waits = 0, st_cpu = pal_thread_cpu_ns();
+    /* PS5C_GPU_PRIORITY=1: the command processor runs ahead of the game's threads (experiment) */
+    const char *prio = getenv("PS5C_GPU_PRIORITY");
+    if (prio && atoi(prio)) LOG_I(GPU, "GPU thread at high priority: %s", pal_thread_raise_priority() ? "yes" : "no");
     for (;;) {
+        if (st && pal_time_ns() - st_at >= 1000000000ull) {
+            uint64_t now = pal_time_ns(), all = now - st_at, busy = st_run + st_empty + st_blocked, cpu = pal_thread_cpu_ns();
+            LOG_I(GPU, "command processor time/s: commands %.1fms, empty queue %.1fms, only blocked jobs %.1fms, rest %.1fms; %llu jobs, %llu blocked waits; thread ran on a CPU %.1fms",
+                  st_run / 1e6 * 1e9 / all, st_empty / 1e6 * 1e9 / all, st_blocked / 1e6 * 1e9 / all,
+                  (all > busy ? all - busy : 0) / 1e6 * 1e9 / all, (unsigned long long)st_jobs, (unsigned long long)st_waits,
+                  (cpu - st_cpu) / 1e6 * 1e9 / all);
+            st_at = now; st_cpu = cpu; st_run = st_empty = st_blocked = st_jobs = st_waits = 0;
+        }
         worker_phase("idle");
         pal_mutex_lock(g_drv.q_lock);
+        uint64_t st_t = st && !g_drv.count ? pal_time_ns() : 0;
         while (!g_drv.count) pal_cond_wait(g_drv.q_changed, g_drv.q_lock);
+        if (st_t) st_empty += pal_time_ns() - st_t;
         uint64_t selected = g_drv.completed + 1;
         if (g_drv.cp_waits) {
             uint64_t first_ticket[CP_QUEUES] = {0}, now_ns = pal_time_ns();
@@ -275,13 +405,15 @@ static int32_t gpu_worker(void *arg) {
              * blocked. Its held labels/interrupts must reach the CPU even
              * though the ticket prefix cannot retire yet. */
             pal_mutex_unlock(g_drv.q_lock);
+            uint64_t st_b = st ? pal_time_ns() : 0;
             worker_phase("renderer_gpu_idle (no runnable job)");
             renderer *idle_renderer = video_out_renderer();
-            if (idle_renderer) renderer_gpu_idle(idle_renderer);
+            if (idle_renderer && !hand_over(idle_renderer, RENDERER_DEFER_IDLE, 0, 0, 0, 0)) renderer_gpu_idle(idle_renderer);
             pal_mutex_lock(g_drv.q_lock);
             /* CPU patches to REWIND/labels need not call the driver. */
             pal_cond_wait_ns(g_drv.q_changed, g_drv.q_lock, 1000000);
             pal_mutex_unlock(g_drv.q_lock);
+            if (st_b) st_blocked += pal_time_ns() - st_b;
             continue;
         }
         gpu_job job = g_drv.ring[selected % SUBMIT_RING];
@@ -328,10 +460,13 @@ static int32_t gpu_worker(void *arg) {
         gpu_exec_result result = GPU_EXEC_DONE;
         uint64_t executed = job.stream.executed;
         worker_phase("command processor");
+        if (r) renderer_prefetch_running(r, job.ticket);
+        uint64_t st_r = st ? pal_time_ns() : 0;
         if (!job.suspend || job.dwords) {
             if (g_drv.cp_waits) result = gpu_submit_resume(&g_drv.gpu, &job.stream, job.addr, job.dwords, job.queue_event);
             else gpu_submit(&g_drv.gpu, job.addr, job.dwords, job.queue_event);
         }
+        if (st_r) st_run += pal_time_ns() - st_r, st_jobs++, st_waits += result == GPU_EXEC_BLOCKED;
         if (result == GPU_EXEC_FAULT) {
             LOG_E(GPU, "invalid resumable CP stream ticket %llu queue %d at 0x%llx opcode %02x",
                   (unsigned long long)job.ticket, job.queue_event, (unsigned long long)job.stream.wait_packet,
@@ -364,7 +499,7 @@ static int32_t gpu_worker(void *arg) {
                           (unsigned long long)job.ticket, job.queue_event, (unsigned long long)job.stream.wait_packet,
                           w[0], w[1], w[2], w[3], w[4], w[5], w[6], (unsigned long long)value, g_drv.count);
             }
-            if (r && job.stream.executed != executed) renderer_gpu_idle(r);
+            if (r && job.stream.executed != executed && !hand_over(r, RENDERER_DEFER_IDLE, 0, 0, 0, 0)) renderer_gpu_idle(r);
             job.retry_ns = result == GPU_EXEC_BLOCKED ? pal_time_ns() + 1000000 : 0;
             pal_mutex_lock(g_drv.q_lock);
             g_drv.ring[selected % SUBMIT_RING] = job;
@@ -379,12 +514,14 @@ static int32_t gpu_worker(void *arg) {
                       (unsigned long long)job.ticket, job.queue_event, (pal_time_ns() - job.blocked_ns) / 1e6);
         }
         worker_phase("renderer_suspend_point");
-        if (r && job.suspend) renderer_suspend_point(r);
+        if (r && job.suspend && !hand_over(r, RENDERER_DEFER_SUSPEND, 0, 0, 0, 0)) renderer_suspend_point(r);
         pal_mutex_lock(g_drv.q_lock);
         bool idle = g_drv.count == 1;
         pal_mutex_unlock(g_drv.q_lock);
         worker_phase("renderer_gpu_idle");
-        if (r && idle) renderer_gpu_idle(r); /* releases the renderer holds: the game may wait for them */
+        /* releases the renderer holds: the game may wait for them */
+        if (r && idle && !hand_over(r, RENDERER_DEFER_IDLE, 0, 0, 0, 0)) renderer_gpu_idle(r);
+        if (job.rptr) gmem_write(g_drv.gpu.mem, job.rptr, &job.rptr_value, 4);
         pal_mutex_lock(g_drv.q_lock);
         job.done = true;
         g_drv.ring[selected % SUBMIT_RING] = job;
@@ -404,7 +541,8 @@ static int32_t gpu_worker(void *arg) {
 static gpu *get_gpu(hle_call *c);
 
 /* Queues a command buffer for the GPU thread (blocks while the ring is full). */
-static uint64_t enqueue(hle_call *c, guest_addr addr, uint32_t dwords, int32_t queue_event, bool suspend) {
+static uint64_t enqueue_rptr(hle_call *c, guest_addr addr, uint32_t dwords, int32_t queue_event, bool suspend,
+                             guest_addr rptr, uint32_t rptr_value) {
     get_gpu(c);
     static int check = -1; /* PS5C_LOG_OVERRUN: is the buffer already unparsable when submitted? */
     if (check < 0) check = getenv("PS5C_LOG_OVERRUN") != NULL;
@@ -436,11 +574,16 @@ static uint64_t enqueue(hle_call *c, guest_addr addr, uint32_t dwords, int32_t q
     }
     uint64_t ticket = ++g_drv.submitted;
     g_drv.ring[ticket % SUBMIT_RING] = (gpu_job){.addr=addr, .dwords=dwords, .queue_event=queue_event,
-        .snap=snap, .t=pal_time_ns(), .suspend=suspend, .ticket=ticket, .queue=queue};
+        .snap=snap, .t=pal_time_ns(), .suspend=suspend, .ticket=ticket, .queue=queue, .rptr=rptr, .rptr_value=rptr_value};
     g_drv.count++;
     pal_cond_broadcast(g_drv.q_changed);
     pal_mutex_unlock(g_drv.q_lock);
+    if (dwords && !suspend) renderer_prefetch_submit(video_out_renderer(), addr, dwords, ticket);
     return ticket;
+}
+
+static uint64_t enqueue(hle_call *c, guest_addr addr, uint32_t dwords, int32_t queue_event, bool suspend) {
+    return enqueue_rptr(c, addr, dwords, queue_event, suspend, 0, 0);
 }
 
 static void submit(hle_call *c, guest_addr addr, uint32_t dwords, int32_t queue_event) {
@@ -450,7 +593,7 @@ static void submit(hle_call *c, guest_addr addr, uint32_t dwords, int32_t queue_
 static gpu *get_gpu(hle_call *c) {
     pal_mutex_lock(g_drv.lock);
     if (!g_drv.gpu_ready) {
-        gpu_callbacks cb = {NULL, on_flip, on_interrupt, on_draw, on_dispatch, on_mem_written, on_sync_mem, on_release, on_cp_write, on_lod_stats, on_sample_counter, on_wait_display};
+        gpu_callbacks cb = {NULL, on_flip, on_interrupt, on_draw, on_dispatch, on_mem_written, on_sync_mem, on_release, on_cp_write, on_lod_stats, on_sample_counter, on_wait_display, on_flip_deferred};
         if (gpu_init(&g_drv.gpu, c->mem, &cb) != PS5C_OK) {
             LOG_E(GPU, "out of memory for the GPU state");
             pal_exit_process(3);
@@ -640,17 +783,15 @@ invalid:
 
 /* ---- Events ---- */
 
-/* int sceAgcDriverAddEqEvent(SceKernelEqueue eq, int id, void *udata) */
-static void add_eq_event(hle_call *c) {
-    uint64_t eq = hle_arg(c, 0);
-    int32_t id = hle_arg_s32(c, 1);
+/* An event of eq for the interrupts of queue id, reported to the game as ident */
+static void add_eq_registration(hle_call *c, uint64_t eq, int32_t id, uint64_t ident) {
     if (!equeue_valid(eq)) {
         hle_ret_s32(c, (int32_t)0x80020009); /* EBADF */
         return;
     }
     pal_mutex_lock(g_drv.lock);
     bool found = false;
-    for (uint32_t i = 0; i < g_drv.event_count; i++) found |= g_drv.events[i].eq == eq && g_drv.events[i].id == id;
+    for (uint32_t i = 0; i < g_drv.event_count; i++) found |= g_drv.events[i].eq == eq && g_drv.events[i].ident == ident;
     /* Keep every accepted registration: games can register the graphics
      * events plus all compute queues before their first submission. The
      * former 32-slot table silently lost later interrupts despite success. */
@@ -663,31 +804,50 @@ static void add_eq_event(hle_call *c) {
     }
     /* Reserve host tracking first, so allocation failure cannot leave an
      * apparently registered guest event that the GPU never notifies. */
-    if(!equeue_add(eq,(uint64_t)id,EVFILT_GRAPHICS_,hle_arg(c,2))) {
+    if(!equeue_add(eq,ident,EVFILT_GRAPHICS_,hle_arg(c,2))) {
         pal_mutex_unlock(g_drv.lock);hle_ret_s32(c,(int32_t)0x80020009);return;
     }
     if (!found) {
         g_drv.events[g_drv.event_count].eq = eq;
         g_drv.events[g_drv.event_count].id = id;
+        g_drv.events[g_drv.event_count].ident = ident;
         g_drv.event_count++;
     }
     pal_mutex_unlock(g_drv.lock);
     hle_ret_s32(c, 0);
 }
 
-static void delete_eq_event(hle_call *c) {
-    uint64_t eq = hle_arg(c, 0);
+/* int sceAgcDriverAddEqEvent(SceKernelEqueue eq, int id, void *udata) */
+static void add_eq_event(hle_call *c) {
     int32_t id = hle_arg_s32(c, 1);
+    add_eq_registration(c, hle_arg(c, 0), id, (uint64_t)id);
+}
+
+static void delete_eq_event(hle_call *c) {
+    uint64_t eq = hle_arg(c, 0), ident = (uint64_t)hle_arg_s32(c, 1);
     pal_mutex_lock(g_drv.lock);
     for (uint32_t i = 0; i < g_drv.event_count; i++) {
-        if (g_drv.events[i].eq == eq && g_drv.events[i].id == id) {
+        if (g_drv.events[i].eq == eq && g_drv.events[i].ident == ident) {
             g_drv.events[i] = g_drv.events[--g_drv.event_count];
             break;
         }
     }
     pal_mutex_unlock(g_drv.lock);
-    equeue_remove(eq, (uint64_t)id, EVFILT_GRAPHICS_);
+    equeue_remove(eq, ident, EVFILT_GRAPHICS_);
     hle_ret_s32(c, 0);
+}
+
+/* int sceGnmAddEqEvent(SceKernelEqueue eq, u64 type, void *udata), PS4 event types: 0..6 the
+ * RELEASE_MEM interrupts of compute pipe 0..6 (its rings), 0x40 the graphics end of pipe */
+#define GNM_EQ_GFX_EOP 0x40
+#define GNM_CQ_EVENT(pipe) (COMPUTE_QUEUE_EVENT_BASE + (int32_t)(pipe))
+static void gnm_add_eq_event(hle_call *c) {
+    uint64_t type = hle_arg(c, 1);
+    if (type != GNM_EQ_GFX_EOP && type >= 7) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    add_eq_registration(c, hle_arg(c, 0), type == GNM_EQ_GFX_EOP ? 0 : GNM_CQ_EVENT(type), type);
 }
 
 static const guest_kevent *event_arg(hle_call *c) {
@@ -848,6 +1008,13 @@ static guest_addr g_gnm_flips;
 static bool g_gnm_seen;
 static uint32_t g_gnm_flip_next;
 
+static void gnm_first_buffer(hle_call *c) {
+    if (g_gnm_seen) return;
+    g_gnm_seen = true;
+    get_gpu(c)->gcn = true;
+    LOG_I(GPU, "PS4 command buffers: GCN shaders, draws counted but not rendered yet");
+}
+
 /* Each command buffer of the arrays, by its size in bytes (constant buffers are not run) */
 static bool gnm_submit(hle_call *c, uint32_t count, guest_addr addrs, guest_addr sizes) {
     if (count > 4096) return false;
@@ -856,11 +1023,7 @@ static bool gnm_submit(hle_call *c, uint32_t count, guest_addr addrs, guest_addr
         uint32_t bytes = 0;
         if (!gmem_read_u64(c->mem, addrs + (uint64_t)i * 8, &addr) || !gmem_read(c->mem, sizes + (uint64_t)i * 4, &bytes, 4))
             return false;
-        if (addr && bytes >= 4 && !g_gnm_seen) {
-            g_gnm_seen = true;
-            get_gpu(c)->gcn = true;
-            LOG_I(GPU, "PS4 command buffers: GCN shaders, draws counted but not rendered yet");
-        }
+        if (addr && bytes >= 4) gnm_first_buffer(c);
         if (addr && bytes >= 4) submit(c, addr, bytes / 4, 0);
     }
     return true;
@@ -957,6 +1120,38 @@ static void gnm_set_vs_shader(hle_call *c) {
     gnm_space_close(c, &sp);
 }
 
+/* The geometry-shader stages of PS4 draws (Tearaway Unfolded):
+ * int sceGnmSetEsShader(u32 *cmd, u32 dwords (20), const EsStageRegisters *regs, u32 modifier):
+ * {pgm lo, pgm hi, rsrc1, rsrc2}; int sceGnmSetGsShader(u32 *cmd, u32 dwords (29), const
+ * GsStageRegisters *regs): {pgm lo, pgm hi, rsrc1, rsrc2, VGT_STRMOUT_CONFIG,
+ * VGT_GS_OUT_PRIM_TYPE, VGT_GS_INSTANCE_CNT}. The rest of the space is a NOP: left as zeros
+ * it parsed as type 0 packets that swallowed the packet after them. */
+static void gnm_set_es_shader(hle_call *c) {
+    gnm_space sp;
+    const uint32_t *r = (const uint32_t *)hle_mem(c, hle_arg_ptr(c, 2), 4 * 4);
+    if (!gnm_space_open(c, &sp) || !r) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    uint32_t pgm[4] = {r[0], r[1], gnm_rsrc1(r[2], hle_arg_u32(c, 3)), r[3]};
+    gnm_set_regs(&sp, 0x2CC8u, pgm, 4);     /* SPI_SHADER_PGM_LO_ES .. RSRC2_ES */
+    gnm_space_close(c, &sp);
+}
+
+static void gnm_set_gs_shader(hle_call *c) {
+    gnm_space sp;
+    const uint32_t *r = (const uint32_t *)hle_mem(c, hle_arg_ptr(c, 2), 7 * 4);
+    if (!gnm_space_open(c, &sp) || !r) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    gnm_set_regs(&sp, 0x2C88u, r, 4);       /* SPI_SHADER_PGM_LO_GS .. RSRC2_GS */
+    gnm_set_regs(&sp, 0xA2E5u, r + 4, 1);   /* VGT_STRMOUT_CONFIG */
+    gnm_set_regs(&sp, 0xA29Bu, r + 5, 1);   /* VGT_GS_OUT_PRIM_TYPE */
+    gnm_set_regs(&sp, 0xA2E4u, r + 6, 1);   /* VGT_GS_INSTANCE_CNT */
+    gnm_space_close(c, &sp);
+}
+
 /* int sceGnmSetPsShader350(u32 *cmd, u32 dwords, const PsStageRegisters *regs):
  * {pgm lo, pgm hi, rsrc1, rsrc2, Z_FORMAT, COL_FORMAT, PS_INPUT_ENA, PS_INPUT_ADDR, PS_IN_CONTROL,
  *  BARYC_CNTL, DB_SHADER_CONTROL, CB_SHADER_MASK}; no registers: a pixel stage that does nothing */
@@ -1041,6 +1236,26 @@ static void gnm_draw_index_auto(hle_call *c) {
     gnm_space_close(c, &sp);
 }
 
+/* int sceGnmDrawIndex(u32 *cmd, u32 dwords, u32 count, const void *indices, u32 flags, u32 type):
+ * DRAW_INDEX_2 (max size, base, count, initiator 0), predicated by flags bit 0; the index size is
+ * the one the command buffer set before (VGT_INDEX_TYPE) */
+static void gnm_draw_index(hle_call *c) {
+    gnm_space sp;
+    uint64_t indices = hle_arg(c, 3);
+    if (!gnm_space_open(c, &sp) || sp.cap < 6 || !indices || (indices & 1)) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    uint32_t count = hle_arg_u32(c, 2);
+    sp.p[sp.n++] = 0xC0042700u | (hle_arg_u32(c, 4) & 1u);
+    sp.p[sp.n++] = count;
+    sp.p[sp.n++] = (uint32_t)indices;
+    sp.p[sp.n++] = (uint32_t)(indices >> 32);
+    sp.p[sp.n++] = count;
+    sp.p[sp.n++] = 0;
+    gnm_space_close(c, &sp);
+}
+
 static void gnm_nop_fill(hle_call *c) {
     uint32_t dwords = hle_arg_u32(c, 1);
     uint32_t *dst = dwords >= 2 && dwords <= 0x4000 ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 0), (uint64_t)dwords * 4) : NULL;
@@ -1053,6 +1268,113 @@ static void gnm_nop_fill(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
+/* int sceGnmSetCsShader(u32 *cmd, u32 dwords, const CsStageRegisters *regs):
+ * {pgm lo, pgm hi, rsrc1, rsrc2, NUM_THREAD_X, Y, Z}; ...WithModifier(cmd, dwords, regs, modifier)
+ * replaces the low VGPR/SGPR fields of RSRC1 as the vertex stage does */
+static void gnm_set_cs(hle_call *c, uint32_t modifier) {
+    gnm_space sp;
+    const uint32_t *r = hle_arg_ptr(c, 2) ? (const uint32_t *)hle_mem(c, hle_arg_ptr(c, 2), 7 * 4) : NULL;
+    if (!gnm_space_open(c, &sp) || !r) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    uint32_t rsrc[2] = {gnm_rsrc1(r[2], modifier), r[3]};
+    gnm_set_regs(&sp, 0x2E0Cu, r, 2);    /* COMPUTE_PGM_LO, HI */
+    gnm_set_regs(&sp, 0x2E12u, rsrc, 2); /* COMPUTE_PGM_RSRC1, RSRC2 */
+    gnm_set_regs(&sp, 0x2E07u, r + 4, 3); /* COMPUTE_NUM_THREAD_X, Y, Z */
+    gnm_space_close(c, &sp);
+}
+static void gnm_set_cs_shader(hle_call *c) { gnm_set_cs(c, 0); }
+static void gnm_set_cs_shader_modifier(hle_call *c) { gnm_set_cs(c, hle_arg_u32(c, 3)); }
+
+/* u32 sceGnmDispatchInitDefaultHardwareState(u32 *cmd, u64 dwords): a compute ring's default
+ * state in a fixed 256-dword block (0 when there is less room): every CU of the four shader
+ * engines open to its waves, the wave limits libSceGnm sets, NOP after; returns the block size */
+static void gnm_dispatch_init_default(hle_call *c) {
+    uint64_t room = hle_arg(c, 1);
+    gnm_space sp = {NULL, 0, 256};
+    sp.p = room >= 256 ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 0), 256 * 4) : NULL;
+    if (!sp.p) {
+        hle_ret_u32(c, 0);
+        return;
+    }
+    static const uint32_t all[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}, limits = 0x170u;
+    gnm_set_regs(&sp, 0x2E16u, all, 2);     /* COMPUTE_STATIC_THREAD_MGMT_SE0, SE1 */
+    gnm_set_regs(&sp, 0x2E19u, all, 2);     /* COMPUTE_STATIC_THREAD_MGMT_SE2, SE3 */
+    gnm_set_regs(&sp, 0x2E15u, &limits, 1); /* COMPUTE_RESOURCE_LIMITS */
+    sp.p[sp.n] = 0xC0001000u | ((256 - sp.n - 2) << 16); /* type 3 NOP over the rest */
+    memset(sp.p + sp.n + 1, 0, (size_t)(256 - sp.n - 1) * 4);
+    hle_ret_u32(c, 256);
+}
+
+/* sceGnmInsertPushMarker(cmd, dwords, name), PushColorMarker(cmd, dwords, name, color),
+ * PopMarker(cmd, dwords): debugger markers, a NOP over the space the game reserved */
+
+/* PS4 compute rings (sceGnmMapComputeQueue): the game writes packets into a ring and rings the
+ * doorbell with the new write offset; the queue runs them in order, then moves the read pointer.
+ * Ids 1..64 (0 is none), 7 pipes of 8 queues. */
+#define GNM_CQ_MAX 64
+static struct gnm_cq {
+    bool used;
+    guest_addr base, rptr;
+    uint32_t size_dw, offs, pipe;
+} g_gnm_cq[GNM_CQ_MAX];
+
+/* int sceGnmMapComputeQueue(u32 pipe, u32 queue, void *ring, u32 ring_dwords, u32 *read_ptr);
+ * ...WithPriority adds a priority: the queue id, or an error */
+static void gnm_map_compute_queue(hle_call *c) {
+    uint32_t pipe = hle_arg_u32(c, 0), queue = hle_arg_u32(c, 1), size = hle_arg_u32(c, 3);
+    guest_addr ring = hle_arg_ptr(c, 2), rptr = hle_arg_ptr(c, 4);
+    if (pipe >= 7 || queue >= 8 || !ring || (ring & 0xFF) || size < 4 || (size & (size - 1)) || !rptr || (rptr & 3) ||
+        !hle_mem(c, ring, (uint64_t)size * 4) || !hle_mem(c, rptr, 4)) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    pal_mutex_lock(g_drv.lock);
+    int id = -1;
+    for (int i = 0; i < GNM_CQ_MAX && id < 0; i++)
+        if (!g_gnm_cq[i].used) id = i;
+    if (id >= 0) g_gnm_cq[id] = (struct gnm_cq){.used = true, .base = ring, .rptr = rptr, .size_dw = size, .pipe = pipe};
+    pal_mutex_unlock(g_drv.lock);
+    if (id < 0) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_ENOMEM);
+        return;
+    }
+    uint32_t zero = 0;
+    gmem_write(c->mem, rptr, &zero, 4);
+    LOG_I(GPU, "PS4 compute queue %d: pipe %u queue %u, ring 0x%llx (%u dwords)", id + 1, pipe, queue,
+          (unsigned long long)ring, size);
+    hle_ret_s32(c, id + 1);
+}
+
+static void gnm_unmap_compute_queue(hle_call *c) {
+    uint32_t id = hle_arg_u32(c, 0);
+    pal_mutex_lock(g_drv.lock);
+    if (id >= 1 && id <= GNM_CQ_MAX) g_gnm_cq[id - 1].used = false;
+    pal_mutex_unlock(g_drv.lock);
+    hle_ret_s32(c, 0);
+}
+
+/* void sceGnmDingDong(u32 queue_id, u32 next_offset_dwords): the packets from the last offset to
+ * this one (two parts when they wrap past the ring's end) */
+static void gnm_ding_dong(hle_call *c) {
+    uint32_t id = hle_arg_u32(c, 0), next = hle_arg_u32(c, 1);
+    pal_mutex_lock(g_drv.lock);
+    struct gnm_cq q = id >= 1 && id <= GNM_CQ_MAX ? g_gnm_cq[id - 1] : (struct gnm_cq){0};
+    if (q.used && next <= q.size_dw) g_gnm_cq[id - 1].offs = next == q.size_dw ? 0 : next;
+    pal_mutex_unlock(g_drv.lock);
+    if (!q.used || next > q.size_dw) return;
+    gnm_first_buffer(c);
+    int32_t event = GNM_CQ_EVENT(q.pipe); /* interrupts go to the pipe's event type */
+    uint32_t end = next == q.size_dw ? 0 : next;
+    if (next < q.offs) { /* wrapped */
+        enqueue_rptr(c, q.base + (uint64_t)q.offs * 4, q.size_dw - q.offs, event, false, next ? 0 : q.rptr, 0);
+        if (next) enqueue_rptr(c, q.base, next, event, false, q.rptr, end);
+    } else if (next > q.offs) {
+        enqueue_rptr(c, q.base + (uint64_t)q.offs * 4, next - q.offs, event, false, q.rptr, end);
+    }
+}
+
 static const hle_export k_gnm_exports[] = {
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSubmitCommandBuffers", gnm_submit_command_buffers),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSubmitAndFlipCommandBuffers", gnm_submit_and_flip),
@@ -1063,8 +1385,31 @@ static const hle_export k_gnm_exports[] = {
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmUpdateVsShader", gnm_set_vs_shader), /* same space, a later frame */
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmUpdatePsShader350", gnm_set_ps_shader),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawIndexAuto", gnm_draw_index_auto),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawIndex", gnm_draw_index),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitDefaultHardwareState350", gnm_init_default_state),
     HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitToDefaultContextState400", gnm_init_default_context400),
+    /* the SDK 1.x/2.x names (Tearaway Unfolded, CUSA01607): same registers, or the fixed
+     * 256-dword block the default state fills */
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSetPsShader", gnm_set_ps_shader),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmUpdatePsShader", gnm_set_ps_shader),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSetCsShader", gnm_set_cs_shader),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSetEsShader", gnm_set_es_shader),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSetGsShader", gnm_set_gs_shader),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmSetCsShaderWithModifier", gnm_set_cs_shader_modifier),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitDefaultHardwareState", gnm_init_default_context400),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitDefaultHardwareState175", gnm_init_default_context400),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDrawInitDefaultHardwareState200", gnm_init_default_context400),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmInsertPushMarker", gnm_nop_fill),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmInsertPushColorMarker", gnm_nop_fill),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmInsertPopMarker", gnm_nop_fill),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmIsUserPaEnabled", ok_), /* 0: a retail console */
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmMapComputeQueue", gnm_map_compute_queue),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmMapComputeQueueWithPriority", gnm_map_compute_queue),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmUnmapComputeQueue", gnm_unmap_compute_queue),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDingDong", gnm_ding_dong),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDispatchInitDefaultHardwareState", gnm_dispatch_init_default),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmAddEqEvent", gnm_add_eq_event),
+    HLE_FUNC_ENTRY("libSceGnmDriver", "sceGnmDeleteEqEvent", delete_eq_event),
 };
 
 static const hle_export k_exports[] = {
@@ -1117,6 +1462,12 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverIsPaDebug", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverIsCaptureInProgress", capture_in_progress),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverRegisterWorkloadStream", register_workload_stream),
+    /* workload markers (GPU workload accounting): no packet, nothing to track here
+     * (Jurassic Park Classic Games Collection) */
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverGetSetWorkloadsActivePacketSize", ok_),
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverSetWorkloadsActive", ok_),
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverGetSetWorkloadCompletePacketSize", ok_),
+    HLE_FUNC_ENTRY(LIB, "sceAgcDriverSetWorkloadComplete", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverGetTraceInitiator", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverUserDataGetPacketSize", ok_),
     HLE_FUNC_ENTRY(LIB, "sceAgcDriverUserDataWritePacket", ok_),

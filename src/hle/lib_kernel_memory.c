@@ -7,6 +7,7 @@
  * separate "physical" space. Mappings are views of one shared memory object
  * where the host allows it; elsewhere they are private copies whose bytes
  * follow the physical pages from one mapping to the next (phys_save). */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,23 @@ typedef struct dmem_alias {
 static DYNARRAY(dmem_alias) g_aliases;
 
 /* Caller holds g_lock. Forgets mappings inside [addr, addr + len). */
+/* PS5C_KMEM_STATS: the last direct maps taken away, to see whether the next map puts the same pages back */
+static dmem_map g_gone[256];
+static uint32_t g_gone_at;
+static _Atomic uint64_t g_remap[4]; /* same view, same address other pages, same pages other address, neither */
+static bool kstat_on(void);
+static void remap_count(guest_addr addr, uint64_t phys, uint64_t len) {
+    int kind = 3;
+    for (uint32_t i = 0; i < 256 && kind; i++) {
+        const dmem_map *g = &g_gone[i];
+        if (!g->len) continue;
+        if (g->addr == addr && g->phys == phys && g->len == len) kind = 0;
+        else if (g->addr == addr && kind > 1) kind = 1;
+        else if (g->phys == phys && kind > 2) kind = 2;
+    }
+    atomic_fetch_add(&g_remap[kind], 1);
+}
+
 static void dmaps_forget(guest_addr addr, uint64_t len) {
     for (size_t i = 0; i < g_dmaps.len;) {
         dmem_map *m = &g_dmaps.data[i];
@@ -80,6 +98,7 @@ static void dmaps_forget(guest_addr addr, uint64_t len) {
             continue;
         }
         if (m->addr >= addr && m->addr + m->len <= addr + len) {
+            if (kstat_on()) g_gone[g_gone_at++ % 256] = *m;
             *m = g_dmaps.data[--g_dmaps.len];
             continue;
         }
@@ -96,6 +115,32 @@ static void dmaps_forget(guest_addr addr, uint64_t len) {
     }
 }
 static pal_mutex *g_lock;
+static bool kstat_on(void);
+static _Atomic uint64_t g_glock_n, g_glock_ns, g_glock_max, g_ghold_ns, g_ghold_max, g_gzero_ns, g_gzero_bytes;
+static _Thread_local uint64_t t_glock_at;
+/* g_lock, with its waits counted under PS5C_KMEM_STATS=1 */
+static void glock(void) {
+    if (!kstat_on()) {
+        pal_mutex_lock(g_lock);
+        return;
+    }
+    uint64_t t0 = pal_time_ns();
+    pal_mutex_lock(g_lock);
+    uint64_t ns = pal_time_ns() - t0, mx = atomic_load(&g_glock_max);
+    atomic_fetch_add(&g_glock_n, 1);
+    atomic_fetch_add(&g_glock_ns, ns);
+    while (ns > mx && !atomic_compare_exchange_weak(&g_glock_max, &mx, ns)) {}
+    t_glock_at = pal_time_ns();
+}
+static void gunlock(void) {
+    uint64_t at = t_glock_at;
+    t_glock_at = 0;
+    pal_mutex_unlock(g_lock);
+    if (!at) return;
+    uint64_t ns = pal_time_ns() - at, mx = atomic_load(&g_ghold_max);
+    atomic_fetch_add(&g_ghold_ns, ns);
+    while (ns > mx && !atomic_compare_exchange_weak(&g_ghold_max, &mx, ns)) {}
+}
 
 /* Physical pages released since they were last mapped: the shared memory
  * object keeps their bytes, while the console hands out zeroed memory, so
@@ -105,6 +150,74 @@ static uint8_t g_stale[GUEST_SHM_SIZE / GUEST_PAGE_SIZE / 8];
 static void stale_mark(uint64_t start, uint64_t end) {
     for (uint64_t p = start / GUEST_PAGE_SIZE; p < end / GUEST_PAGE_SIZE && p < sizeof(g_stale) * 8; p++)
         g_stale[p >> 3] |= (uint8_t)(1u << (p & 7));
+}
+
+static void stale_clear(gmem *mem, guest_addr addr, uint64_t phys, uint64_t len, uint32_t gprot);
+
+/* Caller holds g_lock. The stale pages of [phys, phys + len) become fresh: returns which ones (bit i = page i,
+ * the caller zeroes them with stale_zero after it lets the lock go: ~1-2 MiB at each of Minecraft's hundreds of
+ * maps a second kept every other memory call waiting). NULL with *any: no memory for the list (zeroed now). */
+static uint8_t *stale_take(gmem *mem, guest_addr addr, uint64_t phys, uint64_t len, uint32_t gprot, bool *any) {
+    uint64_t pages = (len + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE;
+    uint8_t *marks = NULL;
+    *any = false;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t p = phys / GUEST_PAGE_SIZE + i;
+        if (p >= sizeof(g_stale) * 8 || !((g_stale[p >> 3] >> (p & 7)) & 1)) continue;
+        if (!marks && !(marks = calloc((size_t)((pages + 7) / 8), 1))) {
+            *any = true;
+            stale_clear(mem, addr, phys, len, gprot);
+            return NULL;
+        }
+        *any = true;
+        marks[i >> 3] |= (uint8_t)(1u << (i & 7));
+        g_stale[p >> 3] &= (uint8_t)~(1u << (p & 7));
+    }
+    return marks;
+}
+
+/* PS5C_ZERO_WINDOW=0: stale pages are zeroed through the new view, as before */
+static bool zero_window_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PS5C_ZERO_WINDOW");
+        on = !e || atoi(e) != 0;
+    }
+    return on != 0;
+}
+
+/* Zeroes the pages stale_take returned in the view [addr, addr + len) of phys and frees the list. The host view
+ * of the whole object stays mapped, so its pages fault once: through the new view every page faulted first
+ * (~0.5 GB/s, 0.2-0.4 s a second of Minecraft's threads), and pages only the GPU uses never fault there now. */
+static void stale_zero(gmem *mem, guest_addr addr, uint64_t phys, uint64_t len, uint32_t gprot, uint8_t *marks) {
+    if (!marks) return;
+    uint64_t t0 = kstat_on() ? pal_time_ns() : 0, bytes = 0;
+    uint8_t *win = zero_window_on() && phys + len <= GUEST_SHM_SIZE ? gmem_phys_window(mem) : NULL;
+    if (win) {
+        for (uint64_t i = 0, pages = (len + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE; i < pages; i++) {
+            if (!((marks[i >> 3] >> (i & 7)) & 1)) continue;
+            uint64_t run = 1;
+            while (i + run < pages && ((marks[(i + run) >> 3] >> ((i + run) & 7)) & 1)) run++;
+            memset(win + phys + i * GUEST_PAGE_SIZE, 0, (size_t)(run * GUEST_PAGE_SIZE));
+            bytes += run * GUEST_PAGE_SIZE;
+            i += run - 1;
+        }
+        free(marks);
+        if (t0) atomic_fetch_add(&g_gzero_ns, pal_time_ns() - t0), atomic_fetch_add(&g_gzero_bytes, bytes);
+        return;
+    }
+    if (!(gprot & GPROT_WRITE)) gmem_protect(mem, addr, len, GPROT_RW);
+    for (uint64_t i = 0, pages = (len + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE; i < pages; i++) {
+        if (!((marks[i >> 3] >> (i & 7)) & 1)) continue;
+        uint64_t run = 1;
+        while (i + run < pages && ((marks[(i + run) >> 3] >> ((i + run) & 7)) & 1)) run++;
+        uint8_t *h = gmem_host(mem, addr + i * GUEST_PAGE_SIZE, run * GUEST_PAGE_SIZE);
+        if (h) memset(h, 0, (size_t)(run * GUEST_PAGE_SIZE)), bytes += run * GUEST_PAGE_SIZE;
+        i += run - 1;
+    }
+    if (!(gprot & GPROT_WRITE)) gmem_protect(mem, addr, len, gprot);
+    free(marks);
+    if (t0) atomic_fetch_add(&g_gzero_ns, pal_time_ns() - t0), atomic_fetch_add(&g_gzero_bytes, bytes);
 }
 
 /* Zeroes the stale pages of the view [addr, addr + len) of phys (then fresh). */
@@ -154,6 +267,7 @@ static bool stale_page(uint64_t phys) {
 
 /* Caller holds g_lock. Saves the private direct mappings in [addr, addr + len). */
 static void phys_save(gmem *mem, guest_addr addr, uint64_t len) {
+    if (addr >= mem->ph_start) return; /* only views there: the object has the bytes */
     for (size_t i = 0; i < g_dmaps.len; i++) {
         const dmem_map *m = &g_dmaps.data[i];
         if (m->addr >= mem->ph_start) continue; /* a view: the object has the bytes */
@@ -240,10 +354,21 @@ static bool is_pow2(uint64_t v) { return v && !(v & (v - 1)); }
 
 /* ---- Direct memory ---- */
 
+/* Caller holds g_lock. Index of the first allocation that ends above phys (g_dmem is sorted, disjoint). */
+static size_t dmem_lower_bound(uint64_t phys) {
+    size_t lo = 0, hi = g_dmem.len;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (g_dmem.data[mid].start + g_dmem.data[mid].size <= phys) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 /* First fit in [start, end) at `align`. Caller holds g_lock. */
 static bool dmem_find(uint64_t start, uint64_t end, uint64_t size, uint64_t align, uint64_t *out) {
     uint64_t cand = PS5C_ALIGN_UP(start, align);
-    for (size_t i = 0; i <= g_dmem.len; i++) {
+    for (size_t i = dmem_lower_bound(cand); i <= g_dmem.len; i++) {
         uint64_t limit = i < g_dmem.len ? g_dmem.data[i].start : DIRECT_MEMORY_SIZE;
         if (limit > end) limit = end;
         if (limit >= cand && limit - cand >= size) {
@@ -265,13 +390,12 @@ static int32_t dmem_allocate(uint64_t start, uint64_t end, uint64_t size, uint64
         return SCE_KERNEL_ERROR_EINVAL;
     }
     if (end > DIRECT_MEMORY_SIZE) end = DIRECT_MEMORY_SIZE;
-    pal_mutex_lock(g_lock);
+    glock();
     uint64_t at = 0;
     int32_t ret = SCE_KERNEL_ERROR_EAGAIN;
     if (dmem_find(start, end, size, align, &at)) {
         dmem_block b = {at, size, type, 0};
-        size_t i = 0;
-        while (i < g_dmem.len && g_dmem.data[i].start < at) i++;
+        size_t i = dmem_lower_bound(at);
         if (dyn_reserve(&g_dmem, g_dmem.len + 1)) {
             memmove(&g_dmem.data[i + 1], &g_dmem.data[i], (g_dmem.len - i) * sizeof(dmem_block));
             g_dmem.data[i] = b;
@@ -282,7 +406,7 @@ static int32_t dmem_allocate(uint64_t start, uint64_t end, uint64_t size, uint64
             ret = SCE_KERNEL_ERROR_ENOMEM;
         }
     }
-    pal_mutex_unlock(g_lock);
+    gunlock();
     return ret;
 }
 
@@ -311,6 +435,18 @@ static void allocate_main_direct_memory(hle_call *c) {
     hle_ret_s32(c, ret);
 }
 
+/* int sceKernelReleaseFlexibleMemory(void *addr, size_t len): the pages give their share of
+ * the flexible budget back and stay mapped (rps5e, AnyPS5); a NULL or unaligned range is EINVAL */
+static void release_flexible_memory(hle_call *c) {
+    guest_addr addr = hle_arg_ptr(c, 0);
+    uint64_t len = hle_arg(c, 1);
+    if (!addr || gmem_release_flexible(c->mem, addr, len) != PS5C_OK) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    hle_ret_s32(c, 0);
+}
+
 /* int sceKernelReleaseDirectMemory(off_t start, size_t len) */
 /* Releases every allocated page in [start, start + len): blocks inside are
  * dropped, blocks crossing an edge are trimmed or split. `checked` fails with
@@ -320,12 +456,13 @@ static int32_t release_direct(uint64_t start, uint64_t len, bool checked) {
     uint64_t end = start + len;
     bool touched = false;
     int32_t ret = 0;
-    pal_mutex_lock(g_lock);
+    glock();
     stale_mark(start, end);
-    for (size_t i = 0; i < g_dmem.len;) {
+    for (size_t i = dmem_lower_bound(start); i < g_dmem.len;) {
         dmem_block *b = &g_dmem.data[i];
         uint64_t bs = b->start, be = b->start + b->size;
-        if (be <= start || bs >= end) {
+        if (bs >= end) break; /* sorted: none further in the range */
+        if (be <= start) {
             i++;
             continue;
         }
@@ -360,7 +497,7 @@ static int32_t release_direct(uint64_t start, uint64_t len, bool checked) {
         }
         i++;
     }
-    pal_mutex_unlock(g_lock);
+    gunlock();
     if (ret == 0 && checked && !touched) ret = SCE_KERNEL_ERROR_ENOENT;
     return ret;
 }
@@ -383,7 +520,7 @@ static void direct_memory_query(hle_call *c) {
         return;
     }
     const dmem_block *hit = NULL;
-    pal_mutex_lock(g_lock);
+    glock();
     for (size_t i = 0; i < g_dmem.len && !hit; i++) {
         const dmem_block *b = &g_dmem.data[i];
         if ((off >= b->start && off < b->start + b->size) || (next && b->start >= off)) hit = b;
@@ -394,7 +531,7 @@ static void direct_memory_query(hle_call *c) {
         info[1] = hit->start + hit->size;
         info[2] = (uint64_t)(uint32_t)hit->type;
     }
-    pal_mutex_unlock(g_lock);
+    gunlock();
     if (!hit) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EACCES);
         return;
@@ -419,7 +556,7 @@ static void available_direct_memory_size(hle_call *c) {
     if (end > DIRECT_MEMORY_SIZE) end = DIRECT_MEMORY_SIZE;
     /* Largest free, aligned range */
     uint64_t best_at = 0, best = 0;
-    pal_mutex_lock(g_lock);
+    glock();
     uint64_t cursor = start;
     for (size_t i = 0; i <= g_dmem.len; i++) {
         uint64_t limit = i < g_dmem.len ? PS5C_MIN(g_dmem.data[i].start, end) : end;
@@ -430,7 +567,7 @@ static void available_direct_memory_size(hle_call *c) {
         }
         if (i < g_dmem.len) cursor = PS5C_MAX(cursor, g_dmem.data[i].start + g_dmem.data[i].size);
     }
-    pal_mutex_unlock(g_lock);
+    gunlock();
     if (!best) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_ENOMEM);
         return;
@@ -443,11 +580,76 @@ static void available_direct_memory_size(hle_call *c) {
 /* ---- Mapping ---- */
 
 /* Common path of every map call. `*addr` is in/out. */
+/* Parked views: a fixed reserve over a whole view of direct memory keeps the host view, and a map
+ * of the same pages at the same place takes it back. Minecraft recycles its pools this way ~1000
+ * times a second while a world builds (63% of its maps put the same view back): each round trip
+ * unmapped and mapped a host view, waited for the renderer's pins and faulted every page in again.
+ * The guest sees reserved memory there; any other call over the range drops the record and gmem
+ * replaces the view as usual. Caller holds g_lock for the list. PS5C_PARK_VIEWS=1: on (experiment). */
+typedef struct { guest_addr addr; uint64_t len, phys; uint32_t gprot; } parked_view;
+static parked_view g_parked[1024];
+static uint32_t g_parked_n;
+static _Atomic uint64_t g_park_n[3]; /* parked, taken back, dropped */
+
+static bool park_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PS5C_PARK_VIEWS");
+        on = e && atoi(e) != 0;
+    }
+    return on != 0;
+}
+
+/* Without g_lock: parked views overlapping [addr, addr + len) become the reserved ranges the guest asked for */
+static void park_drop(gmem *mem, guest_addr addr, uint64_t len) {
+    parked_view gone[16];
+    for (;;) {
+        uint32_t n = 0;
+        glock();
+        for (uint32_t i = 0; i < g_parked_n && n < 16;) {
+            if (g_parked[i].addr < addr + len && addr < g_parked[i].addr + g_parked[i].len) {
+                gone[n++] = g_parked[i];
+                g_parked[i] = g_parked[--g_parked_n];
+            } else i++;
+        }
+        gunlock();
+        for (uint32_t i = 0; i < n; i++) {
+            guest_addr out = 0;
+            atomic_fetch_add(&g_park_n[2], 1);
+            if (gmem_map_aligned(mem, gone[i].addr, gone[i].len, GUEST_PAGE_SIZE, GPROT_NONE,
+                                 GMAP_RESERVE | GMAP_SHARED_AREA | GMAP_FIXED | GMAP_REPLACE, "reserved", &out) != PS5C_OK)
+                LOG_W(KERNEL, "parked view 0x%llx+0x%llx: reserve failed", (unsigned long long)gone[i].addr,
+                      (unsigned long long)gone[i].len);
+        }
+        if (n < 16) return;
+    }
+}
+
+/* Caller holds g_lock: [addr, addr + len) is exactly one parked view (of phys unless phys is ~0) */
+static bool park_exact(guest_addr addr, uint64_t len, uint64_t phys) {
+    for (uint32_t i = 0; i < g_parked_n; i++)
+        if (g_parked[i].addr == addr) return g_parked[i].len == len && (phys == ~0ull || g_parked[i].phys == phys);
+    return false;
+}
+
+static bool park_take(guest_addr addr, uint64_t len, uint64_t phys, uint32_t *gprot) {
+    for (uint32_t i = 0; i < g_parked_n; i++) {
+        if (g_parked[i].addr != addr) continue;
+        if (g_parked[i].len != len || g_parked[i].phys != phys) return false;
+        *gprot = g_parked[i].gprot;
+        g_parked[i] = g_parked[--g_parked_n];
+        atomic_fetch_add(&g_park_n[1], 1);
+        return true;
+    }
+    return false;
+}
+
 static int32_t map_memory(hle_call *c, guest_addr *addr, uint64_t len, uint32_t prot, uint32_t flags,
                           uint64_t align, const char *name, bool demand,bool flexible) {
     if (!len || len % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
     if (align && (!is_pow2(align) || align % GUEST_PAGE_SIZE)) return SCE_KERNEL_ERROR_EINVAL;
     gmem *mem = c->mem;
+    if (flags & MAP_FIXED) park_drop(mem, *addr, len);
     uint32_t gflags = 0;
     if (flags & MAP_FIXED) {
         if (*addr % GUEST_PAGE_SIZE || *addr>UINT64_MAX-len) return SCE_KERNEL_ERROR_EINVAL;
@@ -460,7 +662,7 @@ static int32_t map_memory(hle_call *c, guest_addr *addr, uint64_t len, uint32_t 
          * (with NO_OVERWRITE, only placeholders are left at this point), in
          * one step: another thread must not take the range in between. */
         gflags = GMAP_FIXED | GMAP_REPLACE;
-        pal_mutex_lock(g_lock);
+        glock();
         phys_save(mem, *addr, len);
         if(!flexible)dmaps_forget(*addr,len);
         /* Keep direct translation until the replacement actually succeeds.
@@ -478,7 +680,7 @@ static int32_t map_memory(hle_call *c, guest_addr *addr, uint64_t len, uint32_t 
          * Once replacement starts, retain main's conservative invalidation
          * even if a host unit/backing fails after partial removal. */
         if(flexible && (err==PS5C_OK || replacement_started))dmaps_forget(*addr,len);
-        pal_mutex_unlock(g_lock);
+        gunlock();
     }
     if (err != PS5C_OK) {
         LOG_W(KERNEL, "map '%s' 0x%llx bytes at 0x%llx failed: %s", name, (unsigned long long)len,
@@ -494,19 +696,26 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
                              uint64_t phys, uint64_t align, const char *name) {
     if (phys % GUEST_PAGE_SIZE || !len || len > UINT64_MAX - phys)
         return SCE_KERNEL_ERROR_EINVAL;
+    bool parked = false; /* these very pages wait parked there: taken back below */
+    if (flags & MAP_FIXED) {
+        glock();
+        parked = park_exact(*addr, PS5C_ALIGN_UP(len, GUEST_PAGE_SIZE), phys);
+        gunlock();
+        if (!parked) park_drop(c->mem, *addr, PS5C_ALIGN_UP(len, GUEST_PAGE_SIZE));
+    }
     /* Keep the existing gmem page rounding for lengths. Physical allocation
      * boundaries are page aligned, so complete byte coverage also covers the
      * rounded final page; do not introduce a new size-alignment rejection. */
     /* Every physical page must be allocated. A streaming pool may span
      * several adjacent allocation records after pieces are freed/reused.
      * Preserve a uniform memory type and reject gaps before changing VMAs. */
-    pal_mutex_lock(g_lock);
+    glock();
     /* It may span several allocations that touch (Unreal's PS5 allocator
      * allocates in chunks and maps runs of neighbours in one BatchMap entry);
      * blk is the first, whose type the mapping takes. g_dmem is sorted. */
     dmem_block *blk = NULL;
     uint64_t covered = phys;
-    for (size_t i = 0; i < g_dmem.len; i++) {
+    for (size_t i = dmem_lower_bound(phys); i < g_dmem.len; i++) {
         dmem_block *b = &g_dmem.data[i];
         if (b->start + b->size <= covered) continue;
         if (b->start > covered || (blk && b->type != blk->type)) break;
@@ -520,7 +729,7 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
     gmem *mem = c->mem;
     int32_t memory_type = blk ? blk->type : -1;
     if (blk && mem->shm && phys + len <= GUEST_SHM_SIZE && (!(flags & MAP_FIXED) || *addr >= mem->ph_start)) {
-        pal_mutex_unlock(g_lock);
+        gunlock();
         if (len >= (64ull << 20) && getenv("PS5C_LOG_MAPS"))
             LOG_I(KERNEL, "direct pool '%s': type %d prot 0x%x phys 0x%llx size %llu MiB (shared path)",
                   name, memory_type, prot, (unsigned long long)phys, (unsigned long long)(len >> 20));
@@ -540,7 +749,7 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
         }
         if (flags & MAP_FIXED) {
             if (*addr % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
-            if (flags & MAP_NO_OVERWRITE) {
+            if ((flags & MAP_NO_OVERWRITE) && !parked) {
                 for (guest_addr p = *addr; p < *addr + len; p += GUEST_PAGE_SIZE) {
                     if (gmem_is_mapped(mem, p, 1)) return SCE_KERNEL_ERROR_ENOMEM;
                 }
@@ -550,22 +759,37 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
         if (memory_type == 3 || memory_type == 11) gflags |= GMAP_DEMAND;
         guest_addr out = 0;
         bool shared = false;
-        ps5c_err err = gmem_map_direct(mem, requested, len, align ? align : GUEST_PAGE_SIZE, to_gprot(prot), gflags, phys,
-                                       name, &out, &shared);
+        uint32_t parked_prot = 0;
+        ps5c_err err = PS5C_OK;
+        glock();
+        bool taken = parked && park_take(*addr, PS5C_ALIGN_UP(len, GUEST_PAGE_SIZE), phys, &parked_prot);
+        gunlock();
+        if (taken) { /* the parked view is these pages already */
+            out = *addr;
+            shared = true;
+            if (parked_prot != to_gprot(prot)) err = gmem_protect(mem, out, len, to_gprot(prot));
+            gmem_note_change(mem, out, len);
+        } else {
+            err = gmem_map_direct(mem, requested, len, align ? align : GUEST_PAGE_SIZE, to_gprot(prot), gflags, phys,
+                                  name, &out, &shared);
+        }
         if (err != PS5C_OK) {
             LOG_W(KERNEL, "map direct 0x%llx+0x%llx at 0x%llx failed: %s", (unsigned long long)phys,
                   (unsigned long long)len, (unsigned long long)*addr, ps5c_err_str(err));
             return SCE_KERNEL_ERROR_ENOMEM;
         }
         *addr = out;
-        pal_mutex_lock(g_lock);
-        if (shared) stale_clear(mem, out, phys, len, to_gprot(prot));
+        glock();
+        bool any = false;
+        uint8_t *marks = shared ? stale_take(mem, out, phys, len, to_gprot(prot), &any) : NULL;
+        if (kstat_on()) remap_count(out, phys, len);
         dmaps_forget(out, len);
         if (dyn_reserve(&g_dmaps, g_dmaps.len + 1)) g_dmaps.data[g_dmaps.len++] = (dmem_map){phys, len, out};
         /* blk belongs to g_dmem and may have moved or been removed while
          * g_lock was released. Its unused mapping hint must not be written
          * through that stale pointer. Live mappings are tracked in g_dmaps. */
-        pal_mutex_unlock(g_lock);
+        gunlock();
+        stale_zero(mem, out, phys, len, to_gprot(prot), marks);
         LOG_D(KERNEL, "mapped direct 0x%llx -> 0x%llx (0x%llx bytes, prot 0x%x) '%s'%s", (unsigned long long)phys,
               (unsigned long long)out, (unsigned long long)len, prot, name, shared ? " (view)" : "");
         return 0;
@@ -593,7 +817,7 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
                   (unsigned long long)at, (unsigned long long)align);
         if (dyn_reserve(&g_aliases, g_aliases.len + 1)) {
             g_aliases.data[g_aliases.len++] = (dmem_alias){at, len};
-            pal_mutex_unlock(g_lock);
+            gunlock();
             LOG_I(KERNEL, "direct memory 0x%llx+0x%llx mapped again: shares the view at 0x%llx", (unsigned long long)phys,
                   (unsigned long long)len, (unsigned long long)at);
             *addr = at;
@@ -601,7 +825,7 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
         }
     }
     bool allocated = blk != NULL;
-    pal_mutex_unlock(g_lock);
+    gunlock();
     if (len >= (64ull << 20) && getenv("PS5C_LOG_MAPS"))
         LOG_I(KERNEL, "direct pool '%s': type %d prot 0x%x phys 0x%llx size %llu MiB (private path)",
               name, memory_type, prot, (unsigned long long)phys, (unsigned long long)(len >> 20));
@@ -609,14 +833,14 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
         LOG_W(KERNEL, "map of unallocated direct memory 0x%llx+0x%llx", (unsigned long long)phys,
               (unsigned long long)len);
         if (getenv("PS5C_LOG_MAPS")) {
-            pal_mutex_lock(g_lock);
+            glock();
             for (size_t i = 0; i < g_dmem.len; i++) {
                 const dmem_block *b = &g_dmem.data[i];
                 if (b->start <= phys + len && b->start + b->size >= phys)
                     LOG_I(KERNEL, "direct allocation: 0x%llx+0x%llx, type %d",
                           (unsigned long long)b->start, (unsigned long long)b->size, b->type);
             }
-            pal_mutex_unlock(g_lock);
+            gunlock();
         }
         return SCE_KERNEL_ERROR_EACCES;
     }
@@ -641,11 +865,11 @@ static int32_t map_direct_at(hle_call *c, guest_addr *addr, uint64_t len, uint32
     bool demand = (memory_type == 3 || memory_type == 11) && !(prot & SCE_PROT_CPU_EXEC);
     int32_t ret = map_memory(c, addr, len, prot, flags, align, name, demand,false);
     if (ret == 0) {
-        pal_mutex_lock(g_lock);
+        glock();
         dmaps_forget(*addr, len);
         if (dyn_reserve(&g_dmaps, g_dmaps.len + 1)) g_dmaps.data[g_dmaps.len++] = (dmem_map){phys, len, *addr};
         phys_load(c->mem, *addr, phys, len, to_gprot(prot));
-        pal_mutex_unlock(g_lock);
+        gunlock();
         /* Do not dereference blk after dropping g_lock: g_dmem is mutable. */
         LOG_D(KERNEL, "mapped direct 0x%llx -> 0x%llx (0x%llx bytes, prot 0x%x) '%s'", (unsigned long long)phys,
               (unsigned long long)*addr, (unsigned long long)len, prot, name);
@@ -735,17 +959,18 @@ static void available_flexible_memory_size(hle_call *c) {
 static int32_t do_munmap(hle_call *c, guest_addr addr, uint64_t len) {
     if (addr % GUEST_PAGE_SIZE || !len) return SCE_KERNEL_ERROR_EINVAL;
     len = PS5C_ALIGN_UP(len, GUEST_PAGE_SIZE);
-    pal_mutex_lock(g_lock);
+    glock();
     for (size_t i = 0; i < g_aliases.len; i++) {
         if (g_aliases.data[i].addr == addr && g_aliases.data[i].len == len) {
             g_aliases.data[i] = g_aliases.data[--g_aliases.len]; /* a shared view: the memory stays */
-            pal_mutex_unlock(g_lock);
+            gunlock();
             return 0;
         }
     }
     phys_save(c->mem, addr, len);
     dmaps_forget(addr, len);
-    pal_mutex_unlock(g_lock);
+    gunlock();
+    park_drop(c->mem, addr, len);
     return gmem_unmap(c->mem, addr, len) == PS5C_OK ? 0 : SCE_KERNEL_ERROR_EINVAL;
 }
 
@@ -756,6 +981,7 @@ static int32_t do_mprotect(hle_call *c, guest_addr addr, uint64_t len, uint32_t 
     guest_addr start = PS5C_ALIGN_DOWN(addr, GUEST_PAGE_SIZE);
     uint64_t size = PS5C_ALIGN_UP(addr + len, GUEST_PAGE_SIZE) - start;
     uint32_t gprot = to_gprot(prot);
+    park_drop(c->mem, start, size);
     /* The import stubs stay writable and executable: hooking libraries patch
      * them (and the emulator adds stubs at run time for dlsym). */
     guest_addr stubs = c->rt->lk.import_code;
@@ -818,12 +1044,29 @@ static int32_t do_reserve(hle_call *c, guest_addr *addr, uint64_t len, uint32_t 
     if (flags & MAP_FIXED) {
         if (*addr % GUEST_PAGE_SIZE) return SCE_KERNEL_ERROR_EINVAL;
         gflags |= GMAP_FIXED | (flags & MAP_NO_OVERWRITE ? 0u : (uint32_t)GMAP_REPLACE);
-        pal_mutex_lock(g_lock);
+        if (!(flags & MAP_NO_OVERWRITE)) {
+            glock();
+            bool again = park_exact(*addr, len, ~0ull); /* reserved already */
+            gunlock();
+            if (again) return 0;
+        }
+        park_drop(c->mem, *addr, len);
+        gmem_vma v;
+        bool whole_view = !(flags & MAP_NO_OVERWRITE) && park_on() && gmem_query_vma(c->mem, *addr, false, &v) &&
+                          v.kind == GVMA_VIEW && !v.reserved && v.start == *addr && v.size == len && v.os_base == *addr &&
+                          v.os_size == len;
+        glock();
         if (!(flags & MAP_NO_OVERWRITE)) {
             phys_save(c->mem, *addr, len);
             dmaps_forget(*addr, len);
+            if (whole_view && g_parked_n < sizeof(g_parked) / sizeof(g_parked[0])) {
+                g_parked[g_parked_n++] = (parked_view){*addr, len, v.phys, v.prot};
+                atomic_fetch_add(&g_park_n[0], 1);
+                gunlock();
+                return 0;
+            }
         }
-        pal_mutex_unlock(g_lock);
+        gunlock();
     }
     guest_addr out = 0;
     if (gmem_map_aligned(c->mem, *addr, len, align ? align : GUEST_PAGE_SIZE, GPROT_NONE, gflags, "reserved", &out) !=
@@ -947,6 +1190,72 @@ static void memory_pool_get_block_stats(hle_call *c) {
     hle_ret_s32(c, 0);
 }
 
+/* ---- PS5C_KMEM_STATS=1: calls, time and bytes of the memory calls each second (debugging aid) ---- */
+
+enum { KS_ALLOC, KS_RELEASE, KS_MAP_DIRECT, KS_MAP_FLEX, KS_MUNMAP, KS_MPROTECT, KS_MMAP, KS_RESERVE, KS_BATCH, KS_COUNT };
+static const char *const k_ks_names[KS_COUNT] = {"allocate", "release", "map direct", "map flexible", "munmap",
+                                                 "mprotect", "mmap", "reserve", "batch map"};
+static _Atomic uint64_t g_ks_n[KS_COUNT], g_ks_ns[KS_COUNT], g_ks_max[KS_COUNT], g_ks_bytes[KS_COUNT];
+static _Atomic uint64_t g_ks_last;
+
+static bool kstat_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("PS5C_KMEM_STATS") && atoi(getenv("PS5C_KMEM_STATS"));
+    return on;
+}
+
+static void kstat_add(int id, uint64_t ns, uint64_t bytes) {
+    atomic_fetch_add(&g_ks_n[id], 1);
+    atomic_fetch_add(&g_ks_ns[id], ns);
+    atomic_fetch_add(&g_ks_bytes[id], bytes);
+    uint64_t m = atomic_load(&g_ks_max[id]);
+    while (ns > m && !atomic_compare_exchange_weak(&g_ks_max[id], &m, ns)) {}
+    uint64_t now = pal_time_ns(), last = atomic_load(&g_ks_last);
+    if (!last) atomic_compare_exchange_strong(&g_ks_last, &last, now);
+    else if (now - last >= 1000000000ull && atomic_compare_exchange_strong(&g_ks_last, &last, now)) {
+        char line[768];
+        int n = 0;
+        for (int i = 0; i < KS_COUNT; i++) {
+            uint64_t calls = atomic_exchange(&g_ks_n[i], 0), t = atomic_exchange(&g_ks_ns[i], 0);
+            uint64_t mx = atomic_exchange(&g_ks_max[i], 0), b = atomic_exchange(&g_ks_bytes[i], 0);
+            if (calls && n < (int)sizeof(line) - 1)
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %s %llu/%.1fms (max %.2f, %.1f MiB);", k_ks_names[i],
+                              (unsigned long long)calls, t / 1e6, mx / 1e6, b / 1048576.0);
+        }
+        if (n) LOG_I(KERNEL, "memory calls/s:%s", line);
+        char parts[1024];
+        int k = snprintf(parts, sizeof(parts),
+                         " kernel lock wait %llu/%.1fms (max %.2f), held %.1fms (max %.2f); zeroed %.1f MiB/%.1fms;"
+                         " %zu allocations, %zu direct maps; maps putting back the same view %llu, same address other pages %llu,"
+                         " same pages other address %llu, new %llu; views parked %llu, taken back %llu, dropped %llu;",
+                         (unsigned long long)atomic_exchange(&g_glock_n, 0), atomic_exchange(&g_glock_ns, 0) / 1e6,
+                         atomic_exchange(&g_glock_max, 0) / 1e6, atomic_exchange(&g_ghold_ns, 0) / 1e6,
+                         atomic_exchange(&g_ghold_max, 0) / 1e6, atomic_exchange(&g_gzero_bytes, 0) / 1048576.0,
+                         atomic_exchange(&g_gzero_ns, 0) / 1e6, g_dmem.len, g_dmaps.len,
+                         (unsigned long long)atomic_exchange(&g_remap[0], 0), (unsigned long long)atomic_exchange(&g_remap[1], 0),
+                         (unsigned long long)atomic_exchange(&g_remap[2], 0), (unsigned long long)atomic_exchange(&g_remap[3], 0),
+                         (unsigned long long)atomic_exchange(&g_park_n[0], 0), (unsigned long long)atomic_exchange(&g_park_n[1], 0),
+                         (unsigned long long)atomic_exchange(&g_park_n[2], 0));
+        gmem_stats_line(parts + k, sizeof(parts) - (size_t)k);
+        LOG_I(KERNEL, "memory calls/s, parts:%s", parts);
+    }
+}
+
+#define KSTAT_WRAP(fn, id, lenarg)                                                                                          static void fn##_st(hle_call *c) {                                                                                         if (!kstat_on()) {                                                                                                         fn(c);                                                                                                                 return;                                                                                                            }                                                                                                                      uint64_t len_ = (lenarg) >= 0 ? hle_arg(c, (lenarg) < 0 ? 0 : (lenarg)) : 0, t0_ = pal_time_ns();                    fn(c);                                                                                                                 kstat_add(id, pal_time_ns() - t0_, len_);                                                                          }
+KSTAT_WRAP(allocate_direct_memory, KS_ALLOC, 2)
+KSTAT_WRAP(release_direct_memory, KS_RELEASE, 1)
+KSTAT_WRAP(map_direct_memory, KS_MAP_DIRECT, 1)
+KSTAT_WRAP(map_named_direct_memory, KS_MAP_DIRECT, 1)
+KSTAT_WRAP(map_flexible_memory, KS_MAP_FLEX, 1)
+KSTAT_WRAP(map_named_flexible_memory, KS_MAP_FLEX, 1)
+KSTAT_WRAP(kernel_munmap, KS_MUNMAP, 1)
+KSTAT_WRAP(posix_munmap, KS_MUNMAP, 1)
+KSTAT_WRAP(kernel_mprotect, KS_MPROTECT, 1)
+KSTAT_WRAP(posix_mprotect, KS_MPROTECT, 1)
+KSTAT_WRAP(kernel_mmap, KS_MMAP, 1)
+KSTAT_WRAP(posix_mmap, KS_MMAP, 1)
+KSTAT_WRAP(reserve_virtual_range, KS_RESERVE, 1)
+
 /* ---- Batch map ---- */
 
 /* SceKernelBatchMapEntry */
@@ -1008,6 +1317,17 @@ static void kernel_batch_map2(hle_call *c) {
 
 /* ---- Queries ---- */
 
+/* A parked view answers queries as the reserved range the guest made of it */
+static void park_mask(gmem_vma *v) {
+    glock();
+    bool parked = v->kind == GVMA_VIEW && !v->reserved && park_exact(v->start, v->size, ~0ull);
+    gunlock();
+    if (!parked) return;
+    v->reserved = true;
+    v->prot = GPROT_NONE;
+    snprintf(v->name, sizeof(v->name), "reserved");
+}
+
 /* int sceKernelQueryMemoryProtection(void *addr, void **start, void **end, int *prot) */
 static void query_memory_protection(hle_call *c) {
     gmem_vma snapshot;
@@ -1015,6 +1335,7 @@ static void query_memory_protection(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EACCES);
         return;
     }
+    park_mask(&snapshot);
     const gmem_vma *v = &snapshot;
     uint64_t *start = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 1), 8);
     uint64_t *end = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 2), 8);
@@ -1048,6 +1369,7 @@ static void virtual_query(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EACCES);
         return;
     }
+    park_mask(&snapshot);
     const gmem_vma *v = &snapshot;
     memset(out, 0, sizeof(*out));
     out->start = v->start;
@@ -1061,25 +1383,44 @@ static void virtual_query(hle_call *c) {
         if (v->kind == GVMA_VIEW) {
             out->offset = v->phys + (v->start - v->os_base);
         } else {
-            pal_mutex_lock(g_lock);
+            glock();
             for (size_t i = 0; i < g_dmaps.len; i++) {
                 const dmem_map *m = &g_dmaps.data[i];
                 if (v->start >= m->addr && v->start < m->addr + m->len) out->offset = m->phys + (v->start - m->addr);
             }
-            pal_mutex_unlock(g_lock);
+            gunlock();
         }
-        pal_mutex_lock(g_lock);
+        glock();
         for (size_t i = 0; i < g_dmem.len; i++) {
             const dmem_block *b = &g_dmem.data[i];
             if (out->offset >= b->start && out->offset < b->start + b->size) out->memory_type = b->type;
         }
-        pal_mutex_unlock(g_lock);
+        gunlock();
     }
     snprintf(out->name, sizeof(out->name), "%.31s", v->name);
     hle_ret_s32(c, 0);
 }
 
 static void set_virtual_range_name(hle_call *c) { hle_ret_s32(c, 0); }
+
+/* int sceKernelClearVirtualRangeName(const void *addr, size_t len): names are not kept */
+static void clear_virtual_range_name(hle_call *c) {
+    guest_addr a = hle_arg_ptr(c, 0);
+    uint64_t len = hle_arg(c, 1);
+    hle_ret_s32(c, !a || !len || len > UINT64_MAX - a ? SCE_KERNEL_ERROR_EINVAL : 0);
+}
+
+/* int sceKernelGetPageTableStats(int *cpuTotal, int *cpuAvailable, int *gpuTotal, int *gpuAvailable):
+ * a pool of 8192 page-table pages of 2 MiB each (AnyPS5), used by the mapped bytes */
+static void get_page_table_stats(hle_call *c) {
+    for (uint32_t i = 0; i < 4; i++)
+        if (!hle_arg_ptr(c, i)) { hle_ret_s32(c, SCE_KERNEL_ERROR_EFAULT); return; }
+    uint64_t used = (c->mem->mapped_bytes + (2ull << 20) - 1) >> 21;
+    int32_t total = 8192, avail = used >= 8192 ? 0 : (int32_t)(8192 - used);
+    bool ok = gmem_write(c->mem, hle_arg_ptr(c, 0), &total, 4) && gmem_write(c->mem, hle_arg_ptr(c, 1), &avail, 4) &&
+              gmem_write(c->mem, hle_arg_ptr(c, 2), &total, 4) && gmem_write(c->mem, hle_arg_ptr(c, 3), &avail, 4);
+    hle_ret_s32(c, ok ? 0 : SCE_KERNEL_ERROR_EFAULT);
+}
 
 /* ---- libc heap hooks ---- */
 
@@ -1123,9 +1464,9 @@ static void set_prt_aperture(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    pal_mutex_lock(g_lock);
+    glock();
     g_prt[i][0] = hle_arg_ptr(c, 1), g_prt[i][1] = hle_arg(c, 2);
-    pal_mutex_unlock(g_lock);
+    gunlock();
     hle_ret_s32(c, 0);
 }
 static void get_prt_aperture(hle_call *c) {
@@ -1135,9 +1476,9 @@ static void get_prt_aperture(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    pal_mutex_lock(g_lock);
+    glock();
     uint64_t v[2] = {g_prt[i][0], g_prt[i][1]};
-    pal_mutex_unlock(g_lock);
+    gunlock();
     hle_ret_s32(c, gmem_write(c->mem, addr, &v[0], 8) && gmem_write(c->mem, len, &v[1], 8) ? 0 : SCE_KERNEL_ERROR_EFAULT);
 }
 
@@ -1186,36 +1527,39 @@ int32_t kernel_amm_unmap(hle_call *c, guest_addr va, uint64_t size) {
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(K, "sceKernelGetDirectMemorySize", get_direct_memory_size),
     HLE_FUNC_ENTRY(K, "sceKernelDirectMemoryQuery", direct_memory_query),
-    HLE_FUNC_ENTRY(K, "sceKernelAllocateDirectMemory", allocate_direct_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelAllocateDirectMemory", allocate_direct_memory_st),
     HLE_FUNC_ENTRY(K, "sceKernelAllocateMainDirectMemory", allocate_main_direct_memory),
-    HLE_FUNC_ENTRY(K, "sceKernelReleaseDirectMemory", release_direct_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelReleaseDirectMemory", release_direct_memory_st),
     HLE_FUNC_ENTRY(K, "sceKernelCheckedReleaseDirectMemory", checked_release_direct_memory),
     HLE_FUNC_ENTRY(K, "sceKernelAvailableDirectMemorySize", available_direct_memory_size),
-    HLE_FUNC_ENTRY(K, "sceKernelMapDirectMemory", map_direct_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelMapDirectMemory", map_direct_memory_st),
     HLE_FUNC_ENTRY(K, "sceKernelMapDirectMemory2", map_direct_memory2),
-    HLE_FUNC_ENTRY(K, "sceKernelMapNamedDirectMemory", map_named_direct_memory),
-    HLE_FUNC_ENTRY(K, "sceKernelMapFlexibleMemory", map_flexible_memory),
-    HLE_FUNC_ENTRY(K, "sceKernelMapNamedFlexibleMemory", map_named_flexible_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelMapNamedDirectMemory", map_named_direct_memory_st),
+    HLE_FUNC_ENTRY(K, "sceKernelMapFlexibleMemory", map_flexible_memory_st),
+    HLE_FUNC_ENTRY(K, "sceKernelReleaseFlexibleMemory", release_flexible_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelMapNamedFlexibleMemory", map_named_flexible_memory_st),
     /* the libc of GTA V maps its heap with this one (same arguments) */
-    HLE_FUNC_ENTRY(K, "sceKernelMapNamedFlexibleMemoryInternal", map_named_flexible_memory),
+    HLE_FUNC_ENTRY(K, "sceKernelMapNamedFlexibleMemoryInternal", map_named_flexible_memory_st),
     HLE_FUNC_ENTRY(K, "sceKernelAvailableFlexibleMemorySize", available_flexible_memory_size),
     HLE_FUNC_ENTRY(K, "sceKernelConfiguredFlexibleMemorySize", configured_flexible_memory_size),
-    HLE_FUNC_ENTRY(K, "sceKernelMunmap", kernel_munmap),
-    HLE_FUNC_ENTRY(K, "sceKernelMprotect", kernel_mprotect),
-    HLE_FUNC_ENTRY(K, "sceKernelMmap", kernel_mmap),
+    HLE_FUNC_ENTRY(K, "sceKernelMunmap", kernel_munmap_st),
+    HLE_FUNC_ENTRY(K, "sceKernelMprotect", kernel_mprotect_st),
+    HLE_FUNC_ENTRY(K, "sceKernelMmap", kernel_mmap_st),
     HLE_FUNC_ENTRY(K, "sceKernelQueryMemoryProtection", query_memory_protection),
     HLE_FUNC_ENTRY(K, "sceKernelVirtualQuery", virtual_query),
     HLE_FUNC_ENTRY(K, "sceKernelSetVirtualRangeName", set_virtual_range_name),
-    HLE_FUNC_ENTRY(K, "sceKernelReserveVirtualRange", reserve_virtual_range),
+    HLE_FUNC_ENTRY(K, "sceKernelClearVirtualRangeName", clear_virtual_range_name),
+    HLE_FUNC_ENTRY(K, "sceKernelGetPageTableStats", get_page_table_stats),
+    HLE_FUNC_ENTRY(K, "sceKernelReserveVirtualRange", reserve_virtual_range_st),
     HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolReserve", memory_pool_reserve),
     HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolCommit", memory_pool_commit),
     HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolDecommit", memory_pool_decommit),
     HLE_FUNC_ENTRY(K, "sceKernelMemoryPoolGetBlockStats", memory_pool_get_block_stats),
     HLE_FUNC_ENTRY(K, "sceKernelBatchMap", kernel_batch_map),
     HLE_FUNC_ENTRY(K, "sceKernelBatchMap2", kernel_batch_map2),
-    POSIX_ENTRY("mmap", posix_mmap),
-    POSIX_ENTRY("munmap", posix_munmap),
-    POSIX_ENTRY("mprotect", posix_mprotect),
+    POSIX_ENTRY("mmap", posix_mmap_st),
+    POSIX_ENTRY("munmap", posix_munmap_st),
+    POSIX_ENTRY("mprotect", posix_mprotect_st),
     HLE_FUNC_ENTRY(K, "_sceKernelRtldSetApplicationHeapAPI", rtld_set_application_heap_api),
     HLE_FUNC_ENTRY(K, "sceKernelGetSanitizerNewReplaceExternal", get_sanitizer_new_replace_external),
     HLE_FUNC_ENTRY(K, "sceKernelGetSanitizerMallocReplaceExternal", get_sanitizer_new_replace_external),

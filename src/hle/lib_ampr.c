@@ -15,11 +15,7 @@
  *   +0x10 u64 buffer address
  *   APR command buffers: +0x18, +0x20 reserved state words (cleared). */
 #include <string.h>
-#ifdef _MSC_VER
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
+#include "cpu/x64_compat.h"
 
 #include "base/log.h"
 #include "hle/amm.h"
@@ -698,5 +694,5 @@ void hle_register_ampr(void) {
 }
 
 uint64_t ampr_time_counter(void) {
-    return __rdtsc();
+    return x64_guest_tsc_read();
 }

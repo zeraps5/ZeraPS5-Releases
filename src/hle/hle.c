@@ -95,11 +95,14 @@ ps5c_err hle_registry_init(void) {
     hle_register_jpeg_dec();
     hle_register_audiodec();
     hle_register_compat_stubs();
+    hle_register_zlib();
+    hle_register_jpeg_enc();
     hle_register_ajm();
     hle_register_acm();
     hle_register_ngs2();
     hle_register_font();
     hle_register_voice();
+    hle_register_camera();
     hle_register_np_trophy();
     hle_register_playgo();
     g_ready = true;

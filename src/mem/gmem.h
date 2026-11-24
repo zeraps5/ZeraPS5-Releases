@@ -129,6 +129,9 @@ ps5c_err gmem_map_aligned(gmem *m, guest_addr addr, uint64_t size, uint64_t alig
 ps5c_err gmem_map_flexible(gmem *m, guest_addr addr, uint64_t size, uint64_t align, uint32_t prot,
                            uint32_t flags, uint64_t budget, const char *name, guest_addr *out, bool *replacement_started);
 uint64_t gmem_flexible_used(gmem *m);
+/* sceKernelReleaseFlexibleMemory: flexible pages in [addr, addr + size) stop counting
+ * against the budget; they stay mapped with their protection and contents. */
+ps5c_err gmem_release_flexible(gmem *m, guest_addr addr, uint64_t size);
 /* Unmaps every page in [addr, addr + size) (munmap semantics: VMAs are split,
  * unmapped holes are ignored). */
 ps5c_err gmem_unmap(gmem *m, guest_addr addr, uint64_t size);
@@ -146,6 +149,9 @@ void *gmem_host(gmem *m, guest_addr addr, uint64_t size);
 /* Host pointer for an address the caller knows is mapped: no lookup, no lock. */
 void *gmem_host_unlocked(gmem *m, guest_addr addr);
 bool gmem_is_mapped(gmem *m, guest_addr addr, uint64_t size);
+/* addr is outside every backed mapping: [*lo, *hi) is the free or reserved address space
+ * around it, as of mapping generation *generation (false: addr is in a backed mapping). */
+bool gmem_hole(gmem *m, guest_addr addr, guest_addr *lo, guest_addr *hi, uint64_t *generation);
 /* Borrowed pointer, invalidated by map/unmap/protect. Concurrent callers use
  * gmem_query_vma to copy the metadata while holding the map lock. */
 const gmem_vma *gmem_find_vma(gmem *m, guest_addr addr);
@@ -165,6 +171,10 @@ bool gmem_pin_mappings_version(gmem *m, bool retain, uint64_t *generation);
 bool gmem_retain_mappings(gmem *m);
 void gmem_unpin_mappings(gmem *m);
 
+/* PS5C_KMEM_STATS=1: appends " what calls/ms (max ms);" per part of the mapping changes since the
+ * last call (map lock and pin waits, host placeholder calls); returns the length written. */
+int gmem_stats_line(char *buf, size_t size);
+
 /* Maps physical memory [phys, phys + size): a view of the shared object where
  * the destination is in the placeholder area (*shared = true, every view of a
  * page shows the same bytes), else plain zeroed memory (*shared = false). */
@@ -181,6 +191,8 @@ bool gmem_commit_fault(gmem *m, guest_addr addr, uint32_t access);
 /* fn(addr, size) after every change of mappings or protection (map, unmap, protect, demand
  * commits), with the map lock held: the GPU write tracker resets those pages (gpu_watch.h). */
 void gmem_set_change_hook(void (*fn)(guest_addr addr, uint64_t size));
+/* The bytes of [addr, addr + size) changed behind the mappings (a parked view taken back): the change hook runs as for a new mapping */
+void gmem_note_change(gmem *m, guest_addr addr, uint64_t size);
 /* Hooks of the copy-on-write write tracker (gpu_watch.h), both called with the map lock held.
  * release(addr, size, phys_copy): the view [addr, addr + size) is about to be unmapped (for
  * good, or to be mapped again in parts); phys_copy shows the same physical memory through the

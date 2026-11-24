@@ -196,60 +196,114 @@ static inline void mark_sgprs64(uint64_t *mask, uint32_t base, uint32_t count) {
     for (uint32_t k = 0; k < count && base + k < 64; k++) *mask |= 1ULL << (base + k);
 }
 
-/* sh_program.eval_reloc_sgprs: every other operand that names one of them,
- * read or written, at any width, disqualifies it. Only the fields an encoding
- * has: the decoder leaves the others 0 (s0). */
+/* sh_program.eval_reloc_sgprs: SGPRs whose value on entry is read only as a
+ * scalar memory base or offset register. Instructions run in index order unless a branch goes
+ * back, so without loops a register written after its last such read still
+ * counts (the value it holds then is another one); with loops, any write
+ * disqualifies it. Every other read of the entry value, at any width, does.
+ * Only the fields an encoding has: the decoder leaves the others 0 (s0).
+ * PS5C_RELOC_ORDER=0 = old rule (any write disqualifies). */
+static int g_log_reloc = -1, g_reloc_order = -1;
+static void reloc_log(const sh_program *p, uint64_t eval_mask, uint64_t bases, uint64_t other, const int16_t *first, const char *why) {
+    LOG_I(GPU, "relocation: shader 0x%llx (%016llx, %u insts) evaluated SGPRs %llx, bases %llx, kept %llx%s%s",
+          (unsigned long long)p->base, (unsigned long long)p->hash, p->count, (unsigned long long)eval_mask,
+          (unsigned long long)bases, (unsigned long long)(bases & ~other & eval_mask), why ? "; stopped: " : "", why ? why : "");
+    for (uint32_t b = 0; first && b < 64; b++)
+        if ((eval_mask >> b & 1) && (bases >> b & 1) && first[b] >= 0) {
+            const rdna2_inst *in = &p->insts[first[b]];
+            LOG_I(GPU, "relocation:   s%u base, ruled out at +0x%x %s (dst %u src %u %u %u)", b, p->pc[first[b]] * 4,
+                  in->name ? in->name : "?", in->dst, in->src[0], in->src[1], in->src[2]);
+        }
+}
+
 static uint64_t reloc_sgprs(const sh_program *p, uint64_t eval_mask) {
-    uint64_t bases = 0, other = 0;
+    uint64_t bases = 0, other = 0, written = 0;
+    int16_t first[64];
+    if (g_log_reloc < 0) g_log_reloc = getenv("PS5C_LOG_RELOC") != NULL;
+    if (g_reloc_order < 0) { const char *e = getenv("PS5C_RELOC_ORDER"); g_reloc_order = !(e && !strcmp(e, "0")); }
+    if (g_log_reloc) memset(first, 0xFF, sizeof(first));
+    bool order = g_reloc_order && !p->back_branch;
     for (uint32_t i = 0; i < p->count; i++) {
         const rdna2_inst *in = &p->insts[i];
         const char *n = in->name ? in->name : "";
         uint32_t op = p->ops[i];
-        if (op == SH_OP_S_SWAPPC_B64 || strstr(n, "movrel")) return 0;
-        if (in->enc != RDNA2_ENC_DS)
-            for (int k = 0; k < 3; k++) mark_sgprs64(&other, in->src[k], 2);
+        uint64_t base = 0, rd = 0, wr = 0;
+        if (op == SH_OP_S_SWAPPC_B64 || strstr(n, "movrel")) {
+            if (g_log_reloc && eval_mask) reloc_log(p, eval_mask, bases, other, NULL, n);
+            return 0;
+        }
+        if (strstr(n, "setpc")) order = false; /* a jump anywhere */
+        if (in->enc != RDNA2_ENC_DS) {
+            /* 32-bit operands name one SGPR; a carry or lane mask can be a pair */
+            bool wide = strstr(n, "64") != NULL;
+            bool vop3 = in->enc == RDNA2_ENC_VOP3 || in->enc == RDNA2_ENC_VOP3P;
+            for (int k = 0; k < 3; k++) mark_sgprs64(&rd, in->src[k], wide || (vop3 && k == 2) || in->enc == RDNA2_ENC_SMEM ? 2 : 1);
+        }
         switch (in->enc) {
         case RDNA2_ENC_SMEM:
             if (is_smem(op)) {
                 bool buffer = op >= SH_OP_S_BUFFER_LOAD_DWORD;
-                mark_sgprs64(&bases, in->sbase, 1);
-                mark_sgprs64(&other, in->sbase + 1u, buffer ? 3 : 1);
-                mark_sgprs64(&other, in->dst, smem_dwords(op));
-                if (in->soffset != RDNA2_OP_NULL) mark_sgprs64(&other, in->soffset, 1);
+                mark_sgprs64(&base, in->sbase, 1);
+                mark_sgprs64(&rd, in->sbase + 1u, buffer ? 3 : 1);
+                mark_sgprs64(&wr, in->dst, smem_dwords(op));
+                /* an offset moves the read like a base (the renderer moves it by both) */
+                if (in->soffset != RDNA2_OP_NULL) mark_sgprs64(&base, in->soffset, 1);
             } else if (op == SH_OP_S_MEMTIME || op == SH_OP_S_MEMREALTIME) {
-                mark_sgprs64(&other, in->dst, 2);
+                mark_sgprs64(&wr, in->dst, 2);
             } else if (strncmp(n, "s_dcache", 8) && strncmp(n, "s_gl1", 5)) {
+                if (g_log_reloc && eval_mask) reloc_log(p, eval_mask, bases, other, NULL, n);
                 return 0; /* scalar stores and atomics */
             }
             break;
         case RDNA2_ENC_MUBUF: case RDNA2_ENC_MTBUF:
-            mark_sgprs64(&other, in->srsrc, 4);
-            if (in->soffset != RDNA2_OP_NULL) mark_sgprs64(&other, in->soffset, 1);
+            mark_sgprs64(&rd, in->srsrc, 4);
+            if (in->soffset != RDNA2_OP_NULL) mark_sgprs64(&rd, in->soffset, 1);
             break;
         case RDNA2_ENC_MIMG:
-            mark_sgprs64(&other, in->srsrc, 8);
-            mark_sgprs64(&other, in->ssamp, 4);
+            mark_sgprs64(&rd, in->srsrc, 8);
+            mark_sgprs64(&rd, in->ssamp, 4);
             break;
         case RDNA2_ENC_FLAT:
-            if (in->sbase != RDNA2_OP_NULL) mark_sgprs64(&other, in->sbase, 2);
+            if (in->sbase != RDNA2_OP_NULL) mark_sgprs64(&rd, in->sbase, 2);
             break;
         case RDNA2_ENC_DS: case RDNA2_ENC_VINTRP: case RDNA2_ENC_EXP: case RDNA2_ENC_SOPP: case RDNA2_ENC_SOPC: break;
         case RDNA2_ENC_SOP1: case RDNA2_ENC_SOP2: case RDNA2_ENC_SOPK:
-            mark_sgprs64(&other, in->dst, 2);
+            mark_sgprs64(&wr, in->dst, strstr(n, "64") ? 2 : 1); /* s_cselect_b32 s11 leaves s12 */
+            /* those that keep or merge the destination, or (s_cmpk, s_setreg) read it */
+            if ((in->enc == RDNA2_ENC_SOPK && strncmp(n, "s_movk", 6) && strncmp(n, "s_getreg", 8)) ||
+                strstr(n, "cmov") || strstr(n, "bitset"))
+                mark_sgprs64(&rd, in->dst, 2);
+            if (!strncmp(n, "s_call", 6)) order = false;
             break;
         case RDNA2_ENC_VOP1: case RDNA2_ENC_VOP2: case RDNA2_ENC_VOP3: case RDNA2_ENC_VOP3P: case RDNA2_ENC_VOPC:
-            mark_sgprs64(&other, in->dst, 2); /* a VGPR (256 on) unless a scalar result */
+            mark_sgprs64(&wr, in->dst, 2); /* a VGPR (256 on) unless a scalar result */
             if (in->sdst || strstr(n, "_co_") || strstr(n, "div_scale") || strstr(n, "mad_u64") || strstr(n, "mad_i64"))
-                mark_sgprs64(&other, in->sdst, 2);
+                mark_sgprs64(&wr, in->sdst, 2);
             if (in->src[0] == RDNA2_OP_SDWA) {
-                if ((in->dpp_sdwa >> 23) & 1) mark_sgprs64(&other, in->dpp_sdwa & 0xFF, 1);
-                if ((in->dpp_sdwa >> 15) & 1) mark_sgprs64(&other, (in->dpp_sdwa >> 8) & 0x7F, 2);
-                if (in->src[1] >= RDNA2_OP_VGPR && (in->dpp_sdwa >> 31)) mark_sgprs64(&other, in->src[1] - RDNA2_OP_VGPR, 1);
+                if ((in->dpp_sdwa >> 23) & 1) mark_sgprs64(&rd, in->dpp_sdwa & 0xFF, 1);
+                if ((in->dpp_sdwa >> 15) & 1) mark_sgprs64(&wr, (in->dpp_sdwa >> 8) & 0x7F, 2);
+                if (in->src[1] >= RDNA2_OP_VGPR && (in->dpp_sdwa >> 31)) mark_sgprs64(&rd, in->src[1] - RDNA2_OP_VGPR, 1);
             }
             break;
-        default: return 0; /* an encoding without known operands */
+        default: /* an encoding without known operands */
+            if (g_log_reloc && eval_mask) reloc_log(p, eval_mask, bases, other, NULL, n);
+            return 0;
         }
+        /* reads of the entry value disqualify, a base read of a value written since too */
+        uint64_t bad = (rd & ~written) | (base & written);
+        bases |= base & ~written;
+        if (g_log_reloc)
+            for (uint64_t add = wr & ~written & eval_mask & bases; add; add &= add - 1)
+                LOG_I(GPU, "relocation:   s%d first written at +0x%x %s (dst %u)", __builtin_ctzll(add), p->pc[i] * 4, n, in->dst);
+        written |= wr;
+        if (!order) bad |= wr;
+        if (g_log_reloc)
+            for (uint64_t add = bad & ~other; add; add &= add - 1)
+                first[__builtin_ctzll(add)] = (int16_t)i;
+        other |= bad;
     }
+    if (!order) other |= written;
+    if (g_log_reloc && eval_mask) reloc_log(p, eval_mask, bases, other, first, NULL);
     return bases & ~other & eval_mask;
 }
 
@@ -266,6 +320,7 @@ void sh_program_flags(sh_program *p) {
     p->eval_forward_branches = 0;
     p->aperture_flags&=4; /* raw FLAT marker from decoding, before seg is normalized */
     bool has_swappc = false, has_global = false;
+    bool wide_count = false, upper_prefix = false, first_lane = false;
     for (uint32_t i = 0; i < p->count; i++) {
         uint32_t op = p->ops[i];
         if (op == SH_OP_GLOBAL_LOAD || op == SH_OP_GLOBAL_STORE || op == SH_OP_GLOBAL_ATOMIC) {
@@ -294,6 +349,9 @@ void sh_program_flags(sh_program *p) {
         p->iflags[i] = f;
         p->has_flow |= (f & SH_IF_FLOW) != 0;
         has_swappc |= op == SH_OP_S_SWAPPC_B64;
+        wide_count |= op == SH_OP_S_BCNT1_I32_B64;
+        upper_prefix |= op == SH_OP_V_MBCNT_HI_U32_B32;
+        first_lane |= op == SH_OP_V_READFIRSTLANE_B32;
         if (strstr(n, "movrel")) sgpr_mask = 0xFFFFFFFFFFFFULL;
         if (in->enc == RDNA2_ENC_SOP1 || in->enc == RDNA2_ENC_SOP2 || in->enc == RDNA2_ENC_SOPK ||
             in->enc == RDNA2_ENC_SOPC || in->enc == RDNA2_ENC_SOPP) {
@@ -337,6 +395,7 @@ void sh_program_flags(sh_program *p) {
         }
         p->vmem_width[i] = w;
     }
+    p->wave_compaction = wide_count && upper_prefix && first_lane;
     p->eval_sgpr_lo = (uint32_t)sgpr_mask;
     p->eval_sgpr_hi = (uint16_t)(sgpr_mask >> 32);
     p->eval_reloc_sgprs = reloc_sgprs(p, sgpr_mask);
@@ -965,6 +1024,7 @@ static void eval_smem(const sh_program *p, uint32_t i, gmem *mem, eval_state *st
     bool later = buffer && (!unknown || address_dfr) && e->defer && e->defer(e->host_user, base + off, (uint64_t)n * 4);
     if (later) e->deferred = unknown = true; /* the GPU still writes it: values unknown here */
     e->host_sbase = (uint8_t)sb;
+    e->host_soff = in->soffset < 64 ? (uint8_t)in->soffset : 0xFF;
     const uint32_t *all = !later && off + (uint64_t)n * 4 <= limit ? (const uint32_t *)eval_host(e, mem, base + off, (uint64_t)n * 4) : NULL;
     for (uint32_t k = 0; k < n; k++) {
         uint64_t o = off + (uint64_t)k * 4;
@@ -984,6 +1044,7 @@ static void eval_smem(const sh_program *p, uint32_t i, gmem *mem, eval_state *st
         if (in->dst + k < SH_SGPRS && in->dst + k != RDNA2_OP_NULL)
             st->unk[in->dst + k] = unknown, st->dfr[in->dst + k] = later || address_dfr;
     }
+    e->host_soff = 0xFF;
     e->host_sbase = 0xFF; /* later reads (descriptor or global loads) are not relative to this base */
     if (!record) {
         if (site >= 0 && buffer && memcmp(e->site[site].desc, desc, sizeof(desc))) g_fork_conflict = true;
@@ -1924,9 +1985,19 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
         if(p->ops[j]!=SH_OP_S_BRANCH && is_branch(p->ops[j]) && p->insts[j].simm16>0)forward++;
     uint32_t fork_capacity=forward>MAX_FORKS?MAX_FORKS:forward;
     if(fork_capacity<PS5C_ARRAY_COUNT(small_forks))fork_capacity=PS5C_ARRAY_COUNT(small_forks);
+    /* The larger storage stays with the thread: up to 512 states are ~0.9 MB,
+     * which the C library takes from (and gives back to) the system on every
+     * call, fresh zeroed pages each draw (Tearaway: ~18% of the GPU thread). */
+    static _Thread_local eval_fork *big_forks;
+    static _Thread_local uint32_t big_capacity;
     if(fork_capacity>PS5C_ARRAY_COUNT(small_forks)) {
-        forks=malloc((size_t)fork_capacity*sizeof(*forks));
-        if(!forks)return false;
+        if(big_capacity<fork_capacity) {
+            free(big_forks);
+            big_forks=malloc((size_t)fork_capacity*sizeof(*forks));
+            big_capacity=big_forks?fork_capacity:0;
+            if(!big_forks)return false;
+        }
+        forks=big_forks;
     }
     bool has_flow = !analyzed || p->has_flow;
     if (has_flow) {
@@ -2110,7 +2181,7 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
                         fork_count++;
                     }
                     taken = false;
-                } else if (op != SH_OP_S_BRANCH && in->simm16 > 0 && !forked[i]) {
+                } else if (op != SH_OP_S_BRANCH && in->simm16 > 0 && !forked[i] && !e->known_side_only) {
                     if (fork_count == fork_capacity) goto eval_done;
                     /* a known condition can still differ when the shader runs (constants the
                      * CPU writes after the draw is recorded): the other side fills the
@@ -2237,7 +2308,6 @@ bool sh_evaluate(const sh_program *p, gmem *mem, sh_eval *e) {
     result=!calls || steps<1000000;
 eval_done:
     e->guessed |= g_dfr_branch && g_fork_conflict;
-    if(forks!=small_forks)free(forks);
     return result;
 }
 
@@ -2485,7 +2555,8 @@ void sh_site_shape_of(const sh_program *p, const sh_eval *e, uint32_t site, sh_s
         sh_buf_format f;
         size_t len = strlen(name);
         out->img_kind = sh_buffer_format(fmt, &f) ? (f.kind == 4 ? 1 : f.kind == 5 ? 2 : 0) : 0;
-        out->img_components = f.comps;
+        /* only storage writes route channels by it: reads would vary with the texture format */
+        if (sh_site_storage(&p->sites[site], out)) out->img_components = f.comps;
         out->img_type = (uint8_t)(v->desc[3] >> 28);
         if (strstr(name, "_c_") || (len >= 2 && !strcmp(name + len - 2, "_c"))) { /* depth-compare variants */
             out->cmp_func = (uint8_t)((v->sampler[0] >> 12) & 7);

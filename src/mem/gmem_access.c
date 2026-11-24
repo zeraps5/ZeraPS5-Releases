@@ -6,6 +6,7 @@ bool gmem_access_begin(gmem_access *a, gmem *mem, bool retain) {
     uint64_t generation;
     if (!gmem_pin_mappings_version(mem, retain, &generation)) return false;
     if (a->mem != mem || a->generation != generation) a->count = a->next = 0;
+    if (a->mem != mem) a->hole_count = a->hole_next = 0;
     a->mem = mem;
     a->generation = generation;
     a->pinned = true;
@@ -24,8 +25,24 @@ void *gmem_access_host(gmem_access *a, guest_addr addr, uint64_t size) {
     for (uint32_t i = 0; i < a->count; i++)
         if (addr >= a->spans[i].start && end <= a->spans[i].end)
             return a->spans[i].host + (addr - a->spans[i].start);
+    /* holes: against the live generation, since memory may be placed in free
+     * space while pinned (gmem: mapping_place_wait does not wait for pins) */
+    uint64_t now = __atomic_load_n(&a->mem->mapping_generation, __ATOMIC_SEQ_CST);
+    if (a->hole_count && a->hole_generation == now)
+        for (uint32_t i = 0; i < a->hole_count; i++)
+            if (addr >= a->holes[i].start && addr < a->holes[i].end) return NULL;
     uint8_t *p = gmem_host(a->mem, addr, size);
-    if (!p) return NULL;
+    if (!p) {
+        guest_addr lo, hi;
+        uint64_t generation;
+        if (gmem_hole(a->mem, addr, &lo, &hi, &generation)) {
+            if (generation != a->hole_generation) a->hole_count = a->hole_next = 0, a->hole_generation = generation;
+            uint32_t i = a->hole_count < PS5C_ARRAY_COUNT(a->holes) ? a->hole_count++ : a->hole_next++ % PS5C_ARRAY_COUNT(a->holes);
+            a->holes[i].start = lo;
+            a->holes[i].end = hi;
+        }
+        return NULL;
+    }
     guest_addr start = addr;
     uint8_t *host = p;
     gmem_vma v;

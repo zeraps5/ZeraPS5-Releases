@@ -621,6 +621,122 @@ static void ssl_no_cert_ptr(hle_call *c) { hle_ret_u64(c, 0); }
 /* NP session signaling needs the PSN peer network: no context is created */
 static void signaling_down(hle_call *c) { hle_ret_s32(c, NET_ERROR_NETDOWN); }
 
+/* int sceHttpParseResponseHeader(const char *header, size_t headerLen, const char *field,
+ * const char **value, size_t *valueLen): finds "field:" at the start of a header line (case
+ * insensitive) and gives its value without the spaces around it, continuation lines included.
+ * Returns the offset where the value ends; an empty value gives NULL and 0. Behavior and
+ * error codes as in the AnyPS5 project's libSceHttp. */
+#define HTTP_ERROR_PARSE_INVALID_RESPONSE ((int32_t)0x80432060)
+#define HTTP_ERROR_PARSE_INVALID_VALUE ((int32_t)0x804321FE)
+#define HTTP_ERROR_PARSE_NOT_FOUND ((int32_t)0x80432025)
+static bool hdr_space(char ch) { return ch == ' ' || (ch >= '\t' && ch <= '\r'); }
+static char hdr_lower(char ch) { return ch >= 'A' && ch <= 'Z' ? (char)(ch + 32) : ch; }
+static const char *hdr_find_lf(const char *s, size_t from, size_t len) {
+    return from < len ? (const char *)memchr(s + from, '\n', len - from) : NULL;
+}
+static void http_parse_response_header(hle_call *c) {
+    guest_addr header = hle_arg_ptr(c, 0), value_out = hle_arg_ptr(c, 3), len_out = hle_arg_ptr(c, 4);
+    uint64_t len = hle_arg(c, 1);
+    char field[0x1000];
+    if (!header) { hle_ret_s32(c, HTTP_ERROR_PARSE_INVALID_RESPONSE); return; }
+    if (!hle_arg_ptr(c, 2) || !value_out || !len_out) { hle_ret_s32(c, HTTP_ERROR_PARSE_INVALID_VALUE); return; }
+    if (!hle_read_str(c, hle_arg_ptr(c, 2), field, sizeof(field))) field[sizeof(field) - 1] = 0;
+    size_t flen = strlen(field);
+    const char *in = len ? (const char *)hle_mem(c, header, len) : "";
+    uint64_t *vp = (uint64_t *)hle_mem(c, value_out, 8), *lp = (uint64_t *)hle_mem(c, len_out, 8);
+    if (!in || !vp || !lp) { hle_ret_s32(c, HTTP_ERROR_PARSE_INVALID_VALUE); return; }
+    size_t start = 0;
+    bool found = false;
+    while (start < len) {
+        if (!hdr_space(in[start]) && flen < len - start && in[start + flen] == ':') {
+            size_t i = 0;
+            while (i < flen && hdr_lower(in[start + i]) == hdr_lower(field[i])) i++;
+            if (i == flen) {
+                start += flen + 1;
+                found = true;
+                break;
+            }
+        }
+        const char *lf = hdr_find_lf(in, start, len);
+        if (!lf) break;
+        start = (size_t)(lf - in) + 1;
+    }
+    if (!found) { hle_ret_s32(c, HTTP_ERROR_PARSE_NOT_FOUND); return; }
+    /* skip spaces before the value; a line break ends it unless the next line continues it */
+    while (start < len) {
+        size_t lf = in[start] == '\r' && start + 1 < len && in[start + 1] == '\n' ? start + 1 : start;
+        if (in[lf] == '\n') {
+            if (!(lf + 1 < len && (in[lf + 1] == ' ' || in[lf + 1] == '\t'))) { start = len + 1; break; }
+            start = lf + 1;
+        } else if (hdr_space(in[start])) start++;
+        else break;
+    }
+    if (start >= len) {
+        *vp = 0, *lp = 0;
+        hle_ret_s32(c, 0);
+        return;
+    }
+    size_t end = len, scan = start;
+    while (scan < len) {
+        const char *lfp = hdr_find_lf(in, scan, len);
+        if (!lfp) break;
+        size_t nl = (size_t)(lfp - in);
+        if (nl + 1 == len) break;
+        if (in[nl + 1] == ' ' || in[nl + 1] == '\t') {
+            scan = nl + 1;
+            continue;
+        }
+        end = nl > start && in[nl - 1] == '\r' ? nl - 1 : nl;
+        break;
+    }
+    *vp = header + start;
+    *lp = end - start;
+    hle_ret_s32(c, end > 0x7FFFFFFF ? HTTP_ERROR_PARSE_INVALID_VALUE : (int32_t)end);
+}
+
+/* sceSsl connections: created and configured, but a handshake never gets a peer */
+#define SSL_ERROR_INVALID_VALUE ((int32_t)0x8095F007)
+#define SSL_ERROR_SOCKET_CLOSED ((int32_t)0x8095170D)
+/* int sceSslCreateConnection(int ctx, int socket, const char *host) */
+static void ssl_create_connection(hle_call *c) {
+    if (!hle_arg_ptr(c, 2)) { hle_ret_s32(c, SSL_ERROR_INVALID_VALUE); return; }
+    new_id(c);
+}
+/* sceSslConnect / sceSslRead / sceSslWrite(int conn, ...) */
+static void ssl_no_peer(hle_call *c) { hle_ret_s32(c, SSL_ERROR_SOCKET_CLOSED); }
+
+/* sce_net_in6addr_any (::) and sce_net_in6addr_linklocal_allnodes (ff02::1) */
+static void in6addr_any_init(struct ps5_runtime *rt, void *slot, size_t size) {
+    (void)rt;
+    memset(slot, 0, size < 16 ? size : 16);
+}
+static void in6addr_linklocal_allnodes_init(struct ps5_runtime *rt, void *slot, size_t size) {
+    static const uint8_t a[16] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    (void)rt;
+    memcpy(slot, a, size < 16 ? size : 16);
+}
+
+/* int sceSslGetCaList(int ctx, {SceSslData *certs; int num} *list): no certificates */
+static void ssl_get_ca_list(hle_call *c) {
+    void *l = hle_arg_ptr(c, 1) ? hle_mem(c, hle_arg_ptr(c, 1), 16) : NULL;
+    if (!l) { hle_ret_s32(c, SSL_ERROR_INVALID_VALUE); return; }
+    memset(l, 0, 16);
+    hle_ret_s32(c, 0);
+}
+/* int sceHttpsGetSslError(int id, int *err, u32 *detail): no SSL error */
+static void https_get_ssl_error(hle_call *c) {
+    if (!hle_arg_ptr(c, 1) || !hle_arg_ptr(c, 2)) { hle_ret_s32(c, HTTP_ERROR_INVALID_VALUE); return; }
+    put_zero(c, 1, 4);
+    put_zero(c, 2, 4);
+    hle_ret_s32(c, 0);
+}
+/* in6addr_any (::) and in6addr_loopback (::1) */
+static void in6addr_loopback_init(struct ps5_runtime *rt, void *slot, size_t size) {
+    static const uint8_t a[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    (void)rt;
+    memcpy(slot, a, size < 16 ? size : 16);
+}
+
 #define H "libSceHttp"
 #define H2 "libSceHttp2"
 
@@ -744,11 +860,45 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetConnectionStatus", signaling_down),
     HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetConnectionInfo", signaling_down),
     HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetLocalNetInfo", signaling_down),
+    HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetConnectionFromPeerAddress", signaling_down),
     HLE_FUNC_ENTRY("libSceRandom", "sceRandomGetRandomNumber", random_get_random_number),
     HLE_FUNC_ENTRY("libSceNet", "sceNetPoolCreate", new_id),
     HLE_FUNC_ENTRY("libSceNet", "sceNetPoolDestroy", ok),
     HLE_FUNC_ENTRY("libSceSsl", "sceSslInit", new_id),
     HLE_FUNC_ENTRY("libSceSsl", "sceSslTerm", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslCreateConnection", ssl_create_connection),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslDeleteConnection", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslEnableVerifyOption", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslConnect", ssl_no_peer),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslRead", ssl_no_peer),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslWrite", ssl_no_peer),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslDisableVerifyOption", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslSetVerifyCallback", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslSetMinSslVersion", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslLoadCert", ok),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslGetCaList", ssl_get_ca_list),
+    HLE_FUNC_ENTRY("libSceSsl", "sceSslFreeCaList", ok),
+    HLE_DATA_ENTRY("libSceNet", "in6addr_any", in6addr_any_init),
+    HLE_DATA_ENTRY("libSceNet", "in6addr_loopback", in6addr_loopback_init),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetResolverStartNtoa6", net_down_net),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetResolverAbort", ok),
+    HLE_FUNC_ENTRY("libSceNet", "sceNetSendmsg", net_bad_socket),
+    HLE_FUNC_ENTRY("libSceNetCtl", "sceNetCtlGetIfStat", netctl_not_connected),
+    HLE_FUNC_ENTRY("libSceNetCtl", "sceNetCtlGetInfoV6", netctl_not_connected),
+    HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetConnectionFromPeerAddress2", signaling_down),
+    HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetConnectionStatistics", signaling_down),
+    HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingGetGroupFromSessionId", signaling_down),
+    HLE_FUNC_ENTRY(H2, "sceHttp2WebSocketCreateRequest", net_down), /* no server to reach */
+    HLE_FUNC_ENTRY(H2, "sceHttp2WebSocketCloseAsync", net_down),
+    HLE_FUNC_ENTRY(H2, "sceHttp2WebSocketSendTextMessageAsync", net_down),
+    HLE_FUNC_ENTRY(H2, "sceHttp2WebSocketSendDataMessageAsync", net_down),
+    HLE_FUNC_ENTRY(H, "sceHttpSetCookieRecvCallback", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpSetRedirectCallback", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpSetInflateGZIPEnabled", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpsSetSslVersion", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpsGetSslError", https_get_ssl_error),
+    HLE_DATA_ENTRY("libSceNet", "sce_net_in6addr_any", in6addr_any_init),
+    HLE_DATA_ENTRY("libSceNet", "sce_net_in6addr_linklocal_allnodes", in6addr_linklocal_allnodes_init),
     HLE_FUNC_ENTRY("libSceSsl", "sceSslGetCaCerts", ssl_get_ca_certs),
     HLE_FUNC_ENTRY("libSceSsl", "sceSslFreeCaCerts", ok),
     HLE_FUNC_ENTRY(H, "sceHttpUriEscape", http_uri_escape),
@@ -781,6 +931,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(H, "sceHttpUnsetEpoll", unset_epoll),
     HLE_FUNC_ENTRY(H, "sceHttpWaitRequest", wait_request),
     HLE_FUNC_ENTRY(H, "sceHttpsSetSslCallback", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpsSetMinSslVersion", ok),
+    HLE_FUNC_ENTRY(H, "sceHttpParseResponseHeader", http_parse_response_header),
     HLE_FUNC_ENTRY(H, "sceHttpsDisableOption", ok),
     HLE_FUNC_ENTRY(H, "sceHttpsEnableOption", ok),
     HLE_FUNC_ENTRY(H, "sceHttpSendRequest", send_request),

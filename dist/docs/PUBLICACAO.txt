@@ -1,11 +1,11 @@
 Publicação — processo manual com revisão
 
-Destino de distribuição escolhido: zeraps5/ZeraPS5-Releases, público e separado.
-Fontes públicos: zeraps5/ZeraPS5.
+Destino de distribuição escolhido: zeraps5/ZeraPS5-Releases, público.
+Fontes públicos: zeraps5/ZeraPS5-Releases.
 Compilar e empacotar não cria repositórios, envia arquivos ou publica releases.
 
 Após autorização específica do usuário:
-1. Conferir o repositório separado de distribuição já existente e sua visibilidade.
+1. Conferir o repositório de distribuição já existente e sua visibilidade.
 2. Revisar o relatório local, executar os testes e revisar o ZIP final.
 3. Conferir SHA256SUMS e os fontes reais correspondentes. O ZIP binário inclui
    sources/ZeraPS5-source.zip, FFmpeg e objetos para religação. Enviar também

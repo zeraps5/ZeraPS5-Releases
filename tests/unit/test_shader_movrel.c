@@ -10,7 +10,7 @@
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"line %d: %s\n",__LINE__,#x);return 1;}}while(0)
 static uint32_t mov(unsigned dst,unsigned src){return 0x7e000200|(dst<<17)|src;}
 static uint32_t relative(unsigned op,unsigned dst,unsigned src){return 0x7e000000|(dst<<17)|(op<<9)|(256+src);}
-static unsigned program(uint32_t *c){
+static unsigned program(uint32_t *c, bool indexed){
     unsigned n=0;
     for(unsigned k=0;k<64;k++) {
         c[n++]=mov(8+k,255);c[n++]=100+k;
@@ -20,7 +20,8 @@ static unsigned program(uint32_t *c){
     for(unsigned reg=72;reg<128;reg++){c[n++]=mov(reg,255);c[n++]=0x40000000u+reg;}
     c[n++]=mov(5,128);c[n++]=mov(6,128);c[n++]=mov(7,128);
     c[n++]=0xbefc0300; /* m0 = s0 */
-    c[n++]=0x7e088708; /* v4 = v[8 + m0] (v_movrels_b32) */
+    for (unsigned i=0;i<(indexed?20u:1u);i++)
+        c[n++]=0x7e088708; /* v4 = v[8 + m0] (v_movrels_b32) */
     c[n++]=0x36060006; /* v3 = v0 & s6 */
     c[n++]=0x7da40680; /* exec = v3 == 0: the even lanes when s6 is 1 */
     c[n++]=0x7e108500; /* v[8 + m0] = v0 (v_movreld_b32) */
@@ -35,22 +36,23 @@ static unsigned program(uint32_t *c){
     }
     c[n++]=0xbf810000;return n;
 }
-static int cpu_test(void){
-    uint32_t code[1024],n=program(code),*spv;size_t words;sh_program *p=calloc(1,sizeof(*p));CHECK(p);
+static int cpu_test(bool indexed){
+    uint32_t code[1024],n=program(code,indexed),*spv;size_t words;sh_program *p=calloc(1,sizeof(*p));CHECK(p);
     CHECK(sh_analyze(code,n,0,p));
     sh_stage_info info={.stage=SH_STAGE_CS,.local_size={64,1,1},.cs_tid_components=1};
     sh_site_shape shapes[SH_MAX_SITES]={0};CHECK(sh_translate(p,&info,shapes,0,&spv,&words));
     unsigned branches=0;
     for(size_t i=5;i<words;){size_t count=spv[i]>>16;CHECK(count && count<=words-i);branches+=(spv[i]&65535)==SpvOpBranchConditional;i+=count;}
-    CHECK(branches>=2*125); /* each access branches to a register, rather than keeping the entire file live */
+    if (indexed) CHECK(branches < 64); /* large shaders use a bounded indexed bank */
+    else CHECK(branches>=2*125); /* smaller shaders retain independent VGPRs */
     free(spv);free(p);return 0;
 }
-static int gpu_test(void){
+static int gpu_test(bool indexed){
     CHECK(pal_init()==PS5C_OK);gmem m;gmem_config cfg=gmem_default_config();cfg.identity=false;CHECK(gmem_init(&m,&cfg)==PS5C_OK);
     guest_addr a;CHECK(gmem_map(&m,0,4*GUEST_PAGE_SIZE,GPROT_RW,0,"movrel",&a)==PS5C_OK);
     pal_window *w=NULL;CHECK(pal_window_open("ZeraPS5 movrel regression",320,180,&w)==PS5C_OK);renderer *r=renderer_create(w,&m);CHECK(r);
     gpu g;CHECK(gpu_init(&g,&m,NULL)==PS5C_OK);uint32_t *u=g.regs+mmCOMPUTE_USER_DATA_0;
-    uint32_t code[1024],n=program(code);CHECK(gmem_write(&m,a,code,n*4));
+    uint32_t code[1024],n=program(code,indexed);CHECK(gmem_write(&m,a,code,n*4));
     g.regs[mmCOMPUTE_PGM_LO]=(uint32_t)(a>>8);g.regs[mmCOMPUTE_PGM_HI]=(uint32_t)(a>>40);
     g.regs[mmCOMPUTE_NUM_THREAD_X]=64;g.regs[mmCOMPUTE_NUM_THREAD_Y]=1;g.regs[mmCOMPUTE_NUM_THREAD_Z]=1;
     g.regs[mmCOMPUTE_PGM_RSRC2]=24u<<1;
@@ -89,4 +91,12 @@ static int gpu_test(void){
     renderer_destroy(r);free(g.regs);pal_mutex_destroy(g.lock);pal_window_destroy(w);gmem_free(&m);pal_shutdown();
     puts("movrel: full 256-register file and short banks, combined read/write, register255, invalid indices and partial EXEC verified");return 0;
 }
-int main(void){CHECK(cpu_test()==0);return getenv("PS5C_TEST_GPU")?gpu_test():0;}
+int main(void){
+    CHECK(cpu_test(false)==0);
+    CHECK(cpu_test(true)==0);
+    if (getenv("PS5C_TEST_GPU")) {
+        CHECK(gpu_test(false)==0);
+        CHECK(gpu_test(true)==0);
+    }
+    return 0;
+}

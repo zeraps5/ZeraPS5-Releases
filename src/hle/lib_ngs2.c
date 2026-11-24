@@ -1507,6 +1507,39 @@ static void ngs_voice_run_commands(hle_call *c) {
 
 /* int sceNgs2VoiceGetState(SceNgs2Handle voice, SceNgs2VoiceState *out, size_t size):
  * {u32 state flags, s32 error}, then the rack type's fields */
+/* sceNgs2VoiceGetPortInfo(voice, port, info, size): SceNgs2VoicePortInfo = matrix id, volume,
+ * delay samples, destination input id, destination voice handle (24 bytes) */
+static void ngs_voice_get_port_info(hle_call *c) {
+    uint32_t port = (uint32_t)hle_arg(c, 1);
+    guest_addr out = hle_arg_ptr(c, 2);
+    uint64_t size = hle_arg(c, 3);
+    if (!out) {
+        hle_ret_s32(c, NGS2_ERR_INVALID_OUT_ADDRESS);
+        return;
+    }
+    if (size < 24) {
+        hle_ret_s32(c, NGS2_ERR_INVALID_OUT_SIZE);
+        return;
+    }
+    uint8_t buf[24] = {0};
+    int32_t ret = 0;
+    pal_mutex_lock(g_ngs.lock);
+    ngs_voice *v = find_voice(hle_arg(c, 0));
+    if (!v) {
+        ret = NGS2_ERR_INVALID_VOICE_HANDLE;
+    } else if (port >= MAX_PORTS) {
+        ret = NGS2_ERR_INVALID_VOICE_INDEX;
+    } else {
+        const ngs_port *p = &v->ports[port];
+        memcpy(buf + 0, &p->matrix, 4);
+        memcpy(buf + 4, &p->volume, 4);
+        memcpy(buf + 16, &p->dest, 8);
+    }
+    pal_mutex_unlock(g_ngs.lock);
+    if (!ret && !gmem_write(c->mem, out, buf, sizeof(buf))) ret = NGS2_ERR_INVALID_OUT_ADDRESS;
+    hle_ret_s32(c, ret);
+}
+
 static void ngs_voice_get_state(hle_call *c) {
     guest_addr out = hle_arg_ptr(c, 1);
     uint64_t size = hle_arg(c, 2);
@@ -1816,6 +1849,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(N, "sceNgs2VoiceRunCommands", ngs_voice_run_commands),
     HLE_FUNC_ENTRY(N, "sceNgs2VoiceGetState", ngs_voice_get_state),
     HLE_FUNC_ENTRY(N, "sceNgs2VoiceGetStateFlags", ngs_voice_get_state_flags),
+    HLE_FUNC_ENTRY(N, "sceNgs2VoiceGetPortInfo", ngs_voice_get_port_info),
     HLE_FUNC_ENTRY(N, "sceNgs2ParseWaveformData", ngs_parse_waveform_data),
     HLE_FUNC_ENTRY(N, "sceNgs2CalcWaveformBlock", ngs_calc_waveform_block),
     HLE_FUNC_ENTRY(N, "sceNgs2PanInit", ngs_pan_init),

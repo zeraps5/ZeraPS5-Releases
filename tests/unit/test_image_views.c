@@ -934,7 +934,17 @@ static void test_gpu_integer_color_exports(void) {
         {VK_FORMAT_R16G16B16A16_UINT, (12u << 2) | (4u << 8), 7, 1,
          {0x8123abcd,0x9001ffff,0,0}, {0x8123abcd,0x9001ffff,0,0}, 8},
         {VK_FORMAT_R32_SINT, (4u << 2) | (5u << 8), 8, 1,
-         {0x1234abcd,0,0,0}, {0xffffabcd,0,0,0}, 4}
+         {0x1234abcd,0,0,0}, {0xffffabcd,0,0,0}, 4},
+        /* Compression describes the source encoding independently of the
+         * attachment's numeric kind. Preserve the unpacked float's bits. */
+        {VK_FORMAT_R32G32_UINT, (11u << 2) | (4u << 8), 4, 1,
+         {0xc2004000,0x3c003800,0,0}, {0x40000000,0xc0400000,0,0}, 8},
+        {VK_FORMAT_R32_SINT, (4u << 2) | (5u << 8), 4, 1,
+         {0x3800be00,0x3c003800,0,0}, {0xbfc00000,0,0,0}, 4},
+        {VK_FORMAT_R32G32_UINT, (11u << 2) | (4u << 8), 5, 1,
+         {0xffff0000,0x80004000,0,0}, {0,0x3f800000,0,0}, 8},
+        {VK_FORMAT_R32G32_UINT, (11u << 2) | (4u << 8), 6, 1,
+         {0x7fff8000,0x40000000,0,0}, {0xbf800000,0x3f800000,0,0}, 8}
     };
     CHECK(pal_init() == PS5C_OK);
     gmem m; gmem_config cfg = gmem_default_config(); cfg.identity = false;
@@ -2654,6 +2664,10 @@ int main(int argc, char **argv) {
     if(argc==2 && !strcmp(argv[1],"--export-mask")) {
         const test_case mask[]={TEST_CASE(test_gpu_export_valid_mask)};
         return test_run_all("export_valid_mask",mask,1);
+    }
+    if(argc==2 && !strcmp(argv[1],"--integer-exports")) {
+        const test_case cases[]={TEST_CASE(test_gpu_integer_color_exports)};
+        return test_run_all("integer_exports",cases,PS5C_ARRAY_COUNT(cases));
     }
     if(argc==2 && !strcmp(argv[1],"--input-layout")) {
         const test_case layout[]={TEST_CASE(test_gpu_pixel_input_layout)};

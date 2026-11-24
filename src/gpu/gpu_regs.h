@@ -31,6 +31,8 @@
 #define GPU_GCN_RSRC1_VS 0x2C4Au
 #define GPU_GCN_RSRC2_VS 0x2C4Bu
 #define GPU_GCN_USER_DATA_VS_0 0x2C4Cu
+#define GPU_GCN_DB_DEPTH_SIZE 0xA016u /* GCN place of DB_DEPTH_SIZE (RDNA2 has DB_DEPTH_SIZE_XY at 0xA007) */
+#define GPU_GCN_VGT_INDX_OFFSET 0xA102u /* GCN: the vertex offset added to each index (RDNA2: GE_INDX_OFFSET) */
 
 #define mmCOMPUTE_NUM_THREAD_X 0x2E07u
 #define mmCOMPUTE_DISPATCH_INITIATOR 0x2E00u

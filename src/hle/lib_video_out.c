@@ -233,6 +233,7 @@ static int32_t vblank_thread(void *arg) {
             pal_mutex_lock(g_vo.lock);
             g_vo.presenting = -1;
             g_vo.flip.count++;
+            gpu_note_video_flip();
             g_vo.flip.process_time = t / 1000u;
             g_vo.flip.process_time_counter = t;
             g_vo.flip.flip_arg = flip_arg;
@@ -870,6 +871,8 @@ static int32_t delete_event(hle_call *c, registration *regs, uint32_t *count, ui
     return 0;
 }
 
+static void accept_set_mode_event(hle_call *c) { hle_ret_s32(c, 0); }
+
 static void add_flip_event(hle_call *c) {
     hle_ret_s32(c, add_event(c, g_vo.flip_regs, &g_vo.flip_reg_count, VO_EVENT_FLIP));
 }
@@ -952,6 +955,9 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceVideoOutLatencyMeasureSetStartPoint", ok_),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutAddFlipEvent", add_flip_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutAddVblankEvent", add_vblank_event),
+    /* the output mode never changes here, so a set mode event never fires */
+    HLE_FUNC_ENTRY(LIB, "sceVideoOutSysAddSetModeEvent2", accept_set_mode_event),
+    HLE_FUNC_ENTRY(LIB, "sceVideoOutDeleteOutputModeEvent", accept_set_mode_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutDeleteFlipEvent", delete_flip_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutDeleteVblankEvent", delete_vblank_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutGetEventId", get_event_id),

@@ -7,6 +7,7 @@
 #include "gpu/gpu.h"
 #include "gpu/gpu_regs.h"
 #include "gpu/gcn.h"
+#include "gpu/rdna2.h"
 #include "gpu/lod_stats.h"
 #include <stdatomic.h>
 #include "gpu/shader/shader.h"
@@ -31,6 +32,7 @@
 #define IT_INDIRECT_BUFFER 0x3F
 #define IT_EVENT_WRITE 0x46
 #define IT_EVENT_WRITE_EOP 0x47
+#define IT_EVENT_WRITE_EOS 0x48
 #define IT_RELEASE_MEM 0x49
 #define IT_DMA_DATA 0x50
 #define IT_COND_EXEC 0x22
@@ -82,7 +84,24 @@ ps5c_err gpu_init(gpu *g, gmem *mem, const gpu_callbacks *cb) {
     return PS5C_OK;
 }
 
-static bool dumping(const gpu *g) { return g->dump_frame >= 0 && (int64_t)g->stats.flips == g->dump_frame; }
+static _Atomic uint64_t g_video_flips;
+void gpu_note_video_flip(void) { atomic_fetch_add(&g_video_flips, 1); }
+static bool dumping(const gpu *g) {
+    uint64_t frame = g->stats.flips ? g->stats.flips : atomic_load(&g_video_flips);
+    if (!g->stats.flips) { /* PS4 flips through VideoOut: PS5C_GPU_DUMP=@<file> is checked here at each new frame */
+        static uint64_t seen = UINT64_MAX;
+        const char *trigger = frame != seen ? getenv("PS5C_GPU_DUMP") : NULL;
+        seen = frame;
+        pal_path_info pi;
+        if (trigger && trigger[0] == '@' && pal_path_stat(trigger + 1, &pi) == PS5C_OK) {
+            pal_file_remove(trigger + 1);
+            ((gpu *)g)->dump_frame = (int64_t)frame;
+            LOG_I(GPU, "dumping frame %lld", (long long)frame);
+        }
+    }
+    if (g->dump_frame < 0) return false;
+    return (int64_t)frame == g->dump_frame;
+}
 
 /* ---- Registers ---- */
 
@@ -305,15 +324,25 @@ static bool saving_shaders(void) {
 /* The GCN program at addr re-encoded as RDNA2 (fetch shader inlined, its address in the user data
  * `user_data` the s_swappc_b64 names): the RDNA2 dword count, 0 when it cannot be. Logs each new failure. */
 static uint32_t gcn_program(const gpu *g, guest_addr addr, uint32_t user_data, uint32_t *out, uint32_t cap,
-                            guest_addr *fetch_addr, int *fetch_reg) {
+                            guest_addr *fetch_addr, int *fetch_reg, const uint32_t *emit, uint32_t emit_words) {
     uint32_t words = gpu_shader_size(g, addr);
     const uint32_t *code = words ? (const uint32_t *)gmem_host(g->mem, addr, (uint64_t)words * 4) : NULL;
     if (!code) return 0;
+    uint32_t first_end = words; /* up to the first s_endpgm, where the fetch shader call is looked for */
+    /* A branch can jump past an early s_endpgm: the translator may read on, up to 64 KiB of mapped code */
+    for (uint32_t more = 0x4000u; more > words; more /= 2) {
+        const uint32_t *wide = (const uint32_t *)gmem_host(g->mem, addr, (uint64_t)more * 4);
+        if (wide) {
+            code = wide;
+            words = more;
+            break;
+        }
+    }
     const uint32_t *fetch = NULL;
     uint32_t fetch_words = 0;
     *fetch_addr = 0;
     *fetch_reg = -1;
-    for (uint32_t i = 0; i < words; i++) {
+    for (uint32_t i = 0; i < first_end; i++) {
         if ((code[i] >> 23) == 0x17Du && ((code[i] >> 8) & 0xFF) == 33) {
             uint32_t k = code[i] & 0xFF; /* s_swappc_b64 s[..], s[k:k+1] */
             if (k + 1 < GPU_USER_DATA_REGS) {
@@ -330,7 +359,7 @@ static uint32_t gcn_program(const gpu *g, guest_addr addr, uint32_t user_data, u
         }
     }
     gcn_error err = {0};
-    uint32_t n = gcn_to_rdna2(code, words, fetch, fetch_words, out, cap, &err);
+    uint32_t n = gcn_to_rdna2_gs(code, words, fetch, fetch_words, emit, emit_words, out, cap, &err);
     if (!n) {
         static guest_addr told[64];
         static uint32_t told_count;
@@ -346,23 +375,51 @@ static uint32_t gcn_program(const gpu *g, guest_addr addr, uint32_t user_data, u
 }
 
 /* RDNA2 copies of PS4 programs, in guest memory the backend reads like any other shader's */
+/* Code space in 4 MiB chunks (LEGO City Undercover's menu and first level hold over 1000
+ * programs: one chunk and a 1024-entry list ran out, and every later program failed) */
 #define GCN_CODE_BYTES (4u << 20)
+#define GCN_CODE_CHUNKS 32u
+#define GCN_COPIES 16384u
+#define GCN_COPY_HASH 4096u
 typedef struct gcn_copy {
     guest_addr gcn, fetch, code; /* code 0: cannot be re-encoded */
     int fetch_reg;               /* user-data register of the fetch shader's address, -1: none */
+    int32_t next;                /* next entry of the same hash bucket, -1: none */
 } gcn_copy;
-static gcn_copy g_gcn_copies[1024];
+static gcn_copy g_gcn_copies[GCN_COPIES];
 static uint32_t g_gcn_copy_count;
-static guest_addr g_gcn_code;
+static int32_t g_gcn_copy_head[GCN_COPY_HASH]; /* first entry + 1 per bucket (0: empty) */
+static guest_addr g_gcn_code;                  /* the chunk being filled */
 static uint64_t g_gcn_code_used;
+static uint32_t g_gcn_code_chunks;
+
+static uint32_t gcn_copy_bucket(guest_addr addr) { return (uint32_t)((addr >> 8) * 0x9E3779B1u >> 20) & (GCN_COPY_HASH - 1); }
 
 static guest_addr user_addr(const gpu *g, uint32_t user_data, int k) {
     return (guest_addr)gpu_reg(g, user_data + (uint32_t)k) | ((guest_addr)gpu_reg(g, user_data + (uint32_t)k + 1) << 32);
 }
 
+/* Room for `bytes` of RDNA2 code in guest memory: the current chunk, or a new one */
+static guest_addr gcn_code_space(gpu *g, uint64_t bytes) {
+    if (bytes > GCN_CODE_BYTES) return 0;
+    if (!g_gcn_code || g_gcn_code_used + bytes > GCN_CODE_BYTES) {
+        guest_addr chunk = 0;
+        if (g_gcn_code_chunks >= GCN_CODE_CHUNKS ||
+            gmem_map(g->mem, 0, GCN_CODE_BYTES, GPROT_RW, 0, "PS4 shaders as RDNA2", &chunk) != PS5C_OK)
+            return 0;
+        g_gcn_code = chunk;
+        g_gcn_code_used = 0;
+        g_gcn_code_chunks++;
+    }
+    guest_addr at = g_gcn_code + g_gcn_code_used;
+    g_gcn_code_used += bytes;
+    return at;
+}
+
 /* The RDNA2 copy of the GCN program at addr (its fetch shader per the current user data); 0 if none */
 static guest_addr gcn_copy_of(gpu *g, guest_addr addr, uint32_t user_data, guest_addr *fetch) {
-    for (uint32_t i = 0; i < g_gcn_copy_count; i++) {
+    uint32_t bucket = gcn_copy_bucket(addr);
+    for (int32_t i = g_gcn_copy_head[bucket] - 1; i >= 0; i = g_gcn_copies[i].next) {
         const gcn_copy *c = &g_gcn_copies[i];
         if (c->gcn == addr && (c->fetch_reg < 0 || user_addr(g, user_data, c->fetch_reg) == c->fetch)) {
             *fetch = c->fetch;
@@ -371,27 +428,412 @@ static guest_addr gcn_copy_of(gpu *g, guest_addr addr, uint32_t user_data, guest
     }
     static uint32_t buf[0x4000];
     int reg = -1;
-    uint32_t n = gcn_program(g, addr, user_data, buf, PS5C_ARRAY_COUNT(buf), fetch, &reg);
+    uint32_t n = gcn_program(g, addr, user_data, buf, PS5C_ARRAY_COUNT(buf), fetch, &reg, NULL, 0);
     guest_addr code = 0;
-    if (n && !g_gcn_code &&
-        gmem_map(g->mem, 0, GCN_CODE_BYTES, GPROT_RW, 0, "PS4 shaders as RDNA2", &g_gcn_code) != PS5C_OK)
-        g_gcn_code = 0;
     uint64_t bytes = ((uint64_t)n * 4 + 255) & ~255ull;
-    if (n && g_gcn_code && g_gcn_code_used + bytes <= GCN_CODE_BYTES) {
-        uint32_t *dst = (uint32_t *)gmem_host(g->mem, g_gcn_code + g_gcn_code_used, bytes);
-        if (dst) {
-            memcpy(dst, buf, (size_t)n * 4);
-            code = g_gcn_code + g_gcn_code_used;
-            g_gcn_code_used += bytes;
-        }
+    guest_addr at = n ? gcn_code_space(g, bytes) : 0;
+    uint32_t *dst = at ? (uint32_t *)gmem_host(g->mem, at, bytes) : NULL;
+    if (dst) {
+        memcpy(dst, buf, (size_t)n * 4);
+        code = at;
     }
-    if (g_gcn_copy_count < PS5C_ARRAY_COUNT(g_gcn_copies))
-        g_gcn_copies[g_gcn_copy_count++] = (gcn_copy){addr, *fetch, code, reg};
+    if (g_gcn_copy_count < GCN_COPIES) {
+        g_gcn_copies[g_gcn_copy_count] = (gcn_copy){addr, *fetch, code, reg, g_gcn_copy_head[bucket] - 1};
+        g_gcn_copy_head[bucket] = (int32_t)++g_gcn_copy_count;
+    }
     LOG_I(GPU, "PS4 shader 0x%llx (fetch 0x%llx): %s 0x%llx (%u dwords)", (unsigned long long)addr,
           (unsigned long long)*fetch, code ? "RDNA2 copy at" : "no RDNA2 copy", (unsigned long long)code, n);
     if (*fetch && (dumping(g) || saving_shaders()))
         save_shader_words(g, *fetch, gcn_fetch_size((const uint32_t *)gmem_host(g->mem, *fetch, 1024), 256));
     return code;
+}
+
+/* ---- PS4 geometry shaders: the legacy ES -> GS -> copy VS pipeline ----
+ * RDNA2 has no ES/GS rings: a draw with GS_EN runs as three passes through the rings the
+ * GCN programs address, by Gnm's global table: [2] ES->GS write, [3] its read, [4] GS->VS
+ * write (stream 0), [8] its read, swizzled GCN V#s (SH_GCN_SWIZZLE translates them):
+ * 1. the ES as compute, a lane per input vertex, the es2gs offset of its 64-lane wave;
+ * 2. the GS as compute, a lane per primitive, the ES ring offsets of the primitive's
+ *    vertices; each emit also stores the lane's vertex count after its ring elements;
+ * 3. the copy VS draws a triangle list, three corners for every strip triangle the GS
+ *    may emit: index primitive << 10 | triangle << 2 | corner, which its prologue turns
+ *    into the ring offset of the vertex (the first one, a degenerate triangle, past the count).
+ * Rings are new space in one arena per draw, tables and index lists in another (CPU written). */
+#define GS_RING_BYTES (32u << 20)
+#define GS_CPU_BYTES (4u << 20)
+static guest_addr g_gs_ring, g_gs_cpu;
+static uint64_t g_gs_ring_used, g_gs_cpu_used;
+
+static guest_addr gs_space(gpu *g, bool ring, uint64_t bytes) {
+    guest_addr *arena = ring ? &g_gs_ring : &g_gs_cpu;
+    uint64_t *used = ring ? &g_gs_ring_used : &g_gs_cpu_used, size = ring ? GS_RING_BYTES : GS_CPU_BYTES;
+    bytes = (bytes + 255) & ~255ull;
+    if (!bytes || bytes > size / 4) return 0;
+    if (!*arena && gmem_map(g->mem, 0, size, GPROT_RW, 0, ring ? "PS4 geometry shader rings" : "PS4 geometry shader tables",
+                            arena) != PS5C_OK) {
+        *arena = 0;
+        return 0;
+    }
+    if (*used + bytes > size) *used = 0;
+    guest_addr at = *arena + *used;
+    *used += bytes;
+    return at;
+}
+
+/* RDNA2 instruction words (GFX10 encodings) */
+typedef struct rcode {
+    uint32_t w[192];
+    uint32_t n;
+} rcode;
+#define RV(n) (256u + (n)) /* a VGPR source */
+#define RI(k) (128u + (k)) /* inline integer 0..64 */
+#define RLIT 255u
+enum { R_S_MOV = 3, R_S_MUL = 38, R_V_MOV = 1, R_V_CNDMASK = 1, R_V_MUL_U24 = 11, R_V_LSHR = 22, R_V_LSHL = 26,
+       R_V_AND = 27, R_V_ADD = 37, R_VC_LT_U32 = 0xC1, R_V3_LSHL_ADD = 0x346, R_V3_MAD_U24 = 0x143,
+       R_LOAD_USHORT = 10, R_LOAD_DWORD = 12, R_STORE_DWORD = 28 };
+static void rput(rcode *c, uint32_t w) {
+    if (c->n < PS5C_ARRAY_COUNT(c->w)) c->w[c->n++] = w;
+}
+static void r_sop1(rcode *c, uint32_t op, uint32_t d, uint32_t s0, uint32_t lit) {
+    rput(c, 0xBE800000u | d << 16 | op << 8 | s0);
+    if (s0 == RLIT) rput(c, lit);
+}
+static void r_sop2(rcode *c, uint32_t op, uint32_t d, uint32_t s0, uint32_t s1, uint32_t lit) {
+    rput(c, 0x80000000u | op << 23 | d << 16 | s1 << 8 | s0);
+    if (s0 == RLIT || s1 == RLIT) rput(c, lit);
+}
+static void r_vop1(rcode *c, uint32_t op, uint32_t d, uint32_t s0, uint32_t lit) {
+    rput(c, 0x7E000000u | d << 17 | op << 9 | s0);
+    if (s0 == RLIT) rput(c, lit);
+}
+static void r_vop2(rcode *c, uint32_t op, uint32_t d, uint32_t s0, uint32_t v1, uint32_t lit) {
+    rput(c, op << 25 | d << 17 | v1 << 9 | s0);
+    if (s0 == RLIT) rput(c, lit);
+}
+static void r_vopc(rcode *c, uint32_t op, uint32_t s0, uint32_t v1) { rput(c, 0x7C000000u | op << 17 | v1 << 9 | s0); }
+static void r_vop3(rcode *c, uint32_t op, uint32_t d, uint32_t s0, uint32_t s1, uint32_t s2) {
+    rput(c, 0xD4000000u | op << 16 | d);
+    rput(c, s2 << 18 | s1 << 9 | s0);
+}
+static void r_load4(rcode *c, uint32_t sdata, uint32_t sbase, uint32_t offset) {
+    rput(c, 0xF4080000u | sdata << 6 | sbase >> 1);
+    rput(c, 0xFA000000u | offset);
+}
+static void r_wait(rcode *c, uint32_t imm) { rput(c, 0xBF8C0000u | imm); }
+static void r_mubuf(rcode *c, uint32_t op, uint32_t vdata, uint32_t vaddr, uint32_t srsrc, uint32_t soffset) {
+    rput(c, 0xE0000000u | op << 18 | 1u << 14 | 1u << 12); /* glc, offen */
+    rput(c, soffset << 24 | 1u << 22 | (srsrc >> 2) << 16 | vdata << 8 | vaddr);
+}
+#define R_WAIT_VM 0x3F70u
+#define R_WAIT_LGKM 0xC07Fu
+
+/* Program variants of the passes: their prologue's parameters are part of the code */
+enum { GS_KIND_ES, GS_KIND_GS, GS_KIND_VS };
+typedef struct gs_variant {
+    uint32_t kind, params[8];
+    guest_addr gcn, fetch, code;
+    int fetch_reg;
+} gs_variant;
+static gs_variant g_gs_variants[256];
+static uint32_t g_gs_variant_count;
+
+/* The RDNA2 copy of the GCN program at addr behind `pro` (emit: the GS emit replacement) */
+static guest_addr gs_variant_of(gpu *g, uint32_t kind, const uint32_t params[8], guest_addr addr, uint32_t user_data,
+                                const rcode *pro, const rcode *emit) {
+    guest_addr fetch = 0;
+    int reg = -1;
+    for (uint32_t i = 0; i < g_gs_variant_count; i++) {
+        const gs_variant *v = &g_gs_variants[i];
+        if (v->kind == kind && v->gcn == addr && !memcmp(v->params, params, sizeof(v->params)) &&
+            (v->fetch_reg < 0 || user_addr(g, user_data, v->fetch_reg) == v->fetch))
+            return v->code;
+    }
+    static uint32_t buf[0x4000];
+    uint32_t n = gcn_program(g, addr, user_data, buf + pro->n, PS5C_ARRAY_COUNT(buf) - pro->n, &fetch, &reg,
+                             emit ? emit->w : NULL, emit ? emit->n : 0);
+    guest_addr code = 0;
+    if (n) {
+        memcpy(buf, pro->w, pro->n * 4);
+        n += pro->n;
+        uint64_t bytes = ((uint64_t)n * 4 + 255) & ~255ull;
+        guest_addr at = gcn_code_space(g, bytes);
+        uint32_t *dst = at ? (uint32_t *)gmem_host(g->mem, at, bytes) : NULL;
+        if (dst) {
+            memcpy(dst, buf, (size_t)n * 4);
+            code = at;
+            if (dumping(g) || saving_shaders()) save_shader_words(g, at, n);
+        }
+    }
+    if (g_gs_variant_count < PS5C_ARRAY_COUNT(g_gs_variants)) {
+        gs_variant *v = &g_gs_variants[g_gs_variant_count++];
+        v->kind = kind;
+        memcpy(v->params, params, sizeof(v->params));
+        v->gcn = addr;
+        v->fetch = fetch;
+        v->fetch_reg = reg;
+        v->code = code;
+    }
+    LOG_I(GPU, "PS4 geometry shader pass %u of 0x%llx: %s 0x%llx (%u dwords)", kind, (unsigned long long)addr,
+          code ? "code at" : "no code", (unsigned long long)code, n);
+    return code;
+}
+
+/* A V# of the global table moved to `base`. Word 1 [15:0] is all base here: Gnm's ring V#s
+ * carry 0x30 in [15:8], which the 48-bit base read takes for address bits. */
+static void gs_desc(uint32_t v[4], guest_addr base, uint32_t records) {
+    v[0] = (uint32_t)base;
+    v[1] = (v[1] & 0xFFFF0000u) | (uint32_t)((base >> 32) & 0xFFFF);
+    v[2] = records;
+}
+
+static void gs_unsupported(const char *why, uint32_t value) {
+    static const char *told[16];
+    static uint32_t told_count;
+    for (uint32_t i = 0; i < told_count; i++)
+        if (told[i] == why) return;
+    if (told_count < 16) told[told_count++] = why;
+    LOG_W(GPU, "PS4 geometry shader draw skipped: %s (%u)", why, value);
+}
+
+/* The geometry shader passes of a GS_EN draw: ES and GS dispatched here, then `*vs_code`,
+ * `*draw` and the registers of `see` (count n) describe the copy VS draw. False: skip it. */
+typedef struct gs_see {
+    uint32_t idx[40], old[40], n;
+} gs_see;
+static void gs_see_reg(gpu *g, gs_see *s, uint32_t reg, uint32_t value) {
+    if (s->n == PS5C_ARRAY_COUNT(s->idx)) return;
+    s->idx[s->n] = reg;
+    s->old[s->n] = g->regs[reg];
+    g->regs[reg] = value;
+    s->n++;
+}
+static void gs_see_restore(gpu *g, gs_see *s) {
+    while (s->n--) g->regs[s->idx[s->n]] = s->old[s->n];
+    s->n = 0;
+}
+
+static bool gs_dispatch(gpu *g, guest_addr code, uint32_t rsrc1, uint32_t user, const uint32_t *ud, uint32_t groups) {
+    gs_see s = {0};
+    gs_see_reg(g, &s, mmCOMPUTE_PGM_LO, (uint32_t)(code >> 8));
+    gs_see_reg(g, &s, mmCOMPUTE_PGM_HI, (uint32_t)(code >> 40) & 0xFF);
+    gs_see_reg(g, &s, mmCOMPUTE_PGM_RSRC1, rsrc1);
+    gs_see_reg(g, &s, mmCOMPUTE_PGM_RSRC2, user << 1 | 1u << 7); /* USER_SGPR, TGID_X_EN */
+    gs_see_reg(g, &s, mmCOMPUTE_NUM_THREAD_X, 64);
+    gs_see_reg(g, &s, mmCOMPUTE_NUM_THREAD_Y, 1);
+    gs_see_reg(g, &s, mmCOMPUTE_NUM_THREAD_Z, 1);
+    gs_see_reg(g, &s, mmCOMPUTE_DISPATCH_INITIATOR, 1);
+    for (uint32_t i = 0; i < GPU_COMPUTE_USER_DATA_REGS; i++) gs_see_reg(g, &s, mmCOMPUTE_USER_DATA_0 + i, ud[i]);
+    g->gcn_ring_pass = 1;
+    g->cb.dispatch(g->cb.user, g, groups, 1, 1);
+    g->gcn_ring_pass = 0;
+    gs_see_restore(g, &s);
+    return true;
+}
+
+/* Copy VS ring loads (RDNA2 copy): the smallest non-zero and the largest offset */
+static bool gs_copy_layout(const gpu *g, guest_addr vs_code, uint32_t *step, uint32_t *last) {
+    uint32_t words = gpu_shader_size(g, vs_code);
+    const uint32_t *c = words ? (const uint32_t *)gmem_host(g->mem, vs_code, (uint64_t)words * 4) : NULL;
+    *step = 0;
+    *last = 0;
+    bool any = false;
+    for (uint32_t i = 0; c && i < words;) {
+        rdna2_inst in;
+        if (!rdna2_decode(c + i, words - i, &in) || !in.words) return false;
+        if (in.enc == RDNA2_ENC_MUBUF && in.name && !strcmp(in.name, "buffer_load_dword") && in.offen) {
+            uint32_t off = (uint32_t)in.offset;
+            any = true;
+            if (off > *last) *last = off;
+            if (off && (!*step || off < *step)) *step = off;
+        }
+        i += in.words;
+    }
+    return any;
+}
+
+static bool draw_gcn_gs(gpu *g, const gpu_draw *d, guest_addr vs, guest_addr *vs_code, gpu_draw *draw, gs_see *see) {
+    uint32_t prim = gpu_reg(g, mmVGT_PRIMITIVE_TYPE);
+    uint32_t pv = prim == GPU_PRIM_POINTLIST ? 1 : prim == GPU_PRIM_LINELIST ? 2 : prim == GPU_PRIM_TRILIST ? 3 : 0;
+    if (!pv) return gs_unsupported("input primitive type", prim), false;
+    if (gpu_reg(g, mmVGT_GS_OUT_PRIM_TYPE) != 2) return gs_unsupported("output primitive type", gpu_reg(g, mmVGT_GS_OUT_PRIM_TYPE)), false;
+    uint32_t nprims = d->count / pv;
+    if (!nprims) return false;
+    guest_addr es = gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_ES), gs = gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_GS);
+    const uint32_t es_ud = mmSPI_SHADER_PGM_LO_ES + 4, gs_ud = mmSPI_SHADER_USER_DATA_GS_0;
+    uint32_t es_rsrc1 = gpu_reg(g, mmSPI_SHADER_PGM_LO_ES + 2), es_user = (gpu_reg(g, mmSPI_SHADER_PGM_LO_ES + 3) >> 1) & 31;
+    uint32_t gs_rsrc1 = gpu_reg(g, mmSPI_SHADER_PGM_LO_GS + 2), gs_user = (gpu_reg(g, mmSPI_SHADER_PGM_LO_GS + 3) >> 1) & 31;
+    uint32_t vs_rsrc1 = gpu_reg(g, GPU_GCN_RSRC1_VS);
+    if (!es || !gs) return false;
+    if (es_user > 12 || gs_user > 14) return gs_unsupported("user data count", es_user > 12 ? es_user : gs_user), false;
+    if (((es_rsrc1 >> 6) & 0xF) >= 11 || ((gs_rsrc1 >> 6) & 0xF) >= 11 || ((vs_rsrc1 >> 6) & 0xF) >= 11)
+        return gs_unsupported("SGPR count", gs_rsrc1), false;
+    uint32_t gs_vgprs = ((gs_rsrc1 & 0x3F) + 1) * 4, vs_vgprs = ((vs_rsrc1 & 0x3F) + 1) * 4;
+    if (gs_vgprs + 2 > 256 || vs_vgprs + 6 > 256) return gs_unsupported("VGPR count", gs_vgprs), false;
+    /* the global table: the copy VS's s[0:1] */
+    guest_addr table = user_addr(g, GPU_GCN_USER_DATA_VS_0, 0);
+    const uint32_t *tab = table ? (const uint32_t *)gmem_host(g->mem, table, 16 * 16) : NULL;
+    if (!tab) return gs_unsupported("global table", 0), false;
+    const uint32_t *esw = tab + 2 * 4, *gsw = tab + 4 * 4;
+    uint32_t es_es = 2u << ((esw[3] >> 19) & 3), es_is = 8u << ((esw[3] >> 21) & 3);
+    uint32_t gs_es = 2u << ((gsw[3] >> 19) & 3), gs_is = 8u << ((gsw[3] >> 21) & 3);
+    if (!((esw[3] >> 23) & 1) || !(esw[1] >> 31) || es_es != 4 || es_is != 64 || ((esw[1] >> 16) & 0x3FFF))
+        return gs_unsupported("ES ring descriptor", esw[3]), false;
+    if (!((gsw[3] >> 23) & 1) || !(gsw[1] >> 31)) return gs_unsupported("GS ring descriptor", gsw[3]), false;
+    uint32_t es_item = gpu_reg(g, 0xA2ABu /* VGT_ESGS_RING_ITEMSIZE */) & 0x7FFF;
+    if (!es_item) return gs_unsupported("ES item size", 0), false;
+    /* the copy VS reads vertex j's component k at element k * M + j: M from its loads */
+    guest_addr fetch0 = 0;
+    guest_addr copy = gcn_copy_of(g, vs, GPU_GCN_USER_DATA_VS_0, &fetch0);
+    uint32_t step, last, vstep = gs_es * gs_is;
+    if (!copy || !gs_copy_layout(g, copy, &step, &last)) return gs_unsupported("copy shader", 0), false;
+    uint32_t maxv = gpu_reg(g, mmVGT_GS_MAX_VERT_OUT) & 0x7FF;
+    uint32_t m = step ? step / vstep : maxv;
+    if (maxv && m > maxv) m = maxv;
+    if (m < 3 || m > 256 || (step && step % vstep)) return gs_unsupported("vertex count", m), false;
+    uint32_t slot = last / vstep + m;                      /* the count, after the elements */
+    uint32_t stride = ((slot + 1) * gs_es + 15) & ~15u;    /* bytes per lane row */
+    if (stride > 0x3FFF) return gs_unsupported("GS ring stride", stride), false;
+    uint32_t es_waves = (d->count + 63) / 64, gs_waves = (nprims + 63) / 64;
+    uint32_t es_wave = es_item * 4 * 64, gs_wave = 64 * stride;
+    uint32_t ntri = nprims * (m - 2);
+    guest_addr esgs = gs_space(g, true, (uint64_t)es_waves * es_wave), gsvs = gs_space(g, true, (uint64_t)gs_waves * gs_wave);
+    guest_addr mytab = gs_space(g, false, 64 * 16), ib = gs_space(g, false, (uint64_t)ntri * 12);
+    uint32_t *t = mytab ? (uint32_t *)gmem_host(g->mem, mytab, 64 * 16) : NULL;
+    uint32_t *ix = ib ? (uint32_t *)gmem_host(g->mem, ib, (uint64_t)ntri * 12) : NULL;
+    if (!esgs || !gsvs || !t || !ix) return gs_unsupported("ring space", d->count), false;
+    memset(t, 0, 64 * 16);
+    const uint32_t *more = (const uint32_t *)gmem_host(g->mem, table, 64 * 16);
+    memcpy(t, more ? more : tab, more ? 64 * 16 : 16 * 16);
+    gs_desc(t + 2 * 4, esgs, es_waves * es_wave);
+    gs_desc(t + 3 * 4, esgs, es_waves * es_wave);
+    gs_desc(t + 4 * 4, gsvs, gs_waves * 64);
+    t[4 * 4 + 1] = (t[4 * 4 + 1] & ~(0x3FFFu << 16)) | stride << 16;
+    gs_desc(t + 8 * 4, gsvs, gs_waves * gs_wave);
+    for (uint32_t p = 0, k = 0; p < nprims; p++)
+        for (uint32_t tri = 0; tri < m - 2; tri++)
+            for (uint32_t c = 0; c < 3; c++) ix[k++] = p << 10 | tri << 2 | (c < 2 && (tri & 1) ? 1 - c : c);
+
+    /* user data, the table pointer replaced */
+    uint32_t ud[3][GPU_COMPUTE_USER_DATA_REGS] = {{0}};
+    const uint32_t bases[3] = {es_ud, gs_ud, GPU_GCN_USER_DATA_VS_0};
+    int tpair[3] = {-1, -1, -1};
+    for (int s = 0; s < 3; s++) {
+        for (uint32_t i = 0; i < 16; i++) ud[s][i] = gpu_reg(g, bases[s] + i);
+        for (uint32_t i = 0; i + 1 < 16; i++)
+            if (((guest_addr)ud[s][i] | (guest_addr)ud[s][i + 1] << 32) == table) {
+                ud[s][i] = (uint32_t)mytab;
+                ud[s][i + 1] = (uint32_t)(mytab >> 32);
+                if (tpair[s] < 0) tpair[s] = (int)i;
+            }
+    }
+    if (tpair[1] < 0 || tpair[1] & 1) return gs_unsupported("GS table pointer", 0), false;
+    uint32_t indx = gpu_reg(g, GPU_GCN_VGT_INDX_OFFSET);
+
+    /* 1. ES: v0 the vertex index of the lane, s[es_user] the es2gs offset of its wave */
+    rcode pro = {{0}, 0};
+    uint32_t params[8] = {0};
+    uint32_t es_cs_user = es_user, tg = es_user;
+    if (d->indexed) {
+        uint32_t vb = (es_user + 3) & ~3u;
+        ud[0][vb] = (uint32_t)d->index_addr;
+        ud[0][vb + 1] = (uint32_t)(d->index_addr >> 32) & 0xFFFF;
+        ud[0][vb + 2] = d->count * d->index_size;
+        ud[0][vb + 3] = 0x00027FACu; /* X Y Z W, 32 float: raw */
+        es_cs_user = tg = vb + 4;
+        r_vop3(&pro, R_V3_LSHL_ADD, 0, tg, RI(6), RV(0));
+        r_vop2(&pro, R_V_LSHL, 0, RI(d->index_size == 2 ? 1 : 2), 0, 0);
+        r_mubuf(&pro, d->index_size == 2 ? R_LOAD_USHORT : R_LOAD_DWORD, 0, 0, vb, RI(0));
+        r_wait(&pro, R_WAIT_VM);
+    } else {
+        r_vop3(&pro, R_V3_LSHL_ADD, 0, tg, RI(6), RV(0));
+    }
+    if (indx) r_vop2(&pro, R_V_ADD, 0, RLIT, 0, indx);
+    r_sop2(&pro, R_S_MUL, es_user, tg, RLIT, es_wave);
+    params[0] = es_user, params[1] = d->indexed ? d->index_size : 0, params[2] = es_wave, params[3] = indx;
+    guest_addr es_code = gs_variant_of(g, GS_KIND_ES, params, es, es_ud, &pro, NULL);
+
+    /* 2. GS: v0, v1, v3.. the ES ring offsets (dwords) of the primitive's vertices, v2 its index */
+    static const uint32_t slots[3] = {0, 1, 3};
+    uint32_t vc = gs_vgprs, vo = gs_vgprs + 1;
+    pro.n = 0;
+    r_vop3(&pro, R_V3_LSHL_ADD, 2, gs_user, RI(6), RV(0));
+    r_sop1(&pro, R_S_MOV, 100, RLIT, es_wave / 4);
+    for (uint32_t q = 0; q < pv; q++) {
+        r_vop2(&pro, R_V_MUL_U24, 8, RI(pv), 2, 0);
+        if (q) r_vop2(&pro, R_V_ADD, 8, RI(q), 8, 0);
+        r_vop2(&pro, R_V_LSHR, 9, RI(6), 8, 0);
+        r_vop2(&pro, R_V_AND, 8, RI(63), 8, 0);
+        r_vop3(&pro, R_V3_MAD_U24, slots[q], RV(9), 100, RV(8));
+    }
+    r_vop1(&pro, R_V_MOV, 7, RI(0), 0);
+    r_sop1(&pro, R_S_MOV, gs_user + 1, gs_user, 0);
+    r_sop2(&pro, R_S_MUL, gs_user, gs_user, RLIT, gs_wave);
+    r_load4(&pro, 96, (uint32_t)tpair[1], 4 * 16);
+    r_vop1(&pro, R_V_MOV, vc, RI(0), 0);
+    r_vop1(&pro, R_V_MOV, vo, RLIT, slot * gs_es);
+    r_wait(&pro, R_WAIT_LGKM);
+    rcode emit = {{0}, 0};
+    r_vop2(&emit, R_V_ADD, vc, RI(1), vc, 0);
+    r_mubuf(&emit, R_STORE_DWORD, vc, vo, 96, gs_user);
+    memset(params, 0, sizeof(params));
+    params[0] = gs_user, params[1] = pv, params[2] = es_wave, params[3] = gs_wave, params[4] = slot, params[5] = (uint32_t)tpair[1];
+    params[6] = gs_vgprs;
+    guest_addr gs_code = gs_variant_of(g, GS_KIND_GS, params, gs, gs_ud, &pro, &emit);
+
+    /* 3. copy VS: v0 from the index (primitive, triangle, corner) */
+    if (tpair[2] < 0 || tpair[2] & 1) return gs_unsupported("copy shader table pointer", 0), false;
+    uint32_t t0 = vs_vgprs, t1 = t0 + 1, t2 = t0 + 2, t3 = t0 + 3, t4 = t0 + 4, t5 = t0 + 5, lg_is = 0;
+    while ((1u << lg_is) < gs_is) lg_is++;
+    pro.n = 0;
+    r_load4(&pro, 96, (uint32_t)tpair[2], 8 * 16);
+    r_vop2(&pro, R_V_AND, t0, RI(3), 0, 0);
+    r_vop2(&pro, R_V_LSHR, t1, RI(2), 0, 0);
+    r_vop2(&pro, R_V_AND, t1, RLIT, t1, 255);
+    r_vop2(&pro, R_V_LSHR, t2, RI(10), 0, 0);
+    r_sop1(&pro, R_S_MOV, 100, RLIT, gs_wave);
+    r_sop1(&pro, R_S_MOV, 101, RLIT, stride * gs_is);
+    r_sop1(&pro, R_S_MOV, 102, RLIT, slot * vstep);
+    r_sop1(&pro, R_S_MOV, 103, RLIT, vstep);
+    r_vop2(&pro, R_V_LSHR, t3, RI(6), t2, 0);
+    r_vop2(&pro, R_V_MUL_U24, t3, 100, t3, 0);
+    r_vop2(&pro, R_V_AND, t4, RI(63), t2, 0);
+    r_vop2(&pro, R_V_LSHR, t5, RI(lg_is), t4, 0);
+    r_vop2(&pro, R_V_MUL_U24, t5, 101, t5, 0);
+    r_vop2(&pro, R_V_ADD, t3, RV(t5), t3, 0);
+    r_vop2(&pro, R_V_AND, t4, RI(gs_is - 1), t4, 0);
+    r_vop2(&pro, R_V_MUL_U24, t4, RI(gs_es), t4, 0);
+    r_vop2(&pro, R_V_ADD, t3, RV(t4), t3, 0); /* the lane's row */
+    r_vop2(&pro, R_V_ADD, t4, 102, t3, 0);
+    r_wait(&pro, R_WAIT_LGKM);
+    r_mubuf(&pro, R_LOAD_DWORD, t4, t4, 96, RI(0));
+    r_vop2(&pro, R_V_ADD, t5, RV(t1), t0, 0);
+    r_vop2(&pro, R_V_ADD, t1, RI(2), t1, 0);
+    r_wait(&pro, R_WAIT_VM);
+    r_vopc(&pro, R_VC_LT_U32, RV(t1), t4);
+    r_vop2(&pro, R_V_CNDMASK, t5, RI(0), t5, 0);
+    r_vop2(&pro, R_V_MUL_U24, t5, 103, t5, 0);
+    r_vop2(&pro, R_V_ADD, t5, RV(t3), t5, 0);
+    r_vop2(&pro, R_V_LSHR, 0, RI(2), t5, 0);
+    memset(params, 0, sizeof(params));
+    params[0] = (uint32_t)tpair[2], params[1] = gs_wave, params[2] = stride * gs_is, params[3] = slot * vstep, params[4] = vstep;
+    params[5] = gs_es, params[6] = gs_is, params[7] = vs_vgprs;
+    *vs_code = gs_variant_of(g, GS_KIND_VS, params, vs, GPU_GCN_USER_DATA_VS_0, &pro, NULL);
+    if (!es_code || !gs_code || !*vs_code) return gs_unsupported("program", 0), false;
+
+    gs_dispatch(g, es_code, es_rsrc1, es_cs_user, ud[0], es_waves);
+    gs_dispatch(g, gs_code, gs_rsrc1, gs_user, ud[1], gs_waves);
+    for (uint32_t i = 0; i < 16; i++) gs_see_reg(g, see, GPU_GCN_USER_DATA_VS_0 + i, ud[2][i]);
+    gs_see_reg(g, see, mmVGT_PRIMITIVE_TYPE, GPU_PRIM_TRILIST);
+    gs_see_reg(g, see, mmVGT_INDEX_TYPE, 1);
+    gs_see_reg(g, see, mmVGT_MULTI_PRIM_IB_RESET_EN, 0);
+    gs_see_reg(g, see, 0xA2A5u /* GCN VGT_MULTI_PRIM_IB_RESET_EN */, 0);
+    gs_see_reg(g, see, GPU_GCN_VGT_INDX_OFFSET, 0);
+    *draw = (gpu_draw){true, ntri * 3, 1, ib, 4};
+    static uint32_t told;
+    if (told++ < 4 || dumping(g))
+        LOG_I(GPU, "PS4 geometry shader draw: %u primitives of %u vertices, %u vertices out (%u triangles), ES ring %u B/wave, "
+              "GS ring row %u B", nprims, pv, m, ntri, es_wave, stride);
+    return true;
 }
 
 /* A PS4 draw: VS stage (SPI_SHADER_PGM_LO_VS) and GCN shaders. The backend draws it with the RDNA2
@@ -421,12 +863,28 @@ static void draw_gcn(gpu *g, const gpu_draw *d) {
         save_shader(g, ps);
     }
     if (!vs_code || (ps && !ps_code) || !g->cb.draw) return;
+    /* GS_EN: the VS is the GS copy shader, which reads the GS output ring: the ES and GS
+     * passes run first, the draw is then the copy VS's triangle list (draw_gcn_gs) */
+    gpu_draw gs_draw;
+    gs_see gs_regs = {{0}, {0}, 0};
+    if (gpu_reg(g, mmVGT_SHADER_STAGES_EN) & 0x20u) {
+        static int gs_off = -1; /* PS5C_PS4_NO_GS=1: such draws are skipped */
+        if (gs_off < 0) gs_off = getenv("PS5C_PS4_NO_GS") != NULL;
+        if (gs_off || !draw_gcn_gs(g, d, vs, &vs_code, &gs_draw, &gs_regs)) {
+            gs_see_restore(g, &gs_regs);
+            return;
+        }
+        d = &gs_draw;
+    }
     static int off = -1; /* PS5C_PS4_NO_DRAWS=1: count them only */
     if (off < 0) off = getenv("PS5C_PS4_NO_DRAWS") != NULL;
-    if (off) return;
+    if (off) {
+        gs_see_restore(g, &gs_regs);
+        return;
+    }
 
     /* registers the call sees differently, and their PS4 values */
-    enum { NSAVE = 6 + GPU_MAX_RENDER_TARGETS * 5 + 4 };
+    enum { NSAVE = 7 + GPU_MAX_RENDER_TARGETS * 5 + 4 };
     uint32_t idx[NSAVE], old[NSAVE], n = 0;
 #define SEE(reg, value) do { idx[n] = (reg); old[n] = g->regs[(reg)]; g->regs[(reg)] = (value); n++; } while (0)
     SEE(mmSPI_SHADER_PGM_LO_ES, (uint32_t)(vs_code >> 8));
@@ -435,26 +893,40 @@ static void draw_gcn(gpu *g, const gpu_draw *d) {
     SEE(mmSPI_SHADER_PGM_HI_PS, (uint32_t)(ps_code >> 40) & 0xFF);
     SEE(mmVGT_SHADER_STAGES_EN, 0);
     SEE(mmGE_CNTL, 0);
+    SEE(mmGE_INDX_OFFSET, gpu_reg(g, GPU_GCN_VGT_INDX_OFFSET)); /* Gnm setIndexOffset */
+    /* Pitch and slice count whole 8x8 tiles: a 1080-line target reads as 1088. When the screen
+     * scissor ends inside that last tile row (column), it is the real size: the same surface
+     * sampled later with its T# (1920x1080) is then the same host image (LEGO City Undercover). */
+    uint32_t scr = gpu_reg(g, mmPA_SC_SCREEN_SCISSOR_BR), scr_w = scr & 0x7FFF, scr_h = (scr >> 16) & 0x7FFF;
+    g->gcn_fast_clear = 0;
     for (uint32_t i = 0; i < GPU_MAX_RENDER_TARGETS; i++) {
         uint32_t base = mmCB_COLOR0_BASE + i * GPU_CB_STRIDE;
         uint32_t w = ((gpu_reg(g, base + 1) & 0x7FF) + 1) * 8;          /* CB_COLORn_PITCH TILE_MAX */
         uint32_t h = ((gpu_reg(g, base + 2) & 0x3FFFFF) + 1) * 64 / w;  /* CB_COLORn_SLICE TILE_MAX */
         if (!h) h = 1;
+        if (scr_h && scr_h < h && scr_h + 8 >= h) h = scr_h;
+        if (scr_w && scr_w < w && scr_w + 8 >= w) w = scr_w;
         SEE(mmCB_COLOR0_ATTRIB2 + i, ((h - 1) & 0x3FFF) | (((w - 1) & 0x3FFF) << 14));
         SEE(mmCB_COLOR0_ATTRIB3 + i, 0);
         SEE(mmCB_COLOR0_BASE_EXT + i, 0);
+        if ((gpu_reg(g, base + (mmCB_COLOR0_INFO - mmCB_COLOR0_BASE)) >> 13) & 1) g->gcn_fast_clear |= (uint8_t)(1u << i);
         SEE(base + (mmCB_COLOR0_INFO - mmCB_COLOR0_BASE), gpu_reg(g, base + (mmCB_COLOR0_INFO - mmCB_COLOR0_BASE)) & ~(3u << 13));
         SEE(base + (mmCB_COLOR0_DCC_CONTROL - mmCB_COLOR0_BASE), 0);
     }
-    uint32_t zsize = gpu_reg(g, mmDB_DEPTH_SIZE_XY); /* GCN DB_DEPTH_SIZE: PITCH_TILE_MAX [10:0], HEIGHT_TILE_MAX [21:11] */
+    uint32_t zsize = gpu_reg(g, GPU_GCN_DB_DEPTH_SIZE); /* GCN DB_DEPTH_SIZE: PITCH_TILE_MAX [10:0], HEIGHT_TILE_MAX [21:11] */
     uint32_t zw = ((zsize & 0x7FF) + 1) * 8, zh = (((zsize >> 11) & 0x7FF) + 1) * 8;
+    if (scr_h && scr_h < zh && scr_h + 8 >= zh) zh = scr_h;
+    if (scr_w && scr_w < zw && scr_w + 8 >= zw) zw = scr_w;
     SEE(mmDB_DEPTH_SIZE_XY, (zw - 1) | ((zh - 1) << 16));
     SEE(mmDB_Z_INFO, gpu_reg(g, mmDB_Z_INFO) & 0xFu);
     SEE(mmDB_STENCIL_INFO, gpu_reg(g, mmDB_STENCIL_INFO) & 0x1u);
     SEE(mmDB_HTILE_DATA_BASE, 0);
 #undef SEE
+    g->gcn_ps = ps;
     g->cb.draw(g->cb.user, g, d);
+    g->gcn_ps = 0;
     while (n--) g->regs[idx[n]] = old[n];
+    gs_see_restore(g, &gs_regs);
 }
 
 static void draw(gpu *g, const gpu_draw *d) {
@@ -750,10 +1222,13 @@ static void driver_packet(gpu *g, const uint32_t *p, uint32_t len) {
                 g->dump_frame = (int64_t)g->stats.flips;
                 LOG_I(GPU, "dumping frame %lld", (long long)g->dump_frame);
             }
-            /* the flip comes after the frame's work and its end-of-pipe events, as on the hardware */
+            /* the flip comes after the frame's work and its end-of-pipe events, as on the hardware: the backend
+             * completes it once they are done, or the command processor waits for them now */
+            int64_t arg = (int64_t)((uint64_t)p[6] | ((uint64_t)p[7] << 32));
+            if (g->cb.flip_deferred && g->cb.flip_deferred(g->cb.user, (int32_t)p[3], (int32_t)p[4], (int32_t)p[5], arg))
+                break;
             cp_read(g, 0, ~0ull);
-            g->cb.flip(g->cb.user, (int32_t)p[3], (int32_t)p[4], (int32_t)p[5],
-                       (int64_t)((uint64_t)p[6] | ((uint64_t)p[7] << 32)));
+            g->cb.flip(g->cb.user, (int32_t)p[3], (int32_t)p[4], (int32_t)p[5], arg);
         }
         break;
     case GPU_DRIVER_WAIT_DISPLAY:
@@ -858,14 +1333,17 @@ static bool log_release_enabled(void) {
 }
 
 static void release_mem(gpu *g, const uint32_t *p, uint32_t len, int32_t queue_event) {
-    if (len < 8) return;
+    /* PS4 (GCN): 7 dwords, int_sel[25:24], no context id; every int_sel but 0 raises the
+     * interrupt (a compute ring's RELEASE_MEM wakes the pipe's event, Tearaway Unfolded) */
+    bool gcn = g->gcn && len == 7;
+    if (len < 8 && !gcn) return;
     g->stats.releases++;
-    uint32_t data_sel = p[2] >> 29, int_sel = (p[2] >> 24) & 7;
+    uint32_t data_sel = p[2] >> 29, int_sel = (p[2] >> 24) & (gcn ? 3 : 7);
     /* The CPU only learns that work finished through a label or an interrupt:
      * a release with neither, or one that only stores the GPU clock (profiling
      * markers: Astro Bot writes thousands per second), needs no GPU results in
      * guest memory, so it does not wait for the GPU. */
-    bool observable = (data_sel == 1 || data_sel == 2) || (int_sel != 0 && int_sel != 3);
+    bool observable = (data_sel == 1 || data_sel == 2) || (int_sel != 0 && (gcn || int_sel != 3));
     guest_addr addr = (guest_addr)p[3] | ((guest_addr)p[4] << 32);
     uint64_t data = (uint64_t)p[5] | ((uint64_t)p[6] << 32);
     if (addr_logged(addr, 8))
@@ -884,7 +1362,8 @@ static void release_mem(gpu *g, const uint32_t *p, uint32_t len, int32_t queue_e
         }
     }
     if (data_sel > 4) LOG_W(GPU, "RELEASE_MEM data_sel %u not supported", data_sel);
-    gpu_release rel = {addr, data, data_sel <= 4 ? data_sel : 0, int_sel != 0 && int_sel != 3, queue_event, p[7]};
+    gpu_release rel = {addr, data, data_sel <= 4 ? data_sel : 0, int_sel != 0 && (gcn || int_sel != 3), queue_event,
+                       gcn ? 0 : p[7]};
     release(g, &rel, observable);
 }
 
@@ -900,6 +1379,23 @@ static void event_write_eop(gpu *g, const uint32_t *p, uint32_t len, int32_t que
     guest_addr addr = (guest_addr)p[2] | ((guest_addr)(p[3] & 0xFFFF) << 32);
     uint64_t data = (uint64_t)p[4] | ((uint64_t)p[5] << 32);
     gpu_release rel = {addr, data, data_sel <= 3 ? data_sel : 0, int_sel != 0, queue_event, 0};
+    release(g, &rel, true);
+}
+
+/* EVENT_WRITE_EOS (GCN, PS4 writeAtEndOfShader): dw1 event (CS_DONE, PS_DONE), dw2 addr lo,
+ * dw3 addr hi[15:0] data_sel[31:29] (1 GDS contents, 2 the 32-bit dw4), dw4 data. The write
+ * lands once the shaders before it are done, like an end-of-pipe label without interrupt. */
+static void event_write_eos(gpu *g, const uint32_t *p, uint32_t len, int32_t queue_event) {
+    uint32_t data_sel = len >= 5 ? p[3] >> 29 : 0;
+    if (data_sel != 2) {
+        static bool logged;
+        if (!logged) LOG_W(GPU, "EVENT_WRITE_EOS data_sel %u (%u dwords) not supported", data_sel, len);
+        logged = true;
+        return;
+    }
+    g->stats.releases++;
+    guest_addr addr = (guest_addr)p[2] | ((guest_addr)(p[3] & 0xFFFF) << 32);
+    gpu_release rel = {addr, p[4], 1, false, queue_event, 0};
     release(g, &rel, true);
 }
 
@@ -1327,6 +1823,7 @@ static void run_packets(gpu *g, guest_addr addr, uint32_t dwords, int32_t queue_
             break;
         }
         case IT_EVENT_WRITE_EOP: event_write_eop(g, p, len, queue_event); break;
+        case IT_EVENT_WRITE_EOS: event_write_eos(g, p, len, queue_event); break;
         case IT_DMA_DATA: dma_data(g, p, len); break;
         case IT_COPY_DATA: copy_data(g, p, len); break;
         case IT_ATOMIC_MEM: atomic_mem(g, p, len); break;

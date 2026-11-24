@@ -252,6 +252,23 @@ static void ao_get_last_output_time(hle_call *c) {
 
 static void ao_accept(hle_call *c) { hle_ret_s32(c, 0); }
 
+/* int sceAudioOutGetSystemState({float loudness; u8 reserved[28]} *): all zero (AnyPS5) */
+static void ao_get_system_state(hle_call *c) {
+    void *s = hle_arg_ptr(c, 0) ? hle_mem(c, hle_arg_ptr(c, 0), 32) : NULL;
+    if (s) memset(s, 0, 32);
+    hle_ret_s32(c, s ? 0 : (int32_t)0x80260004);
+}
+
+/* int sceAudioOutSetMixLevelPadSpk(int handle, uint32_t level): level 0..32768 of a pad
+ * speaker port (those ports are not mixed here); error codes as in AnyPS5 */
+static void ao_set_mix_level_pad_spk(hle_call *c) {
+    ao_port *p = port_arg(c);
+    hle_ret_s32(c, !p                               ? AO_ERR_INVALID_PORT
+                   : hle_arg_u32(c, 1) > 32768      ? (int32_t)0x80260014 /* invalid volume */
+                   : p->type != PORT_TYPE_PADSPK    ? (int32_t)0x8026000A /* invalid port type */
+                                                    : 0);
+}
+
 /* ---- libSceAudioIn: a microphone that records silence at the real rate ---- */
 
 #define AI_HANDLE_BASE 0x200
@@ -281,6 +298,20 @@ static void ai_open(hle_call *c) {
         return;
     }
     hle_ret_s32(c, (int32_t)0x80260109); /* port full */
+}
+
+/* int sceAudioInAsyncOpen(user, type, index, len, freq, param): the same port, for
+ * 128-sample periods at 48 kHz only (checks as in AnyPS5) */
+static void ai_async_open(hle_call *c) {
+    if (hle_arg_u32(c, 4) != 48000) { hle_ret_s32(c, (int32_t)0x80260103); return; } /* invalid freq */
+    if (hle_arg_u32(c, 3) != 128) { hle_ret_s32(c, (int32_t)0x80260102); return; }   /* invalid size */
+    ai_open(c);
+}
+
+/* int sceAudioInHqOpen(...): 128-sample periods at 48 kHz, stereo (param 2) only */
+static void ai_hq_open(hle_call *c) {
+    if (hle_arg_u32(c, 5) != 2) { hle_ret_s32(c, (int32_t)0x80260105); return; } /* invalid param */
+    ai_async_open(c);
 }
 
 static int ai_index(hle_call *c) {
@@ -317,6 +348,9 @@ static void ai_silent_state(hle_call *c) { hle_ret_s32(c, ai_index(c) >= 0 ? 0 :
 
 static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInOpen", ai_open),
+    HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInAsyncOpen", ai_async_open),
+    HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInHqOpen", ai_hq_open),
+    HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutGetSystemState", ao_get_system_state),
     HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInGetSilentState", ai_silent_state),
     HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInInput", ai_input),
     HLE_FUNC_ENTRY("libSceAudioIn", "sceAudioInClose", ai_close),
@@ -326,6 +360,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutOutput", ao_output),
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutOutputs", ao_outputs),
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutSetVolume", ao_set_volume),
+    HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutSetMixLevelPadSpk", ao_set_mix_level_pad_spk),
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutGetPortState", ao_get_port_state),
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutGetLastOutputTime", ao_get_last_output_time),
     HLE_FUNC_ENTRY("libSceAudioOut", "sceAudioOutSetAllMute", ao_accept),

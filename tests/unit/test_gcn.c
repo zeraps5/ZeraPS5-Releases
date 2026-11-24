@@ -146,11 +146,23 @@ static void test_waitcnt_and_vop2_changes(void) {
     CHECK(err.why != NULL && err.pos == 0);
 }
 
+static void test_code_after_early_endpgm(void) {
+    /* s_cbranch_scc0 over an early s_endpgm: the code it jumps to is translated too */
+    const uint32_t ps[] = {0xbf840001u, 0xbf810000u, 0xbf810000u};
+    uint32_t out[8];
+    gcn_error err = {0};
+    CHECK_EQ_U64(gcn_to_rdna2(ps, 3, NULL, 0, out, 8, &err), 3);
+    CHECK_EQ_U64(out[0], 0xbf840001u);
+    CHECK_EQ_U64(out[1], 0xbf810000u);
+    CHECK_EQ_U64(out[2], 0xbf810000u);
+}
+
 int main(void) {
     static const test_case tests[] = {
         TEST_CASE(test_vs_with_fetch),
         TEST_CASE(test_ps_branch_and_sample),
         TEST_CASE(test_waitcnt_and_vop2_changes),
+        TEST_CASE(test_code_after_early_endpgm),
     };
     return test_run_all("gcn", tests, PS5C_ARRAY_COUNT(tests));
 }

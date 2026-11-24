@@ -187,6 +187,7 @@ struct renderer {
     VkDeviceSize host_import_align; /* opt-in external host allocations; zero when unavailable */
     PFN_vkGetMemoryHostPointerPropertiesEXT host_pointer_properties;
     uint32_t queue_family;
+    uint32_t queue_timestamp_bits;
     VkDevice device;
     VkQueue queue;
 
@@ -351,6 +352,7 @@ void vk_upload_linear(renderer *r, VkCommandBuffer cmd, vk_buffer *staging, vk_i
 /* Work command buffer: vk_begin starts recording if needed, vk_flush submits. */
 VkCommandBuffer vk_begin(renderer *r);
 void vk_flush(renderer *r);
+void vk_copy_pool_drain(void);
 VkResult vk_work_wait(renderer *r, uint64_t timeout_ns);
 VkResult vk_work_wait_slot(renderer *r, uint32_t slot, uint64_t timeout_ns);
 bool vk_work_slot_done(renderer *r, uint32_t slot);

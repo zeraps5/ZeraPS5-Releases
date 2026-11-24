@@ -728,7 +728,7 @@ static bool pipe_io(hle_call *c,int fd,guest_addr buf,uint64_t n,bool write,bool
 
 /* Pipe status flags and descriptor flags. Preserve the pre-existing fcntl
  * behavior for other descriptor kinds until their flag handling is extended. */
-static void posix_fcntl(hle_call *c) {
+static int64_t do_fcntl(hle_call *c) {
     int fd=hle_arg_s32(c,0),cmd=hle_arg_s32(c,1); int64_t result=0;
     pal_mutex_lock(g_lock); fd_entry *e=fd_get(fd);
     if (e && e->pipe) {
@@ -755,8 +755,10 @@ static void posix_fcntl(hle_call *c) {
     } else if(!e && !(fd>=0 && fd<FIRST_FD) &&
         !(fd>=0 && fd<MAX_FDS && g_socket_reserved[fd])) result=-E_BADF;
     else if (cmd<0 || cmd>4) result=-E_INVAL;
-    pal_mutex_unlock(g_lock); ret_posix(c,result);
+    pal_mutex_unlock(g_lock); return result;
 }
+static void posix_fcntl(hle_call *c) { ret_posix(c, do_fcntl(c)); }
+static void sce_fcntl(hle_call *c) { ret_sce(c, do_fcntl(c)); }
 
 /* pollfd is int fd, short events, short revents on FreeBSD. Poll counts ready
  * descriptors, including invalid descriptors and hung-up pipe endpoints. A
@@ -1668,6 +1670,7 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("pipe", posix_pipe),
     POSIX_ENTRY("dup2", posix_dup2),
     POSIX_ENTRY("fcntl", posix_fcntl),
+    HLE_FUNC_ENTRY(K, "sceKernelFcntl", sce_fcntl),
     POSIX_ENTRY("poll", posix_poll),
     POSIX_ENTRY("kqueue", posix_kqueue),
     POSIX_ENTRY("kevent", posix_kevent),
@@ -1718,6 +1721,8 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("fchmod", posix_fchmod),
     HLE_FUNC_ENTRY(K, "sceKernelUtimes", sce_path_exists),
     HLE_FUNC_ENTRY(P, "chmod", posix_path_exists),
+    HLE_FUNC_ENTRY(P, "utimes", posix_path_exists),
+    HLE_FUNC_ENTRY(P, "futimes", posix_fchmod), /* futimes(fd, times): same policy as fchmod */
     POSIX_ENTRY("stat", posix_stat),
     HLE_FUNC_ENTRY(K, "sceKernelStat", sce_stat),
     POSIX_ENTRY("fstat", posix_fstat),

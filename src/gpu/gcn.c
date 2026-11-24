@@ -288,7 +288,9 @@ static const char *conv_one(const uint32_t *c, uint32_t n, out_inst *o) {
         uint32_t op = (w >> 18) & 0x7F;
         if ((w >> 15) & 1) return "MUBUF addr64";
         if ((w >> 16) & 1) return "MUBUF lds";
-        if (op > 0x1F || !rdna2_op_name(RDNA2_ENC_MUBUF, op)) return "MUBUF opcode";
+        /* loads and stores, and the atomics (0x30..0x40, x2 0x50..0x60): numbered as on RDNA2 */
+        bool atomic = (op >= 0x30 && op <= 0x40) || (op >= 0x50 && op <= 0x60);
+        if ((op > 0x1F && !atomic) || !rdna2_op_name(RDNA2_ENC_MUBUF, op)) return "MUBUF opcode";
         put(o, w & ~(1u << 25));
         put(o, c[1] & ~(1u << 21));
         return NULL;
@@ -325,7 +327,14 @@ static bool is_branch(uint32_t w) {
 typedef struct emitter {
     uint32_t *out, cap, n;
     gcn_error *err;
+    const uint32_t *emit; /* replaces s_sendmsg GS emit (geometry shader passes); NULL: kept */
+    uint32_t emit_words;
 } emitter;
+
+/* s_sendmsg MSG_GS with OP emit (2) or emit-cut (3) */
+static bool is_gs_emit(uint32_t w) {
+    return (w & 0xFFFF0000u) == 0xBF900000u && (w & 0xFu) == 2u && ((w >> 4) & 3u) >= 2u;
+}
 
 static bool fail(emitter *em, uint32_t pos, uint32_t word, bool fetch, const char *why) {
     if (em->err) *em->err = (gcn_error){pos, word, fetch, why};
@@ -340,6 +349,7 @@ static bool emit_program(emitter *em, const uint32_t *code, uint32_t avail, bool
     uint32_t (*fix)[2] = (uint32_t(*)[2])malloc(((size_t)avail + 1) * sizeof(*fix));
     bool ok = map && fix;
     uint32_t nfix = 0, pos = 0, start = em->n;
+    uint32_t far = 0; /* furthest forward branch target: code after an early s_endpgm is still reachable */
     if (map) memset(map, 0xFF, ((size_t)avail + 1) * sizeof(uint32_t));
     while (ok) {
         if (pos >= avail) {
@@ -364,12 +374,23 @@ static bool emit_program(emitter *em, const uint32_t *code, uint32_t avail, bool
             pos += n;
             continue;
         }
+        if (em->emit && is_gs_emit(c[0])) {
+            if (em->n + em->emit_words > em->cap) {
+                ok = fail(em, pos, c[0], is_fetch, "output full");
+                break;
+            }
+            memcpy(em->out + em->n, em->emit, em->emit_words * 4);
+            em->n += em->emit_words;
+            pos += n;
+            continue;
+        }
         out_inst o;
         if (is_branch(c[0])) {
             o.n = 1;
             o.w[0] = c[0] & 0xFFFF0000u;
             fix[nfix][0] = em->n;
             fix[nfix][1] = (uint32_t)((int32_t)pos + 1 + (int16_t)(c[0] & 0xFFFF));
+            if (fix[nfix][1] < avail && fix[nfix][1] > far) far = fix[nfix][1];
             nfix++;
         } else {
             const char *why = conv_one(c, n, &o);
@@ -385,7 +406,7 @@ static bool emit_program(emitter *em, const uint32_t *code, uint32_t avail, bool
         memcpy(em->out + em->n, o.w, o.n * 4);
         em->n += o.n;
         pos += n;
-        if (!is_fetch && c[0] == 0xBF810000u) break; /* s_endpgm */
+        if (!is_fetch && c[0] == 0xBF810000u && pos > far) break; /* s_endpgm no branch jumps past */
     }
     for (uint32_t i = 0; ok && i < nfix; i++) {
         uint32_t target = fix[i][1];
@@ -403,7 +424,13 @@ static bool emit_program(emitter *em, const uint32_t *code, uint32_t avail, bool
 
 uint32_t gcn_to_rdna2(const uint32_t *code, uint32_t avail, const uint32_t *fetch, uint32_t fetch_words,
                       uint32_t *out, uint32_t cap, gcn_error *err) {
-    emitter em = {out, cap, 0, err};
+    emitter em = {out, cap, 0, err, NULL, 0};
+    return emit_program(&em, code, avail, false, fetch, fetch_words) ? em.n : 0;
+}
+
+uint32_t gcn_to_rdna2_gs(const uint32_t *code, uint32_t avail, const uint32_t *fetch, uint32_t fetch_words,
+                         const uint32_t *emit, uint32_t emit_words, uint32_t *out, uint32_t cap, gcn_error *err) {
+    emitter em = {out, cap, 0, err, emit, emit_words};
     return emit_program(&em, code, avail, false, fetch, fetch_words) ? em.n : 0;
 }
 

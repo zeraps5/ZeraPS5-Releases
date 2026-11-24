@@ -34,5 +34,8 @@ typedef struct sh_dynamic_plan {
  * Does not infer resources by scanning descriptor-looking bytes. */
 bool sh_dynamic_plan_build(const sh_program *p, const sh_eval *initial, const sh_stage_info *info,
                            gmem *mem, sh_dynamic_plan *out);
+/* Prepare guest memory after checking the code and before reading any guest data. */
+bool sh_dynamic_plan_build_with_prepare(const sh_program *p, const sh_eval *initial, const sh_stage_info *info,
+                                        gmem *mem, sh_dynamic_plan *out, bool (*prepare)(void *), void *context);
 void sh_dynamic_plan_free(sh_dynamic_plan *plan);
 #endif

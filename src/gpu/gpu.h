@@ -84,6 +84,10 @@ typedef struct gpu_callbacks {
     /* Optional: returns once buffer `index` of display `handle` is neither waiting to be shown nor being shown
      * (sceAgcDriverWaitUntilSafeForRendering), so the frame drawn into it next does not reach the screen half done. */
     void (*wait_display)(void *user, int32_t handle, int32_t index);
+    /* Optional: takes the flip and completes it later, once the GPU work recorded so far has completed and its
+     * results and the releases held behind it have reached guest memory; the command processor goes on meanwhile.
+     * False: the flip happens now, after that work (as without it). */
+    bool (*flip_deferred)(void *user, int32_t handle, int32_t index, int32_t mode, int64_t arg);
 } gpu_callbacks;
 
 typedef struct gpu_stats {
@@ -113,6 +117,9 @@ struct gpu {
     uint32_t run_depth;
     gpu_submission *active_submission; /* borrowed only while resuming under the GPU lock */
     bool gcn; /* a PS4 game's streams (Gnm): its draws use the VS stage and GCN shaders */
+    guest_addr gcn_ps; /* during a PS4 draw: its GCN pixel shader (the registers hold the RDNA2 copy) */
+    uint8_t gcn_fast_clear; /* during a PS4 draw: color targets with CB_COLOR_INFO.FAST_CLEAR (cleared from the RDNA2 view) */
+    uint8_t gcn_ring_pass; /* during the compute passes of a PS4 geometry shader draw (GCN swizzled ring addressing) */
 };
 
 ps5c_err gpu_init(gpu *g, gmem *mem, const gpu_callbacks *cb);
@@ -133,6 +140,10 @@ void gpu_perform_release(gpu *g, const gpu_release *rel);
 
 /* Length in dwords of the shader program at `addr` (through s_endpgm), 0 if unknown. */
 uint32_t gpu_shader_size(const gpu *g, guest_addr addr);
+
+/* VideoOut showed a frame (PS4 games flip there: PS5C_GPU_DUMP=<n> counts these when the
+ * command processor saw no flip packet) */
+void gpu_note_video_flip(void);
 
 /* Writes a driver packet (NOP + tag) of `dwords` dwords at `dst`. */
 void gpu_write_driver_packet(uint32_t *dst, uint32_t dwords, const uint32_t *payload, uint32_t payload_dwords);

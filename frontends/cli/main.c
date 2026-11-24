@@ -28,6 +28,10 @@
 #include "loader/nid_db.h"
 #include "mem/gmem.h"
 #include "pal/pal.h"
+#ifdef _WIN32
+#include "pal/ps4_camera.h"
+#include "pal/pal_camera.h"
+#endif
 #include "pal/pal_exfat.h"
 #include "pal/pal_pkg.h"
 #include "base/kraken.h"
@@ -72,6 +76,8 @@ static void print_usage(void) {
            "                                    PS5C_SHADERS_FLOAT_CONTROLS=1 as on GPUs with float controls\n"
            "  ps5c --host-info                 show host platform information\n"
            "  ps5c --list-gpus                 list the host GPUs (number, dedicated/integrated, name)\n"
+           "  ps5c camera [firmware.bin]       PS4 Camera state; with a file, send it the firmware\n"
+           "  ps5c --list-cameras              list the host cameras for the launcher\n"
            "  ps5c --find-system-modules       locate local system libraries without changing preferences\n"
            "  ps5c --collect-system-modules    retain discovered libraries in the local collection\n"
            "  ps5c --version\n\n"
@@ -1134,6 +1140,38 @@ static int cmd_pkg(const char *path, const char *dir) {
     return rc;
 }
 
+#ifdef _WIN32
+/* ps5c --list-cameras, for the launcher: "camera<TAB>name" lines, then "ps4<TAB>absent|firmware|driver|ready" */
+static int cmd_list_cameras(void) {
+    static const char *k_state[] = {"absent", "firmware", "driver", "ready"};
+    char names[16][128];
+    uint32_t n = pal_camera_list(names, 16);
+    for (uint32_t i = 0; i < n && i < 16; i++) printf("camera\t%s\n", names[i]);
+    ps4_camera_state st = ps4_camera_query();
+    printf("ps4\t%s\n", (unsigned)st < 4 ? k_state[st] : "absent");
+    return 0;
+}
+
+/* ps5c camera [firmware.bin]: the PS4 Camera's state; with the user's firmware file, loads it */
+static int cmd_camera(const char *firmware) {
+    ps4_camera_state st = ps4_camera_query();
+    printf("PS4 Camera: %s\n", ps4_camera_state_name(st));
+    if (!firmware) return st == PS4_CAMERA_ABSENT ? 1 : 0;
+    if (st == PS4_CAMERA_READY) return 0;
+    FILE *f = fopen(firmware, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", firmware); return 1; }
+    static uint8_t fw[4u << 20];
+    size_t n = fread(fw, 1, sizeof(fw), f);
+    fclose(f);
+    if (!n || n == sizeof(fw)) { fprintf(stderr, "%s: unexpected size\n", firmware); return 1; }
+    int rc = ps4_camera_load_firmware(fw, n);
+    if (rc) return 1;
+    for (int i = 0; i < 50 && (st = ps4_camera_query()) != PS4_CAMERA_READY; i++) pal_sleep_ns(100000000ull);
+    printf("PS4 Camera: %s\n", ps4_camera_state_name(st));
+    return st == PS4_CAMERA_READY ? 0 : 1;
+}
+#endif
+
 static int cmd_disasm(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -1467,6 +1505,12 @@ int main(int argc, char **argv) {
         rc = o.input && o.input2 ? cmd_audio(o.input, o.input2) : 2;
     } else if (strcmp(o.command, "video") == 0) {
         rc = o.input && o.input2 ? cmd_video(o.input, o.input2) : 2;
+#ifdef _WIN32
+    } else if (strcmp(o.command, "camera") == 0) {
+        rc = cmd_camera(o.input);
+    } else if (strcmp(o.command, "--list-cameras") == 0) {
+        rc = cmd_list_cameras();
+#endif
     } else if (strcmp(o.command, "disasm") == 0) {
         rc = o.input ? cmd_disasm(o.input) : 2;
     } else if (strcmp(o.command, "pkg") == 0) {

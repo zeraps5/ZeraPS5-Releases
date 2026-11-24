@@ -9,6 +9,7 @@ param(
     [int]$WaitPid = 0,
     [switch]$Restart,
     [switch]$Recover,
+    [ValidateRange(0,120)][int]$FileLockTimeoutSeconds = 30,
     [int]$TestFailAfter = 0,
     [int]$TestInterruptAfter = 0
 )
@@ -43,6 +44,47 @@ if (-not (Test-Path -LiteralPath (Join-Path $root 'ZeraPS5.exe') -PathType Leaf)
 $work = Join-Path $root 'user\updates\transaction'
 $journal = Join-Path $work 'journal.json'
 $log = Join-Path $root 'user\updates\result.txt'
+$script:FileFailure = $null
+$lockLog = Join-Path $root 'user\updates\file-locks.jsonl'
+$installerLock = $null
+
+# Windows scanners can retain a file briefly after the launcher has exited.
+# Retry only sharing/byte-range locks, never permissions or corrupt payloads.
+# Diagnostics contain package-relative names, never host/account paths.
+function Invoke-FileOperation([string]$Operation, [string]$RelativePath, [scriptblock]$Action) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $attempts = 0
+    while ($true) {
+        $attempts++
+        try {
+            $value = & $Action
+        } catch {
+            $failure = $_
+            $exception = $_.Exception
+            while ($exception.InnerException) { $exception = $exception.InnerException }
+            $code = $exception.HResult -band 0xffff
+            $details = [ordered]@{operation=$Operation;file=$RelativePath;win32=$code;attempts=$attempts;waited_ms=$timer.ElapsedMilliseconds;resolved=$false}
+            if ($code -notin @(32,33) -or $timer.Elapsed.TotalSeconds -ge $FileLockTimeoutSeconds) {
+                $script:FileFailure = $details
+                if ($code -in @(32,33)) { Write-LockEvent $details }
+                throw $failure
+            }
+            Start-Sleep -Milliseconds 200
+            continue
+        }
+        if ($attempts -gt 1) {
+            $details.resolved = $true
+            $details.attempts = $attempts
+            $details.waited_ms = $timer.ElapsedMilliseconds
+            Write-LockEvent $details
+        }
+        return $value
+    }
+}
+function Write-LockEvent($Details) {
+    # A diagnostic failure must not turn a successful install into a rollback.
+    try { $Details | ConvertTo-Json -Compress | Add-Content -LiteralPath $lockLog -Encoding UTF8 } catch {}
+}
 
 function Assert-LocalPath([string]$Path) {
     $full = [IO.Path]::GetFullPath($Path)
@@ -59,10 +101,17 @@ Assert-LocalPath $work
 New-Item -ItemType Directory -Force (Split-Path $work) | Out-Null
 
 function File-Hash([string]$Path) {
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    $stream = [IO.File]::OpenRead($Path)
-    try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-','') }
-    finally { $stream.Dispose(); $algorithm.Dispose() }
+    Invoke-FileOperation 'hash' ([IO.Path]::GetFileName($Path)) {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $stream = $null
+        try {
+            $stream = [IO.File]::OpenRead($Path)
+            return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-','')
+        } finally {
+            if ($stream) { $stream.Dispose() }
+            $algorithm.Dispose()
+        }
+    }
 }
 
 function Allowed([string]$Path) {
@@ -76,9 +125,13 @@ function Save-Journal($State) {
     $tmp = $journal+'.tmp'
     $json = $State | ConvertTo-Json -Depth 6
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-    $fs = [IO.File]::Open($tmp,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None)
-    try { $fs.Write($bytes,0,$bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
-    Move-Item -LiteralPath $tmp -Destination $journal -Force
+    Invoke-FileOperation 'journal-temp' 'user/updates/transaction/journal.json.tmp' {
+        $fs = [IO.File]::Open($tmp,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try { $fs.Write($bytes,0,$bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+    }
+    Invoke-FileOperation 'journal' 'user/updates/transaction/journal.json' {
+        Move-Item -LiteralPath $tmp -Destination $journal -Force
+    }
 }
 function Rollback($State) {
     if ($State.phase -ne 'applying') { return }
@@ -90,9 +143,15 @@ function Rollback($State) {
             $bak = Join-Path (Join-Path $work 'backup') $f.path
             Assert-LocalPath $bak
             if ((File-Hash $bak) -ne $f.old_sha256) { throw (Update-Text 'Recovery backup is damaged') }
+            # Do not overwrite untouched files (including an unchanged file
+            # that a scanner or another launcher still has open).
+            if ((Test-Path -LiteralPath $dst -PathType Leaf) -and (File-Hash $dst) -eq $f.old_sha256) { continue }
             New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-            Copy-Item -LiteralPath $bak -Destination $dst -Force
-        } elseif (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }
+            Invoke-FileOperation 'restore' $f.path { Copy-Item -LiteralPath $bak -Destination $dst -Force }
+            if ((File-Hash $dst) -ne $f.old_sha256) { throw (Update-Text 'Recovery backup is damaged') }
+        } elseif (Test-Path -LiteralPath $dst) {
+            Invoke-FileOperation 'remove' $f.path { Remove-Item -LiteralPath $dst -Force }
+        }
     }
     $State.phase = 'rolledback'; Save-Journal $State
 }
@@ -111,6 +170,14 @@ function Wait-ForLauncher {
 }
 
 try {
+    # Waiting on a scanner must not let a second updater replace the first
+    # transaction's stage, journal or backups. This handle is outside $work
+    # and Windows releases it even if this helper is interrupted.
+    $lockPath = Join-Path $root 'user/updates/installer.lock'
+    Assert-LocalPath $lockPath
+    $installerLock = Invoke-FileOperation 'installer-lock' 'user/updates/installer.lock' {
+        [IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    }
     Wait-ForLauncher
     if (Test-Path -LiteralPath $journal) {
         $old = Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -172,12 +239,27 @@ try {
         if ($existed) {
             $bak = Join-Path $backup $f.path
             New-Item -ItemType Directory -Force (Split-Path $bak) | Out-Null
-            Copy-Item -LiteralPath $dst -Destination $bak
+            Invoke-FileOperation 'backup' $f.path { Copy-Item -LiteralPath $dst -Destination $bak }
             $sha = File-Hash $bak
         }
         $plan += [ordered]@{path=$f.path;existed=$existed;old_sha256=$sha;new_sha256=$f.sha256}
     }
     foreach ($required in @('ps5c.exe','ZeraPS5.exe','tools/apply-update.ps1')) { if (-not $paths.Contains($required)) { throw (Update-Text 'Incomplete update payload') } }
+    # Check writable destinations before the first replacement. Opening with
+    # FileMode.Open does not truncate them; an executable image still in use
+    # or a reader denying writes is retried without touching program bytes.
+    foreach ($f in $plan) {
+        if ($f.existed) {
+            $dst = Join-Path $root $f.path
+            # Copy-Item -Force already handles the readonly attribute; a write
+            # probe would reject it as access denied before that can happen.
+            if ((Get-Item -LiteralPath $dst -Force).IsReadOnly) { continue }
+            Invoke-FileOperation 'preflight' $f.path {
+                $probe = [IO.File]::Open($dst,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+                $probe.Dispose()
+            }
+        }
+    }
     $state = [ordered]@{schema=1;phase='applying';build=$manifest.build;files=@($plan)}
     Save-Journal $state
     $count = 0
@@ -186,7 +268,7 @@ try {
             $src = Join-Path $payload $f.path; $dst = Join-Path $root $f.path
             Assert-LocalPath $dst
             New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-            Copy-Item -LiteralPath $src -Destination $dst -Force
+            Invoke-FileOperation 'install' $f.path { Copy-Item -LiteralPath $src -Destination $dst -Force }
             if ((File-Hash $dst) -ne $f.new_sha256) { throw (Update-Text 'Installed file checksum mismatch') }
             $count++
             if ($env:PS5C_UPDATE_TEST_HOOKS -eq '1') {
@@ -200,6 +282,7 @@ try {
     if ($Restart) { Start-Process -FilePath (Join-Path $root 'ZeraPS5.exe') -WorkingDirectory $root -WindowStyle Normal }
     exit 0
 } catch {
+    $failure = $_
     # Paths and account names are deliberately absent from the shareable result.
     $result=Update-Text 'Update failed. Program files were restored when possible. Run user\updates\Recuperar-ZeraPS5.ps1 with -InstallRoot and -Recover if interrupted.'
     $reason=$_.Exception.Message
@@ -210,6 +293,11 @@ try {
     if ($known) { $result+="`n"+$reason }
     else { $result+="`nHRESULT: 0x"+$_.Exception.HResult.ToString('X8') }
     $result | Set-Content -LiteralPath $log -Encoding UTF8
-    Write-Error $_
+    if ($script:FileFailure) {
+        try { $script:FileFailure | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'user/updates/file-error.json') -Encoding UTF8 } catch {}
+    }
+    Write-Error $failure
     exit 1
+} finally {
+    if ($installerLock) { $installerLock.Dispose() }
 }

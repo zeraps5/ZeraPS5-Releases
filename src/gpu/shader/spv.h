@@ -108,7 +108,7 @@ enum {
     SpvOpTypeVector = 23, SpvOpTypeImage = 25, SpvOpTypeSampler = 26, SpvOpTypeSampledImage = 27,
     SpvOpTypeArray = 28, SpvOpTypeRuntimeArray = 29, SpvOpTypeStruct = 30, SpvOpTypePointer = 32,
     SpvOpTypeFunction = 33, SpvOpConstantTrue = 41, SpvOpConstantFalse = 42, SpvOpConstant = 43,
-    SpvOpConstantComposite = 44, SpvOpFunction = 54, SpvOpFunctionEnd = 56, SpvOpVariable = 59, SpvOpImageTexelPointer = 60, SpvOpLoad = 61,
+    SpvOpConstantComposite = 44, SpvOpConstantNull = 46, SpvOpFunction = 54, SpvOpFunctionEnd = 56, SpvOpVariable = 59, SpvOpImageTexelPointer = 60, SpvOpLoad = 61,
     SpvOpStore = 62, SpvOpAccessChain = 65, SpvOpArrayLength = 68, SpvOpDecorate = 71, SpvOpMemberDecorate = 72,
     SpvOpVectorExtractDynamic = 77, SpvOpVectorShuffle = 79, SpvOpCompositeConstruct = 80, SpvOpCompositeExtract = 81,
     SpvOpSampledImage = 86, SpvOpImageSampleImplicitLod = 87, SpvOpImageSampleExplicitLod = 88,

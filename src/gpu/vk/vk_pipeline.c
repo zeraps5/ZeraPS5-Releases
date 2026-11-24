@@ -33,6 +33,7 @@
 #include "gpu/shader/shader_ops.h"
 #include "gpu/shader/shader_dynamic.h"
 #include "gpu/vk/vk_vertex_ranges.h"
+#include "gpu/vk/vk_index_bounds.h"
 #include "gpu/vk/vk_texture_layout.h"
 #include "gpu/vk/vk_texture_tiling.h"
 #include "gpu/vk/vk_texture_3d.h"
@@ -45,6 +46,7 @@
 #include "gpu/vk/vk_spirv_bindings.h"
 #include "gpu/vk/vk_image_formats.h"
 #include "gpu/vk/vk_phys_import.h"
+#include "gpu/vk/vk_copy_pool.h"
 #include "gpu/vk/vk_packed_formats.h"
 #include "gpu/vk/vk_depth_policy.h"
 #include "gpu/vk/vk_color_target.h"
@@ -81,7 +83,10 @@ static uint64_t g_stat_held, g_stat_held_forced; /* releases held; batches a hel
 static uint64_t g_stat_held_ordered; /* of those, before a command processor write (renderer_cp_write) */
 static uint64_t g_stat_partial; /* reads that overlapped pending results in part (batch completed first) */
 static uint64_t g_stat_patched; /* such reads copied from guest memory with the pending results put in on the GPU */
+static uint64_t g_stat_flip_deferred, g_stat_suspend_deferred, g_stat_idle_deferred, g_stat_flip_applied; /* completed by the flip thread; batches it completed */
 static uint64_t g_stat_texskip; /* texture comparisons gpu_watch made unnecessary */
+static uint64_t g_stat_pin_held_ns, g_stat_pin_held_max, g_stat_pin_sync_ns, g_pin_since;
+static intptr_t g_pin_caller, g_stat_pin_max_caller; /* scope opener, from vk_guest_access_begin (addr2line) */ /* pin held by the scopes, longest, GPU syncs inside */
 static uint64_t g_stat_pins, g_stat_pin_ns, g_stat_map_epochs; /* CPU access scopes: count, time to pin, mapping changes seen */
 /* resident buffers (resident_buf): statistics per second, and what is resident now */
 static uint64_t g_res_binds, g_res_upload, g_res_created, g_res_applied, g_res_merged, g_res_fallbacks;
@@ -100,7 +105,16 @@ static uint32_t tex_sw(const uint32_t *t) {
     case 10: return GCN_SW_2D_DISPLAY; /* display 2D thin */
     case 13: return GCN_SW_1D_THIN;    /* thin 1D thin */
     case 14: return GCN_SW_2D_THIN;    /* thin 2D thin */
-    default: return GCN_SW_UNSUPPORTED; /* depth, PRT, thick and linear general modes: not yet */
+    default: {
+        static uint32_t told; /* each unknown index once */
+        uint32_t i = t[7] & 0x1F;
+        if (!(told & (1u << i))) {
+            told |= 1u << i;
+            LOG_W(GPU, "PS4 texture tiling index %u not supported yet (T# %08x %08x %08x %08x %08x %08x %08x %08x)", i,
+                  t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+        }
+        return GCN_SW_UNSUPPORTED; /* depth, PRT, thick and linear general modes: not yet */
+    }
     }
 }
 static uint64_t g_stat_stencil_draws, g_stat_stencil_info; /* draws with STENCIL_ENABLE; last DB_STENCIL_INFO */
@@ -110,6 +124,15 @@ static int g_copy_tag;
 static uint64_t g_stat_vc_hits, g_stat_vc_copies, g_stat_vc_skips, g_stat_vc_resets, g_stat_vc_arm_ns, g_stat_vc_copy_ns, g_stat_vc_elig_ns, g_stat_vc_bytes;
 static uint64_t g_stat_ro_hits, g_stat_ro_misses, g_stat_ro_compared, g_stat_ro_compare_ns, g_stat_ro_fallback;
 /* evaluations: cache hits, skipped lookups (vector sources), misses and the programs that cost the most */
+/* why evaluations missed: the key lookup (none with the key, results pending, source changed, other) and
+ * the relocation (program without relocatable SGPRs, no entry, entry of another key/program, pending, source changed) */
+enum { LK_NONE, LK_PENDING, LK_CHANGED, LK_OTHER, LK_N };
+enum { RL_NOSGPRS, RL_NONE, RL_OTHER, RL_PENDING, RL_CHANGED, RL_N };
+static uint32_t g_eval_lk_why, g_eval_rl_why;
+static uint64_t g_stat_eval_lk[LK_N], g_stat_eval_rl[RL_N];
+/* PS5C_SGPR_DIFF=<program hash>: how often each evaluated SGPR changes between its draws */
+static uint64_t g_sgpr_watch, g_sgpr_calls, g_sgpr_diff[48];
+static uint32_t g_sgpr_prev[48];
 static uint64_t g_stat_eval_relocated, g_stat_eval_hits, g_stat_eval_vsrc, g_stat_eval_misses, g_stat_eval_deferred, g_stat_eval_redo;
 #define EVAL_STAT_PROGRAMS 64
 typedef struct prog_stat { uint64_t hash, base, ns, n; uint32_t insts; } prog_stat;
@@ -165,7 +188,7 @@ static uint64_t g_stat_fb_created;
 static uint64_t g_stat_sync_submit_ns, g_stat_sync_fence_ns;
 /* draw phases (source line of the end of each), with the time they took */
 #define PHASE_SITES 32
-static struct { uint32_t line; uint64_t n, ns; } g_stat_phase[PHASE_SITES];
+static struct { uint32_t line; uint64_t n, ns, slow_n, slow_ns; } g_stat_phase[PHASE_SITES]; /* slow: over 1 ms */
 
 /* PS5C_BUFFER_TRAFFIC: attribute actual guest-copy bytes to shader sites.
  * The descriptor span alone overcounts copies shared by earlier bindings. */
@@ -253,6 +276,7 @@ static uint64_t stat_phase_at(uint32_t line, uint64_t t0) {
         g_stat_phase[i].line = line;
         g_stat_phase[i].n++;
         g_stat_phase[i].ns += now - t0;
+        if (now - t0 > 1000000) g_stat_phase[i].slow_n++, g_stat_phase[i].slow_ns += now - t0;
         break;
     }
     return now;
@@ -309,6 +333,8 @@ static void census_report(void) {
     g_census_draws = g_census_pos = 0;
 }
 
+static void direct_store_stats(void);
+static void prefetch_report(renderer *r);
 static void stat_report(renderer *r) {
     if (!g_stats_on) return;
     uint64_t now = pal_time_ns();
@@ -324,9 +350,15 @@ static void stat_report(renderer *r) {
           (unsigned long long)g_stat_held_ordered, (unsigned long long)g_stat_partial, (unsigned long long)g_stat_patched);
     g_stat_held = g_stat_held_forced = g_stat_held_ordered = g_stat_partial = g_stat_patched = 0;
     census_report();
-    LOG_I(GPU, "access scopes: %llu, pinning %.1f ms, %llu after a mapping change", (unsigned long long)g_stat_pins,
-          (double)g_stat_pin_ns / 1e6, (unsigned long long)g_stat_map_epochs);
-    g_stat_pins = g_stat_pin_ns = g_stat_map_epochs = 0;
+    LOG_I(GPU, "access scopes: %llu, pinning %.1f ms, %llu after a mapping change; pin held %.1f ms (longest %.2f), GPU syncs while held %.1f ms; longest opened at vk_guest_access_begin%+lld",
+          (unsigned long long)g_stat_pins, (double)g_stat_pin_ns / 1e6, (unsigned long long)g_stat_map_epochs,
+          g_stat_pin_held_ns / 1e6, g_stat_pin_held_max / 1e6, g_stat_pin_sync_ns / 1e6, (long long)g_stat_pin_max_caller);
+    g_stat_pins = g_stat_pin_ns = g_stat_map_epochs = g_stat_pin_held_ns = g_stat_pin_held_max = g_stat_pin_sync_ns = 0;
+    if (g_stat_flip_deferred || g_stat_suspend_deferred || g_stat_idle_deferred)
+        LOG_I(GPU, "completed after the GPU by their own thread: %llu flips, %llu suspend points, %llu idle queues; results of %llu batches landed by it",
+              (unsigned long long)g_stat_flip_deferred, (unsigned long long)g_stat_suspend_deferred,
+              (unsigned long long)g_stat_idle_deferred, (unsigned long long)g_stat_flip_applied);
+    g_stat_flip_deferred = g_stat_suspend_deferred = g_stat_idle_deferred = g_stat_flip_applied = 0;
     if (g_vk_feedback_copies)
         LOG_I(GPU, "feedback copies: %llu, %.1f MB", (unsigned long long)g_vk_feedback_copies, (double)g_vk_feedback_bytes / 1048576.0);
     g_vk_feedback_copies = g_vk_feedback_bytes = 0;
@@ -377,6 +409,12 @@ static void stat_report(renderer *r) {
             n += snprintf(line + n, sizeof(line) - (size_t)n, " L%u %llu/%.1fms", g_stat_phase[i].line,
                           (unsigned long long)g_stat_phase[i].n, (double)g_stat_phase[i].ns / 1e6);
         LOG_I(GPU, "draw phases by line:%s", line);
+        n = 0;
+        for (int i = 0; i < PHASE_SITES && g_stat_phase[i].n && n < 400; i++)
+            if (g_stat_phase[i].slow_n)
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " L%u %llu/%.1fms", g_stat_phase[i].line,
+                              (unsigned long long)g_stat_phase[i].slow_n, (double)g_stat_phase[i].slow_ns / 1e6);
+        if (n) LOG_I(GPU, "draw phases over 1 ms by line:%s", line);
         memset(g_stat_phase, 0, sizeof(g_stat_phase));
     }
     traffic_report();
@@ -407,6 +445,8 @@ static void stat_report(renderer *r) {
           g_stat_copy_by[3] / 1048576.0, g_stat_copy_by[4] / 1048576.0);
     if (g_stat_patch_shared) LOG_I(GPU, "patched reads shared: %llu", (unsigned long long)g_stat_patch_shared);
     phys_import_stats();
+    direct_store_stats();
+    copy_pool_stats();
     g_stat_patch_shared = 0;
     memset(g_stat_copy_by, 0, sizeof(g_stat_copy_by));
     if (g_stat_vc_hits || g_stat_vc_copies || g_stat_vc_skips)
@@ -434,6 +474,24 @@ static void stat_report(renderer *r) {
               (unsigned long long)g_stat_eval_misses, (unsigned long long)g_stat_eval_vsrc, (unsigned long long)g_stat_eval_deferred,
               (unsigned long long)g_stat_eval_redo, n ? line : " -");
         g_stat_eval_relocated = g_stat_eval_hits = g_stat_eval_misses = g_stat_eval_vsrc = g_stat_eval_deferred = g_stat_eval_redo = 0;
+        prefetch_report(r);
+        LOG_I(GPU, "evaluation misses: key not cached %llu, results pending %llu, source changed %llu, other %llu; relocation: "
+              "program without it %llu, none kept %llu, another key %llu, pending %llu, source changed %llu",
+              (unsigned long long)g_stat_eval_lk[LK_NONE], (unsigned long long)g_stat_eval_lk[LK_PENDING],
+              (unsigned long long)g_stat_eval_lk[LK_CHANGED], (unsigned long long)g_stat_eval_lk[LK_OTHER],
+              (unsigned long long)g_stat_eval_rl[RL_NOSGPRS], (unsigned long long)g_stat_eval_rl[RL_NONE],
+              (unsigned long long)g_stat_eval_rl[RL_OTHER], (unsigned long long)g_stat_eval_rl[RL_PENDING],
+              (unsigned long long)g_stat_eval_rl[RL_CHANGED]);
+        memset(g_stat_eval_lk, 0, sizeof(g_stat_eval_lk));
+        memset(g_stat_eval_rl, 0, sizeof(g_stat_eval_rl));
+        if (g_sgpr_calls) {
+            char sl[600]; int sn = 0;
+            for (int i = 0; i < 48 && sn < 560; i++)
+                if (g_sgpr_diff[i]) sn += snprintf(sl + sn, sizeof(sl) - (size_t)sn, " s%d %llu", i, (unsigned long long)g_sgpr_diff[i]);
+            LOG_I(GPU, "SGPR changes of %016llx: %llu draws;%s", (unsigned long long)g_sgpr_watch, (unsigned long long)g_sgpr_calls, sn ? sl : " none");
+            g_sgpr_calls = 0;
+            memset(g_sgpr_diff, 0, sizeof(g_sgpr_diff));
+        }
     }
     if (g_stat_cs_prog[0].n) {
         n = prog_stat_top(g_stat_cs_prog, line, sizeof(line));
@@ -464,7 +522,8 @@ static void stat_report(renderer *r) {
     g_stat_last = now;
 }
 
-#define MAX_SHADERS 768 /* analyzed programs are large: least recently used ones are dropped */
+#define MAX_SHADERS 4096 /* analyzed programs are large: least recently used ones are dropped */
+#define MAX_SHADERS_DENSE 768 /* the limit with whole (4.4 MB) programs: sparse ones take every slot */
 #define MAX_PIPES 8192
 #define MAX_RPS 64
 #define MAX_FBS 256
@@ -544,6 +603,7 @@ typedef struct writeback {
     uint64_t scope_lo,scope_hi;
     uint8_t scope_mode;
     uint8_t slot; /* the work slot whose batch produces the results (its arena holds them) */
+    bool direct; /* the shader writes guest memory itself (direct import): nothing to copy back */
 } writeback;
 
 static bool wb_scope_valid(const writeback *w) {
@@ -609,6 +669,7 @@ typedef struct copy_entry {
     uint64_t size;
     VkDeviceSize offset;
     uint32_t patched; /* a patched read: 1 + the batch's writebacks it has the results of; 0: plain guest memory */
+    bool deferred; /* a helper may still be copying these bytes */
 } copy_entry;
 
 /* Read-only snapshots survive arena resets. A snapshot used by commands in
@@ -644,7 +705,8 @@ typedef struct vc_entry {
     uint32_t slab, churn;
     uint32_t index_max; /* of an index buffer, once computed for this copy */
     uint32_t versions;  /* sum of its pages' versions when copied */
-    bool armed, has_max;
+    bool armed;
+    uint8_t index_size; /* index width for index_max, 0 until scanned */
 } vc_entry;
 typedef struct readonly_entry {
     guest_addr addr;
@@ -715,12 +777,13 @@ typedef struct dcc_check {
     uint64_t size, writer;
 } dcc_check;
 
-#define MAX_HELD_RELEASES 256
+/* Tearaway Unfolded releases ~220 times a frame: at 256 the list filled before the
+ * frame's batch was submitted, and completing it there cost ~150 ms/s of GPU waits */
+#define MAX_HELD_RELEASES 1024
 #define EVAL_CACHE 2048
 #define EVAL_WAYS 8
 #define EVAL_RELOC 1024     /* entries found by their key without the relocatable SGPRs */
 #define EVAL_RELOC_SGPRS 8  /* at most that many of them a program */
-#define INDEX_MAX_CACHE 64
 
 struct stage_state;
 static void free_draw_stages(struct stage_state *st);
@@ -735,6 +798,7 @@ typedef struct eval_ranges {
     guest_addr start[EVAL_RANGES], end[EVAL_RANGES];
     guest_addr min_start, max_end;
     uint8_t sbase[EVAL_RANGES]; /* the S_BUFFER_LOAD base SGPR that read it (sh_eval.host_sbase) */
+    uint8_t soff[EVAL_RANGES];  /* and its offset SGPR (sh_eval.host_soff) */
     uint32_t count;
     bool overflow; /* read more ranges than kept: any write drops the evaluation */
 } eval_ranges;
@@ -886,6 +950,11 @@ typedef struct vk_pipelines {
     struct bind_list *cs_bl[2];
     uint32_t cs_bl_depth;
     struct prof *prof; /* PS5C_GPU_PROFILE */
+    VkQueryPool batch_clock;
+    bool batch_clock_pending[2];
+    uint64_t batch_clock_mask, batch_clock_last;
+    uint32_t batch_clock_count;
+    double batch_clock_ms, batch_clock_max;
     htile_entry htiles[MAX_HTILES];
     uint64_t htile_sequence;
     htile_verdict htile_verdicts[MAX_HTILE_VERDICTS];
@@ -921,6 +990,11 @@ typedef struct vk_pipelines {
     /* end-of-pipe releases held until the batch's writebacks land (renderer_release) */
     held_release held[MAX_HELD_RELEASES];
     uint32_t held_count;
+    /* the addresses the held labels write (data_sel != 0), sorted: held_overlaps searches
+     * them (scalar evaluation asks for every guest read, ~1 million a second in Tearaway with
+     * ~150 labels held: the list scan was a quarter of the command processor's time) */
+    guest_addr held_sorted[MAX_HELD_RELEASES];
+    uint32_t held_sorted_count;
     eval_entry *evals; /* EVAL_CACHE entries, allocated on first use */
     /* evals_written's filter: the 64 KiB pages the cached evaluations read
      * (hashed into EVAL_PAGE_BITS bits; rebuilt from the live entries each
@@ -939,13 +1013,9 @@ typedef struct vk_pipelines {
     struct stage_state *dispatch_stage; /* the same for compute */
     uint64_t draw_scratch_flip;
     bool draw_scratch_seen, draw_scratch_enabled;
-    /* largest index of an index buffer (address, count, index size) in this epoch: draws share them */
-    struct {
-        guest_addr addr;
-        uint64_t epoch;
-        uint32_t count, size, max;
-    } index_max[INDEX_MAX_CACHE];
-    uint32_t index_max_next;
+    vk_index_bounds index_bounds;
+    struct bind_list *draw_bindings; /* renderer lock serializes access; Vulkan consumes the inputs in the call */
+    bool draw_bindings_reuse, draw_bindings_busy;
     struct {
         const sh_program *source;
         sh_program *program;
@@ -959,7 +1029,20 @@ typedef struct vk_pipelines {
     bool ngg_ballot_seen, ngg_ballot_enabled;
     uint64_t ngg_compact_flip;
     bool ngg_compact_seen, ngg_compact_enabled;
+    /* null_image_shapes: the first real shape of each image site (program hash, site) */
+    hmap64 null_fill_map;
+    sh_site_shape *null_fill;
+    uint32_t null_fill_count, null_fill_cap;
+    struct eval_prefetch *pre; /* PS5C_EVAL_PREFETCH: evaluations of submitted draws ahead of the command processor */
+    guest_addr pre_noted_addr; /* the last program noted for it (command processor only) */
+    const sh_program *pre_noted_prog;
 } vk_pipelines;
+
+static void prefetch_init(renderer *r);
+static void prefetch_shutdown(renderer *r);
+static void prefetch_forget(vk_pipelines *P, const sh_program *prog);
+
+static bool g_ps4_sparse; /* a PS4 game: sparse programs, set before the first one (ps4_programs) */
 
 static bool sparse_programs(void) {
     static int enabled = -1;
@@ -968,8 +1051,22 @@ static bool sparse_programs(void) {
         enabled = s && !strcmp(s, "1");
         if (enabled) LOG_I(GPU, "sparse analyzed programs: enabled (experimental)");
     }
-    return enabled != 0;
+    return enabled != 0 || g_ps4_sparse;
 }
+
+/* LEGO City Undercover draws ~2500 times a frame with ~990 programs: 768 slots of whole programs
+ * analyzed some again at almost every draw (100 us a draw). A PS4 game keeps them sparse (the
+ * unused tails of their arrays released) and takes every slot. Decided before the first program
+ * exists: the storage mode must not change under one. PS5C_SPARSE_PROGRAMS=0: as before. */
+static void ps4_programs(const vk_pipelines *P, const gpu *g) {
+    if (!g->gcn || g_ps4_sparse || sparse_programs() || P->shader_count || P->fused_count) return;
+    const char *s = getenv("PS5C_SPARSE_PROGRAMS");
+    if (s && !strcmp(s, "0")) return;
+    g_ps4_sparse = true;
+    LOG_I(GPU, "PS4 game: sparse analyzed programs, %u slots", MAX_SHADERS);
+}
+
+static uint32_t shader_limit(void) { return sparse_programs() ? MAX_SHADERS : MAX_SHADERS_DENSE; }
 
 static bool analyze_cached_program(const uint32_t *code, uint32_t dwords, guest_addr addr, sh_program *p) {
     if (!program_storage_prepare(p, sparse_programs()) || !sh_analyze(code, dwords, addr, p)) return false;
@@ -1178,6 +1275,57 @@ static void prof_shutdown(renderer *r) {
     if (f->stats) vkDestroyQueryPool(r->device, f->stats, NULL);
     if (f->mesh_stats) vkDestroyQueryPool(r->device, f->mesh_stats, NULL);
     free(f);
+}
+
+/* Two timestamp queries per work slot. Read them after the owning fence and
+ * reset only that slot, so profiling leaves CPU/GPU overlap available. */
+static void batch_clock_init(renderer *r) {
+    const char *enabled = getenv("PS5C_GPU_BATCH_TIMING");
+    if (!enabled || strcmp(enabled, "1")) return;
+    uint32_t bits = r->queue_timestamp_bits;
+    if (!bits || bits > 64) {
+        LOG_W(GPU, "GPU batch timing unavailable: no queue timestamps");
+        return;
+    }
+    VkQueryPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4};
+    VkResult result = vkCreateQueryPool(r->device, &ci, NULL, &r->pipes->batch_clock);
+    if (result != VK_SUCCESS) {
+        r->pipes->batch_clock = VK_NULL_HANDLE;
+        LOG_W(GPU, "GPU batch timing unavailable: query pool creation failed (%d)", result);
+        return;
+    }
+    r->pipes->batch_clock_mask = bits == 64 ? UINT64_MAX : (1ull << bits) - 1;
+    LOG_I(GPU, "GPU batch timing enabled (%u timestamp bits, per work slot)", bits);
+}
+
+static void batch_clock_begin(renderer *r) {
+    vk_pipelines *P = r->pipes;
+    if (!P->batch_clock) return;
+    uint32_t slot = r->work_index, first = 2 * slot;
+    if (P->batch_clock_pending[slot]) {
+        uint64_t timestamps[2];
+        if (vkGetQueryPoolResults(r->device, P->batch_clock, first, 2, sizeof(timestamps),
+                                  timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            uint64_t ticks = (timestamps[1] - timestamps[0]) & P->batch_clock_mask;
+            double ms = (double)ticks * r->props.limits.timestampPeriod / 1e6;
+            P->batch_clock_count++;
+            P->batch_clock_ms += ms;
+            if (ms > P->batch_clock_max) P->batch_clock_max = ms;
+        }
+        P->batch_clock_pending[slot] = false;
+    }
+    uint64_t now = pal_time_ns();
+    if (!P->batch_clock_last) P->batch_clock_last = now;
+    if (now - P->batch_clock_last >= 1000000000ull && P->batch_clock_count) {
+        LOG_I(GPU, "GPU work timing: %u batches, %.2f ms sum of GPU spans, max %.2f ms, %.2f ms wall (excludes presentation)",
+              P->batch_clock_count, P->batch_clock_ms, P->batch_clock_max, (double)(now - P->batch_clock_last) / 1e6);
+        P->batch_clock_last = now;
+        P->batch_clock_count = 0;
+        P->batch_clock_ms = P->batch_clock_max = 0;
+    }
+    vkCmdResetQueryPool(r->cmd, P->batch_clock, first, 2);
+    vkCmdWriteTimestamp(r->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, P->batch_clock, first);
 }
 
 /* Bound expensive GPU timing to selected flips. The optional file contains
@@ -1530,6 +1678,8 @@ bool vk_pipeline_init(renderer *r) {
     /* Compact uniform layouts and the 256 MiB batch are on by default since 2026-11-11: Minecraft's world
      * 5.5 -> 8-9 FPS (uniform uploads 547 -> 28 MB/s, no arena-full syncs), LN2/Wobbly faster, same pictures
      * in 13 games. PS5C_UNIFORM_COMPACT=0 / PS5C_LARGE_DRAW_BATCH=0 turn them off. */
+    const char *draw_bindings_reuse = getenv("PS5C_DRAW_BINDINGS_REUSE");
+    P->draw_bindings_reuse = !draw_bindings_reuse || strcmp(draw_bindings_reuse, "0");
     const char *uniform_mode=getenv("PS5C_UNIFORM_COMPACT");
     P->uniform_compact=!uniform_mode || !strcmp(uniform_mode,"1");
     g_stencil = r->stencil;
@@ -1561,6 +1711,8 @@ bool vk_pipeline_init(renderer *r) {
             LOG_I(GPU,"occlusion: precise GPU samples, synchronous cumulative dumps (experimental)");
     }
     prof_init(r);
+    prefetch_init(r);
+    batch_clock_init(r);
     return true;
 }
 
@@ -1568,6 +1720,8 @@ static void resident_shutdown(renderer *r);
 void vk_pipeline_shutdown(renderer *r) {
     vk_pipelines *P = r->pipes;
     if (!P) return;
+    prefetch_shutdown(r);
+    copy_pool_shutdown();
     large_import_cache_drop(r);
     phys_import_drop(r);
     for (uint32_t i = 0; i < P->pipe_count; i++) {
@@ -1582,6 +1736,7 @@ void vk_pipeline_shutdown(renderer *r) {
     for (uint32_t i = 0; i < P->rp_count && !r->dyn_render; i++) vkDestroyRenderPass(r->device, P->rps[i].rp, NULL);
     for (uint32_t i = 0; i < P->sampler_count; i++) vkDestroySampler(r->device, P->samplers[i].sampler, NULL);
     prof_shutdown(r);
+    if (P->batch_clock) vkDestroyQueryPool(r->device, P->batch_clock, NULL);
     if(P->occlusion_pool)vkDestroyQueryPool(r->device,P->occlusion_pool,NULL);
     vk_buffer_destroy(r,&P->bvh_paged_table);
     for (uint32_t i = 0; i < MAX_READONLY_CACHE; i++) vk_buffer_destroy(r, &P->readonly[i].buffer);
@@ -1597,6 +1752,7 @@ void vk_pipeline_shutdown(renderer *r) {
     }
     free(P->evals);
     free_draw_stages(P->draw_stages);
+    free(P->draw_bindings);
     free_dispatch_stage(P->dispatch_stage);
     free(P->depth_clear_ps);
     for(uint32_t i=0;i<P->wb_count;i++)if(!P->wb[i].orig_pooled)free(P->wb[i].orig);
@@ -1605,6 +1761,8 @@ void vk_pipeline_shutdown(renderer *r) {
     for (uint32_t i = 0; i < VK_MAX_IMAGES; i++) free(P->tex_scan[i]);
     for (uint32_t i = 0; i < PS5C_ARRAY_COUNT(P->cs_bl); i++) free(P->cs_bl[i]);
     resident_shutdown(r);
+    hmap64_free(&P->null_fill_map);
+    free(P->null_fill);
     free(P);
     r->pipes = NULL;
 }
@@ -1743,8 +1901,32 @@ static uint32_t work_slot(const vk_pipelines *P) { return (uint32_t)(P->work - P
 
 /* Results of one work slot (`slot`), or of every batch (-1). A slot's entries
  * come first in the lists: its batch was submitted before the other one. */
+
+/* The first of P->held_sorted at or above addr */
+static uint32_t held_sorted_at(const vk_pipelines *P, guest_addr addr) {
+    uint32_t lo = 0, hi = P->held_sorted_count;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (P->held_sorted[mid] < addr) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+static void held_sorted_add(vk_pipelines *P, const gpu_release *h) {
+    if (!h->data_sel) return;
+    uint32_t at = held_sorted_at(P, h->addr);
+    memmove(P->held_sorted + at + 1, P->held_sorted + at, (P->held_sorted_count - at) * sizeof(P->held_sorted[0]));
+    P->held_sorted[at] = h->addr;
+    P->held_sorted_count++;
+}
+static void held_sorted_rebuild(vk_pipelines *P) {
+    P->held_sorted_count = 0;
+    for (uint32_t i = 0; i < P->held_count; i++) held_sorted_add(P, &P->held[i].rel);
+}
+
 static void apply_writebacks_of(renderer *r, int slot) {
     vk_pipelines *P = r->pipes;
+    copy_pool_drain_now(); /* queued copies read guest memory as it was before these results */
     uint32_t wb_n = 0, held_n = 0;
     if (slot < 0) {
         wb_n = P->wb_count;
@@ -1784,6 +1966,7 @@ static void apply_writebacks_of(renderer *r, int slot) {
             resident_apply(r, w);
             continue;
         }
+        if (w->direct) continue; /* already in guest memory */
         uint8_t *dst = (uint8_t *)guest_host(r, w->addr, w->size);
         const uint8_t *src = (const uint8_t *)P->work_slots[w->slot].arena.mapped + w->offset;
         { /* PS5C_LOG_STORE_ADDR=break: writebacks over the address the guest breakpoint published */
@@ -1868,9 +2051,12 @@ static void apply_writebacks_of(renderer *r, int slot) {
     for (uint32_t i = 0; i < held_n; i++) gpu_perform_release(P->held[i].g, &P->held[i].rel);
     if (held_n < P->held_count) memmove(P->held, P->held + held_n, (P->held_count - held_n) * sizeof(P->held[0]));
     P->held_count -= held_n;
+    if (held_n) held_sorted_rebuild(P);
 }
 
 static void apply_writebacks(renderer *r) { apply_writebacks_of(r, -1); }
+
+static void apply_slot_results(renderer *r, uint32_t slot);
 
 /* Results and labels of the other slot's batch reach guest memory as soon as
  * it has completed (the game may be waiting for its labels), not when the slot
@@ -1881,9 +2067,15 @@ static void retired_poll(renderer *r) {
     uint32_t other = work_slot(P) ^ 1;
     if (!(P->wb_count && P->wb[0].slot == other) && !(P->held_count && P->held[0].slot == other)) return;
     if (!vk_work_slot_done(r, other)) return;
+    apply_slot_results(r, other);
+}
+
+/* Results and labels of one slot's completed batch (the oldest in the lists) reach guest memory */
+static void apply_slot_results(renderer *r, uint32_t slot) {
+    vk_pipelines *P = r->pipes;
     uint32_t n = 0;
-    while (n < P->wb_count && P->wb[n].slot == other) n++;
-    apply_writebacks_of(r, (int)other);
+    while (n < P->wb_count && P->wb[n].slot == slot) n++;
+    apply_writebacks_of(r, (int)slot);
     /* patched copies count the batch's writebacks from the start of the list */
     uint32_t copies = P->copy_count < MAX_COPY_CACHE ? P->copy_count : MAX_COPY_CACHE;
     for (uint32_t q = 0; n && q < copies; q++)
@@ -1892,11 +2084,9 @@ static void retired_poll(renderer *r) {
 
 /* A held release writes inside [addr, addr + size). */
 static bool held_overlaps(const vk_pipelines *P, guest_addr addr, uint64_t size) {
-    for (uint32_t i = 0; i < P->held_count; i++) {
-        const gpu_release *h = &P->held[i].rel;
-        if (h->data_sel && h->addr < addr + size && addr < h->addr + 8) return true;
-    }
-    return false;
+    /* a label at h writes [h, h + 8): the first one from addr - 7 on, if it starts before the end */
+    uint32_t i = held_sorted_at(P, addr > 7 ? addr - 7 : 0);
+    return i < P->held_sorted_count && P->held_sorted[i] < addr + size;
 }
 
 /* PS5C_NO_HELD_PATCH=1 turns off held_patch (reads over held labels complete the batch). */
@@ -2027,6 +2217,7 @@ bool renderer_release(renderer *r, gpu *g, const gpu_release *rel) {
         P->held[P->held_count].g = g;
         P->held[P->held_count].rel = *rel;
         P->held[P->held_count].slot = (uint8_t)work_slot(P);
+        held_sorted_add(P, rel);
         P->held_count++;
         g_stat_held++;
     } else if (off && P && P->wb_count) { /* the old way: wait for the GPU now */
@@ -2125,6 +2316,57 @@ void renderer_cp_write(renderer *r) {
         if (logging) LOG_I(GPU, "CP write waited for %u held releases, %u writebacks: %.1f ms", held, wbs, (pal_time_ns() - t0) / 1e6);
     }
     pal_mutex_unlock(r->lock);
+}
+
+/* The command processor submits the work and goes on (the next frame, the next command buffer); another thread
+ * completes the flip or lets the results land (renderer_complete_deferred). Needs a timeline semaphore (the
+ * point waited for). */
+bool renderer_submit_deferred(renderer *r, int kind, uint64_t *point) {
+    bool flip = kind == RENDERER_DEFER_FLIP;
+    *point = 0;
+    if (!r->pipes || !r->work_timeline) return false;
+    pal_mutex_lock(r->lock);
+    if (!flip) large_import_cache_drop(r); /* as renderer_suspend_point */
+    vk_pipelines *P = r->pipes;
+    if (flip || P->wb_count || P->held_count) {
+        end_pass(r);
+        vk_flush(r);
+        *point = r->work_submitted;
+        if (flip) g_stat_flip_deferred++;
+        else if (kind == RENDERER_DEFER_IDLE) g_stat_idle_deferred++;
+        else g_stat_suspend_deferred++;
+    }
+    pal_mutex_unlock(r->lock);
+    return true;
+}
+
+/* The results and held labels of each batch submitted up to `point` land in submission order (the oldest slot's
+ * entries come first in the lists). A batch still being recorded, or submitted after `point`, is not the flip's. */
+void renderer_complete_deferred(renderer *r, uint64_t point) {
+    if (!point) return;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                              .pSemaphores = &r->work_timeline, .pValues = &point};
+    vk_check_work(r, r->wait_semaphores(r->device, &wi, UINT64_MAX), "vkWaitSemaphores (flip)");
+    for (uint32_t tries = 0;; tries++) {
+        pal_mutex_lock(r->lock);
+        vk_pipelines *P = r->pipes;
+        bool owed = false;
+        for (uint32_t pass = 0; pass < 2 && (P->wb_count || P->held_count); pass++) {
+            uint32_t s = P->wb_count ? P->wb[0].slot : P->held[0].slot;
+            if (P->wb_count && P->held_count && P->held[0].slot != s && r->work_value[P->held[0].slot] < r->work_value[s])
+                s = P->held[0].slot;
+            if (r->recording && r->work_index == s) break; /* the next frame's batch */
+            if (r->work_value[s] > point) break;          /* submitted after the flip */
+            /* the batch being recorded reads that slot's arena in place: it lands when that batch is submitted */
+            if (P->cross_slot && r->recording && s != work_slot(P)) { owed = true; break; }
+            apply_slot_results(r, s);
+            g_stat_flip_applied++;
+        }
+        pal_mutex_unlock(r->lock);
+        if (!owed) break;
+        if (tries == 200) LOG_W(GPU, "flip: results of its batch still wait for the next submit");
+        pal_sleep_ns(1000000);
+    }
 }
 
 void renderer_sync_mem(renderer *r, guest_addr addr, uint64_t size) {
@@ -2247,6 +2489,7 @@ bool vk_work_can_overlap(renderer *r) {
 
 void vk_work_begin(renderer *r) {
     vk_pipelines *P = r->pipes;
+    batch_clock_begin(r);
     /* A switch is allowed only with no pending CPU results in the old slot;
      * otherwise vk_begin waited on the active slot, which still owns them. */
     bool rotated=P->work!=&P->work_slots[r->work_index];
@@ -2336,9 +2579,15 @@ void vk_work_end(renderer *r) { end_pass(r); }
 /* vk_work_end also ends passes for feedback copies without submitting.
  * The endpoint belongs only to the final command-buffer submission. */
 void vk_work_profile_end(renderer *r) {
-    prof *f=r->pipes->prof;
+    vk_pipelines *P = r->pipes;
+    prof *f=P->prof;
     if(f && f->batch_timed)
         vkCmdWriteTimestamp(r->cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f->pool,2*PROF_MAX+1);
+    if (P->batch_clock) {
+        uint32_t slot = r->work_index;
+        vkCmdWriteTimestamp(r->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P->batch_clock, 2 * slot + 1);
+        P->batch_clock_pending[slot] = true;
+    }
 }
 
 /* A depth image cannot expose raw integer bits through a color view. These
@@ -2432,6 +2681,7 @@ static void sync_batch_at(renderer *r, uint32_t line) {
     if (!g_stats_on) return;
     g_stat_sync_submit_ns += submitted - t0;
     g_stat_sync_fence_ns += pal_time_ns() - submitted;
+    if (r->guest_access.pinned) g_stat_pin_sync_ns += pal_time_ns() - t0;
     for (int i = 0; i < SYNC_SITES; i++)
         if (g_stat_sync[i].line == line || !g_stat_sync[i].n) {
             g_stat_sync[i].line = line;
@@ -2493,20 +2743,43 @@ bool vk_guest_access_begin(renderer *r) {
     bool was_pinned = r->guest_access.pinned;
     uint64_t t0 = g_stats_on > 0 ? pal_time_ns() : 0;
     if (!gmem_access_begin(&r->guest_access, r->mem, P && P->large_import_cache)) return false;
-    if (t0 && !was_pinned) g_stat_pins++, g_stat_pin_ns += pal_time_ns() - t0;
+    if (t0 && !was_pinned) {
+        g_stat_pins++, g_pin_since = pal_time_ns(), g_stat_pin_ns += g_pin_since - t0;
+        g_pin_caller = (intptr_t)__builtin_return_address(0) - (intptr_t)vk_guest_access_begin;
+    }
     if (prior != r->mem || generation != r->guest_access.generation) {
         r->phys_cached = 0;
         r->phys_cache_seq = r->use_seq;
     }
+    /* The caches that count epochs hold copies and checks of guest bytes, never host pointers or
+     * where an address points (phys_cache above). A command buffer cannot use memory the game
+     * remaps under it (the game waits for its completion first), and a new one starts a new epoch
+     * (renderer_submit_begin). Minecraft remaps ~1000 times a second while a world builds: the
+     * epoch each time made every texture, program and copy be checked again (texture hashing 4x,
+     * program checks 5x). PS5C_MAP_EPOCH=1: a new epoch at each mapping change, as before. */
+    static int map_epoch = -1;
+    if (map_epoch < 0) map_epoch = getenv("PS5C_MAP_EPOCH") && atoi(getenv("PS5C_MAP_EPOCH"));
     if (P && (prior != r->mem || generation != r->guest_access.generation)) {
         g_stat_map_epochs++;
-        P->epoch++;
-        P->copy_count = P->copy_next = 0;
+        if (map_epoch || prior != r->mem) {
+            P->epoch++;
+            P->copy_count = P->copy_next = 0;
+        }
     }
     return true;
 }
 
-void vk_guest_access_end(renderer *r) { gmem_access_end(&r->guest_access); }
+void vk_guest_access_end(renderer *r) {
+    /* Finish reads from guest pointers while their mappings are pinned. */
+    copy_pool_drain_now();
+    if (g_stats_on > 0 && r->guest_access.pinned && g_pin_since) {
+        uint64_t held = pal_time_ns() - g_pin_since;
+        g_stat_pin_held_ns += held;
+        if (held > g_stat_pin_held_max) g_stat_pin_held_max = held, g_stat_pin_max_caller = g_pin_caller;
+        g_pin_since = 0;
+    }
+    gmem_access_end(&r->guest_access);
+}
 
 /* Cached validations survive a CPU scope only while its mapping generation
  * stays unchanged. Every returned pointer is consumed before scope end. */
@@ -2535,6 +2808,7 @@ static bool eval_defer_cb(void *user, guest_addr addr, uint64_t size) {
     return eval_read_pending(((renderer *)user)->pipes, addr, size);
 }
 
+static void eval_ranges_add(eval_ranges *rd, uint8_t sbase, uint8_t soff, guest_addr addr, uint64_t size);
 static void *guest_host_cb(void *user, guest_addr addr, uint64_t size) {
     renderer *r = (renderer *)user;
     if (eval_read_pending(r->pipes, addr, size)) {
@@ -2558,22 +2832,29 @@ static void *guest_host_cb(void *user, guest_addr addr, uint64_t size) {
         vk_begin(r);
     }
     eval_ranges *rd = r->pipes->eval_reading;
-    if (rd && !rd->overflow) { /* extend a range of the same base it touches, else add one */
-        uint8_t sbase = r->pipes->eval_current ? r->pipes->eval_current->host_sbase : 0xFF;
+    if (rd) eval_ranges_add(rd, r->pipes->eval_current ? r->pipes->eval_current->host_sbase : 0xFF,
+                            r->pipes->eval_current ? r->pipes->eval_current->host_soff : 0xFF, addr, size);
+    return guest_host(r, addr, size);
+}
+
+/* What an evaluation read: extend a range of the same base it touches, else add one */
+static void eval_ranges_add(eval_ranges *rd, uint8_t sbase, uint8_t soff, guest_addr addr, uint64_t size) {
+    if (!rd->overflow) {
         guest_addr end = addr + size;
         if (!rd->count || addr < rd->min_start) rd->min_start = addr;
         if (!rd->count || end > rd->max_end) rd->max_end = end;
         uint32_t i = 0;
-        while (i < rd->count && (rd->sbase[i] != sbase || addr > rd->end[i] || end < rd->start[i])) i++;
+        while (i < rd->count && (rd->sbase[i] != sbase || rd->soff[i] != soff || addr > rd->end[i] || end < rd->start[i])) i++;
         if (i < rd->count) {
             if (addr < rd->start[i]) rd->start[i] = addr;
             if (end > rd->end[i]) rd->end[i] = end;
             for (uint32_t j = i + 1; j < rd->count;) {
-                if (rd->sbase[j] == sbase && rd->start[i] <= rd->end[j] && rd->end[i] >= rd->start[j]) {
+                if (rd->sbase[j] == sbase && rd->soff[j] == soff && rd->start[i] <= rd->end[j] && rd->end[i] >= rd->start[j]) {
                     if (rd->start[j] < rd->start[i]) rd->start[i] = rd->start[j];
                     if (rd->end[j] > rd->end[i]) rd->end[i] = rd->end[j];
                     rd->count--;
                     rd->sbase[j] = rd->sbase[rd->count];
+                    rd->soff[j] = rd->soff[rd->count];
                     rd->start[j] = rd->start[rd->count];
                     rd->end[j] = rd->end[rd->count];
                 } else {
@@ -2582,13 +2863,13 @@ static void *guest_host_cb(void *user, guest_addr addr, uint64_t size) {
             }
         } else if (rd->count < EVAL_RANGES) {
             rd->sbase[rd->count] = sbase;
+            rd->soff[rd->count] = soff;
             rd->start[rd->count] = addr;
             rd->end[rd->count++] = end;
         } else {
             rd->overflow = true;
         }
     }
-    return guest_host(r, addr, size);
 }
 
 /* Arming clears the written bits of the pages for the whole cache, so another
@@ -2718,7 +2999,7 @@ static bool vertex_cache_bind(renderer *r, guest_addr addr, uint64_t copy, VkDev
     e->off = P->vc_used;
     e->armed = true;
     e->versions = vc_versions(P, addr, copy);
-    e->has_max = false;
+    e->index_size = 0;
     if (entry) *entry = e;
     P->vc_used += need;
     g_stat_vc_copy_ns += pal_time_ns() - ta;
@@ -2857,6 +3138,13 @@ static VkBuffer readonly_snapshot(renderer *r, guest_addr addr, uint64_t size, V
     return replace->buffer.buffer;
 }
 
+/* Set around the copies of a draw's buffers that helper threads may make (vk_copy_pool.h). */
+static bool g_copy_defer;
+static bool g_copy_queued;
+
+/* Every copy helper threads still make is complete (before a submit). */
+void vk_copy_pool_drain(void) { copy_pool_drain_now(); }
+
 /* Copies guest memory into the arena (unmapped pages read as zero). */
 static bool arena_copy_guest(renderer *r, guest_addr addr, uint64_t size, VkDeviceSize *offset) {
     VkDeviceSize alloc = (size + 16 + 3) & ~3ull;
@@ -2866,7 +3154,10 @@ static bool arena_copy_guest(renderer *r, guest_addr addr, uint64_t size, VkDevi
     uint8_t *dst = (uint8_t *)arena_ptr(r, *offset);
     memset(dst + size, 0, alloc - size);
     const void *src = guest_host(r, addr, size);
-    if (src) {
+    g_copy_queued = false;
+    if (src && g_copy_defer && copy_pool_push(r, dst, (const uint8_t *)src, (size_t)size)) {
+        g_copy_queued = true;
+    } else if (src) {
         memcpy(dst, src, size);
     } else {
         for (uint64_t o = 0; o < size; o += 4096) {
@@ -2894,6 +3185,7 @@ static bool arena_copy_patched(renderer *r, guest_addr addr, uint64_t size, uint
     for (uint32_t k = 0; k < earlier; k++) {
         const writeback *w = &P->wb[k];
         if (addr >= w->addr + w->size || w->addr >= addr + size) continue;
+        if (w->direct) return false; /* in guest memory once the GPU runs: no arena copy holds it */
         guest_addr lo = addr > w->addr ? addr : w->addr;
         guest_addr hi = addr + size < w->addr + w->size ? addr + size : w->addr + w->size;
         for (uint32_t q = 0; q < n; q++) /* destinations of one copy must not overlap */
@@ -2924,7 +3216,7 @@ static bool arena_copy_patched(renderer *r, guest_addr addr, uint64_t size, uint
 }
 
 /* A copy of [addr, addr + size) made earlier in this batch, or a new one. */
-static bool arena_copy_guest_shared(renderer *r, guest_addr addr, uint64_t size, VkDeviceSize *offset) {
+static bool arena_copy_guest_shared(renderer *r, guest_addr addr, uint64_t size, VkDeviceSize *offset, bool cpu_read) {
     vk_pipelines *P = r->pipes;
     /* Diagnostic only: @file selects normal reuse (1), fresh copies (0), or
      * bounded comparison without changing reuse (2). No setting keeps the
@@ -2951,13 +3243,18 @@ static bool arena_copy_guest_shared(renderer *r, guest_addr addr, uint64_t size,
     if (!mode) return arena_copy_guest(r, addr, size, offset);
     if (size < COPY_CACHE_MIN) return arena_copy_guest(r, addr, size, offset);
     for (uint32_t i = 0; i < P->copy_count; i++) {
-        const copy_entry *c = &P->copies[i];
+        copy_entry *c = &P->copies[i];
         if (!c->patched && addr >= c->addr && addr + size <= c->addr + c->size && ((addr - c->addr) & (P->align - 1)) == 0) {
+            if (cpu_read && c->deferred) {
+                copy_pool_drain_now();
+                c->deferred = false;
+            }
             *offset = c->offset + (addr - c->addr);
             if (mode == 2 && size <= (4u << 20)) {
                 if (!check_at || now - check_at >= 1000000000ull) { check_at = now; checks = 0; }
                 const void *src = checks < 32 ? guest_host(r, addr, size) : NULL;
                 if (src) {
+                    copy_pool_drain_now();
                     checks++;
                     bool changed = memcmp(src, arena_ptr(r, *offset), (size_t)size) != 0;
                     compared++;
@@ -2974,10 +3271,7 @@ static bool arena_copy_guest_shared(renderer *r, guest_addr addr, uint64_t size,
     }
     if (!arena_copy_guest(r, addr, size, offset)) return false;
     copy_entry *c = &P->copies[P->copy_count < MAX_COPY_CACHE ? P->copy_count++ : P->copy_next++ % MAX_COPY_CACHE];
-    c->addr = addr;
-    c->size = size;
-    c->offset = *offset;
-    c->patched = 0;
+    *c = (copy_entry){.addr = addr, .size = size, .offset = *offset, .deferred = g_copy_queued};
     return true;
 }
 
@@ -3394,6 +3688,7 @@ static const sh_program *get_program(renderer *r, guest_addr addr) {
         uint32_t avail = 0;
         code = vk_shader_code(r->mem, addr, &avail);
         vr_flow_invalidate(&P->vertex_flow);
+        prefetch_forget(P, s->prog);
         forget_wave_variants(P,s->prog);
         bool front_half = code && sh_front_dwords(code, avail) != 0; /* as below: get_fused_program's */
         s->ok = code && !front_half && analyze_cached_program(code, avail, addr, s->prog);
@@ -3402,7 +3697,7 @@ static const sh_program *get_program(renderer *r, guest_addr addr) {
         return s->ok ? s->prog : NULL;
     }
     guest_shader *s = NULL;
-    if (P->shader_count == MAX_SHADERS) {
+    if (P->shader_count >= shader_limit()) {
         /* reuse the least recently used entry; programs of this epoch stay (a draw holds them) */
         for (uint32_t i = 0; i < P->shader_count; i++) {
             guest_shader *c = &P->shaders[i];
@@ -3410,6 +3705,7 @@ static const sh_program *get_program(renderer *r, guest_addr addr) {
         }
         if (!s) return NULL;
         vr_flow_invalidate(&P->vertex_flow);
+        prefetch_forget(P, s->prog);
         forget_wave_variants(P,s->prog);
         program_storage_free(s->prog,sparse_programs());
     } else {
@@ -4617,6 +4913,18 @@ bool vk_pipeline_build(renderer *r, const void *recipe, const uint32_t *const wo
         ok = vk_spirv_locations(code[0], cn[0], SpvStorageClassOutput, &outputs) &&
              vk_spirv_locations(code[1], cn[1], SpvStorageClassInput, &inputs);
         if (rc->rect) outputs &= rc->gs_params;
+        /* A pixel shader input no vertex output feeds reads an undefined value on the GPU (the
+         * console reads a default), where dropping the draw lost whole passes: LEGO City Undercover
+         * pairs one PS reading four inputs with ~55 position-only VSs. PS5C_STRICT_INTERFACE=1: reject. */
+        static int allow = -1;
+        if (allow < 0) allow = getenv("PS5C_STRICT_INTERFACE") == NULL;
+        if (ok && allow && (inputs & ~outputs)) {
+            static uint32_t told;
+            if (told++ < 8)
+                LOG_I(GPU, "pipeline interface: VS %016llx outputs %08x, PS %016llx inputs %08x: built anyway",
+                      (unsigned long long)rc->spv[0], outputs, (unsigned long long)rc->spv[1], inputs);
+            inputs &= outputs;
+        }
         if (!ok || (inputs & ~outputs)) {
             LOG_W(GPU, "pipeline interface rejected: VS %016llx PS %016llx, missing locations %08x",
                   (unsigned long long)rc->spv[0], (unsigned long long)rc->spv[1], inputs & ~outputs);
@@ -5145,6 +5453,7 @@ static bool descriptor_plan_confirm(vk_descriptor_plan *plan, const bind_list *b
 
 static void add_buffer(renderer *r, bind_list *bl, VkDeviceSize off, VkDeviceSize size) {
     uint32_t i = bl->count++;
+    bl->bound_image[i] = NULL; /* a buffer slot has no associated image */
     bl->buf[i].buffer = r->pipes->work->arena.buffer;
     bl->buf[i].offset = off;
     bl->buf[i].range = size;
@@ -5976,6 +6285,13 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
         uint32_t we = (w + block - 1) / block, he = (h + block - 1) / block;
         vk_3d_layout layout3 = {0};
         bool standard3 = !last_level && vk_std_3d_layout(sw_mode, bpe, &layout3);
+        if (g_gcn) { /* each PS4 3D tiling index once (thick modes are not detiled yet) */
+            static uint32_t told3;
+            if (!(told3 & (1u << (t[7] & 0x1F)))) {
+                told3 |= 1u << (t[7] & 0x1F);
+                LOG_I(GPU, "PS4 3D texture 0x%llx %ux%ux%u tiling %u", (unsigned long long)addr, w, h, d, t[7] & 0x1F);
+            }
+        }
         uint64_t slice3 = surface_bytes(sw_mode, we, he, bpe), size3 = (uint64_t)we * he * bpe;
         uint64_t guest_size3 = standard3 ? vk_std_3d_bytes(&layout3, we, he, d) : slice3 * d;
         const uint8_t *src3 = (const uint8_t *)guest_host(r, addr, guest_size3);
@@ -6108,6 +6424,25 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
     if (img && img->aspect != VK_IMAGE_ASPECT_COLOR_BIT) depth_flow(addr, w, "sampled");
     if (img) dcc_sample(r, img);
     if (img && img->gpu_written && !small && !recheck) return img;
+    /* PS4: a new texture of more than 256 MiB (8192x8192 RGBA8) is a garbage T# too:
+     * Tearaway's unused material slots asked for 12905x15682 RGBA8 (800 MB) over mapped
+     * memory, 5.7 s to create and hash, and the Iris Xe then ran out of memory. */
+    if (!img && g_gcn && gsize > (256ull << 20)) {
+        static uint32_t told;
+        if (told++ < 4)
+            LOG_W(GPU, "PS4 texture 0x%llx %ux%u format %u of %llu MiB: not created", (unsigned long long)addr, w, h, fmt,
+                  (unsigned long long)(gsize >> 20));
+        return NULL;
+    }
+    if (!img && g_gcn && !guest_host(r, addr + mip.offset, 1)) {
+        /* PS4: a T# over no guest memory at all is stale or garbage data (LEGO City Undercover's
+         * address 0xd3f4ccccd00 holds 0.8f): an image of up to 800 MB for it pushed every real
+         * texture out of the cache, each then recreated hundreds of times. Nothing to read: none. */
+        static uint32_t told;
+        if (told++ < 4)
+            LOG_W(GPU, "PS4 texture 0x%llx %ux%u format %u over unmapped memory: not created", (unsigned long long)addr, w, h, fmt);
+        return NULL;
+    }
     if (!img) {
         img = vk_image_get_layers(r, addr, w, h, vf, layers);
         if (!img) return NULL;
@@ -6305,15 +6640,32 @@ static uint64_t wb_tail(void) {
     return on ? 16 : 0;
 }
 
-static writeback *find_writeback(vk_pipelines *P, guest_addr addr, uint64_t size) {
+/* PS5C_WB_SHIFT=0: vertex fetches bind earlier GPU results only at the alignment (before: a wait) */
+static bool wb_shift_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PS5C_WB_SHIFT"); on = !e || strcmp(e, "0") != 0; }
+    return on > 0;
+}
+
+/* shiftable: the shader adds a distance to its offsets (SH_BUFFER_SHIFTED), so the binding may
+ * start up to align - 4 bytes before addr; *rem is that distance (0 otherwise) */
+static writeback *find_writeback_at(vk_pipelines *P, guest_addr addr, uint64_t size, bool shiftable, uint32_t *rem) {
+    *rem = 0;
     for (uint32_t i = P->wb_count; i-- > 0;) {
         writeback *w = &P->wb[i];
         /* up to 16 bytes past its end still count as inside: bindings carry that much padding, and every
          * copy of a writeback has it (Minecraft reads 1 MiB + 16 of the 1 MiB a compute shader just wrote) */
-        if (addr >= w->addr && addr + size <= w->addr + w->size + wb_tail() && addr < w->addr + w->size &&
-            (addr - w->addr) % P->align == 0) return w;
+        if (addr >= w->addr && addr + size <= w->addr + w->size + wb_tail() && addr < w->addr + w->size) {
+            uint64_t r = (addr - w->addr) % P->align;
+            if (!r) return w;
+            if (shiftable && !(r & 3)) { *rem = (uint32_t)r; return w; }
+        }
     }
     return NULL;
+}
+static writeback *find_writeback(vk_pipelines *P, guest_addr addr, uint64_t size) {
+    uint32_t rem;
+    return find_writeback_at(P, addr, size, false, &rem);
 }
 
 /* Resources of one stage: uniforms, buffer copies, images. False when the arena
@@ -6325,6 +6677,9 @@ static writeback *find_writeback(vk_pipelines *P, guest_addr addr, uint64_t size
  * own image so they never show up in reads. */
 #define NULL_TEXTURE_ADDR 0x1
 #define NULL_STORAGE_ADDR 0x2
+static bool null_tsharp(const sh_site_value *v);
+static bool zero_image_site(const sh_site_value *v, bool gcn);
+
 static vk_image *null_image(renderer *r, bool store, const sh_site_shape *shape, bool atomic) {
     bool raw=shape->buf_format==SH_IMG_PACKED_R11G11B10 || shape->buf_format==SH_IMG_ATOMIC_FLOAT32 ||
              shape->buf_format==SH_IMG_ATOMIC_UINT32;
@@ -6684,6 +7039,36 @@ static uint64_t vertex_share_shift(const sh_program *p, const sh_eval *e, uint32
 }
 
 static bool draw_fail(uint32_t line);
+/* Direct compute stores (stage_resources): statistics and the WAR barrier the dispatch needs. */
+static uint64_t g_stat_direct_stores, g_stat_direct_bytes, g_stat_direct_over, g_stat_direct_waits, g_stat_direct_no[2];
+static bool g_direct_store_bound;
+static void direct_store_stats(void) {
+    if (g_stat_direct_stores || g_stat_direct_over || g_stat_direct_waits || g_stat_direct_no[0] || g_stat_direct_no[1])
+        LOG_I(GPU, "direct compute stores: %llu (%.1f MiB not copied), reads over them bound directly %llu, waits %llu; "
+                   "copied instead: %llu over earlier results, %llu not importable",
+              (unsigned long long)g_stat_direct_stores, g_stat_direct_bytes / 1048576.0,
+              (unsigned long long)g_stat_direct_over, (unsigned long long)g_stat_direct_waits,
+              (unsigned long long)g_stat_direct_no[0], (unsigned long long)g_stat_direct_no[1]);
+    g_stat_direct_stores = g_stat_direct_bytes = g_stat_direct_over = g_stat_direct_waits = 0;
+    g_stat_direct_no[0] = g_stat_direct_no[1] = 0;
+}
+static bool direct_stores_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PS5C_DIRECT_STORES"); on = !(e && !strcmp(e, "0")); }
+    return on > 0;
+}
+/* A pending result in guest memory itself: CPU readers and the evaluator wait for the batch as
+ * for any writeback (wb_pending), and apply_writebacks has nothing to copy. */
+static bool direct_register(vk_pipelines *P, guest_addr addr, uint64_t size) {
+    if (P->wb_count >= MAX_WRITEBACKS) return false;
+    writeback *w = &P->wb[P->wb_count++];
+    memset(w, 0, sizeof(*w));
+    w->addr = addr;
+    w->size = size;
+    w->slot = (uint8_t)work_slot(P);
+    w->direct = true;
+    return true;
+}
 static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool writeback_stores, bool *stored,
                             bool *overflow) {
     uint32_t first_binding=bl->count;
@@ -6696,7 +7081,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
     uint32_t wb_earlier = P->wb_count; /* results of earlier work (not this stage's own stores) */
     const sh_program *p = st->prog;
     st->footprint_count=0;
-    if (g_pimp.on > 0) memset(g_pimp_extra, 0, p->site_count * sizeof(g_pimp_extra[0]));
+    memset(g_pimp_extra, 0, p->site_count * sizeof(g_pimp_extra[0]));
     if(st->info.stage==SH_STAGE_CS)footprint_prepare(r,st);
     VkDeviceSize off;
     uint32_t uniform_shift=st->info.uniform_shift;
@@ -6863,8 +7248,11 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             site_base[i] -= shift;
             site_size[i] += shift;
         }
-    uint64_t coherent_size[SH_MAX_SITES] = {0};
-    uint64_t site_copy_size[SH_MAX_SITES] = {0};
+    /* only the program's sites are used: zeroing all SH_MAX_SITES (2 x 32 KiB) per stage cost
+     * Minecraft ~5% of the command thread at 24,000 draws a second */
+    uint64_t coherent_size[SH_MAX_SITES], site_copy_size[SH_MAX_SITES];
+    memset(coherent_size, 0, p->site_count * sizeof(coherent_size[0]));
+    memset(site_copy_size, 0, p->site_count * sizeof(site_copy_size[0]));
     for(uint32_t i=0;i<p->site_count;i++) {
         if(!site_copy_size[i] && !p->sites[i].store && site_size[i] && site_base[i]) {
             uint64_t widest_read=site_size[i];
@@ -7037,6 +7425,63 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                 g_stat_held_forced++;
                 return draw_fail(__LINE__); /* a held label lands there first: the caller completes the batch and retries */
             }
+            /* Earlier compute results written straight to guest memory (direct stores): the range is current
+             * only on the GPU, so this site binds the same memory directly, or the batch completes first. */
+            bool over_direct = false, over_other = false;
+            for (uint32_t k = 0; wsize && k < wb_earlier; k++)
+                if (wbase < P->wb[k].addr + P->wb[k].size + wb_tail() && P->wb[k].addr < wbase + wsize) {
+                    if (P->wb[k].direct) over_direct = true;
+                    else over_other = true;
+                }
+            if (over_direct) {
+                VkBuffer dbuf = VK_NULL_HANDLE;
+                VkDeviceSize doff = 0, drange = (size + 3) & ~3ull; /* no padding: a buffer ending its view would fall outside it */
+                bool shiftable = st->shapes[i].buffer_length == SH_BUFFER_SHIFTED && !st->shapes[i].address_map;
+                if (!over_other && !coherent && !windowed && !checking && phys_import_enabled(r))
+                    dbuf = phys_import_bind(r, base, drange, P->align, shiftable, &doff, &g_pimp_extra[i]);
+                if (!dbuf) {
+                    g_stat_direct_waits++;
+                    return draw_fail(__LINE__);
+                }
+                add_buffer(r, bl, 0, drange + g_pimp_extra[i]);
+                bl->buf[bl->count - 1].buffer = dbuf;
+                bl->buf[bl->count - 1].offset = doff;
+                if (site->store) {
+                    if (stored) *stored = true;
+                    g_direct_store_bound = true;
+                    if (writeback_stores && !direct_register(P, base, size)) { if (overflow) *overflow = true; }
+                }
+                g_stat_direct_over++;
+                traffic_record(p, i, st->info.stage, stride, size, 0);
+                continue;
+            }
+            /* A compute store straight into guest memory through its direct import (PS5C_PHYS_IMPORT=1):
+             * no copy in, no copy back. Minecraft's chunk builder (19 instructions, ~110 dispatches/s)
+             * copied its up-to-6 MiB output both ways: ~150 MiB/s. PS5C_DIRECT_STORES=0 = copies. */
+            /* (a windowed store binds its whole buffer: the shader writes only the window anyway) */
+            if (site->store && st->info.stage == SH_STAGE_CS && writeback_stores && size && !coherent &&
+                !checking && direct_stores_on() && phys_import_enabled(r) && P->wb_count < MAX_WRITEBACKS) {
+                bool over = false;
+                for (uint32_t k = 0; k < P->wb_count && !over; k++)
+                    over = base < P->wb[k].addr + P->wb[k].size && P->wb[k].addr < base + size;
+                VkDeviceSize doff = 0, drange = (size + 3) & ~3ull; /* no padding: a buffer ending its view would fall outside it */
+                uint32_t extra = 0;
+                VkBuffer dbuf = over ? VK_NULL_HANDLE : phys_import_bind(r, base, drange, P->align, false, &doff, &extra);
+                if (over) g_stat_direct_no[0]++;
+                else if (!dbuf) g_stat_direct_no[1]++;
+                if (dbuf) {
+                    add_buffer(r, bl, 0, drange);
+                    bl->buf[bl->count - 1].buffer = dbuf;
+                    bl->buf[bl->count - 1].offset = doff;
+                    if (stored) *stored = true;
+                    g_direct_store_bound = true;
+                    direct_register(P, base, size);
+                    g_stat_direct_stores++;
+                    g_stat_direct_bytes += size;
+                    traffic_record(p, i, st->info.stage, stride, size, 0);
+                    continue;
+                }
+            }
             if (size >= RESIDENT_MIN && st->info.stage == SH_STAGE_CS && !coherent && !windowed && !checking &&
                 base % P->align == 0 && (!site->store || writeback_stores) && resident_on(P)) {
                 VkDeviceSize roff;
@@ -7051,7 +7496,13 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                 }
             }
             uint64_t copy_before = g_stat_bytes;
-            writeback *w = wsize ? find_writeback(P, wbase, wneed) : NULL;
+            /* a vertex fetch reads earlier results at any 4-byte offset: bound from below, the shader
+             * adds the distance (Minecraft's interface vertices sit 48 bytes off the Iris Xe's 64-byte
+             * alignment in a compute shader's 4 MiB output: each draw was a full GPU wait) */
+            uint32_t wrem = 0;
+            bool wshift = !windowed && !site->store && st->shapes[i].buffer_length == SH_BUFFER_SHIFTED &&
+                          !st->shapes[i].address_map && wb_shift_on();
+            writeback *w = wsize ? find_writeback_at(P, wbase, wneed, wshift, &wrem) : NULL;
             uint64_t scope_lo=0,scope_hi=0;
             bool scope_proved=false;
             for(uint32_t j=0;site->store && !windowed && j<st->footprint_count;j++)
@@ -7062,21 +7513,23 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             if (w && w->res) { /* in a resident buffer that holds earlier results of the batch */
                 resident_buf *e = &P->res[w->res - 1];
                 VkDeviceSize range = ((windowed ? hi : size) + 3) & ~3ull;
-                if (wbase - e->addr < (windowed ? lo : 0) || wbase - e->addr - (windowed ? lo : 0) + range + 16 > e->buf.size) {
+                if (wbase - e->addr < (windowed ? lo : 0) + wrem || wbase - e->addr - (windowed ? lo : 0) + range + 16 > e->buf.size) {
                     g_stat_partial++;
                     return draw_fail(__LINE__);
                 }
-                add_buffer(r, bl, 0, range + 16);
+                add_buffer(r, bl, 0, range + 16 + wrem);
                 bl->buf[bl->count - 1].buffer = e->buf.buffer;
-                bl->buf[bl->count - 1].offset = wbase - e->addr - (windowed ? lo : 0);
+                bl->buf[bl->count - 1].offset = wbase - e->addr - (windowed ? lo : 0) - wrem;
+                g_pimp_extra[i] = wrem;
                 e->used_batch = P->batch;
                 if ((site->store || coherent) && stored) *stored = true;
                 traffic_record(p, i, st->info.stage, stride, size, 0);
                 continue;
             }
-            if (w && w->offset + (wbase - w->addr) >= (windowed ? lo : 0)) {
-                VkDeviceSize at = w->offset + (wbase - w->addr) - (windowed ? lo : 0);
-                VkDeviceSize range = ((windowed ? hi : size) + 3) & ~3ull;
+            if (w && w->offset + (wbase - w->addr) >= (windowed ? lo : 0) + wrem) {
+                VkDeviceSize at = w->offset + (wbase - w->addr) - (windowed ? lo : 0) - wrem;
+                VkDeviceSize range = (((windowed ? hi : size) + 3) & ~3ull) + wrem;
+                g_pimp_extra[i] = wrem;
                 /* The A/B control may reserve 256 MiB while this batch is
                  * limited to 128 MiB. Preserve the old binding boundary. */
                 if(at>P->arena_limit || P->arena_limit-at<16)return false;
@@ -7119,7 +7572,16 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                  * PS5C_DRAW_PATCH=1 = patched copies for draws again (Crash Bandicoot 4: fewer waits). */
                 static int draw_patch = -1;
                 if (draw_patch < 0) draw_patch = getenv("PS5C_DRAW_PATCH") != NULL;
-                if (site->store || coherent || windowed || (st->info.stage != SH_STAGE_CS && !draw_patch)) {
+                /* Small earlier results wholly inside the read (Minecraft's vertex shader reads 64 bytes
+                 * where a compute wrote a 48-byte block, ~14 times a second: each was a full GPU wait,
+                 * ~18% of the command thread): the patched copy takes them. The pool case above
+                 * (results in part of a large binding) still waits. */
+                bool small_inside = true;
+                for (uint32_t k = 0; k < wb_earlier && small_inside; k++)
+                    if (base < P->wb[k].addr + P->wb[k].size && P->wb[k].addr < base + size)
+                        small_inside = !P->wb[k].res && P->wb[k].size <= 256 && P->wb[k].addr >= base &&
+                                       P->wb[k].addr + P->wb[k].size <= base + size;
+                if (site->store || coherent || windowed || (st->info.stage != SH_STAGE_CS && !draw_patch && !small_inside)) {
                     static uint32_t logged_sync;
                     if (log_partial && logged_sync < 40) {
                         logged_sync++;
@@ -7171,10 +7633,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                         return draw_fail(__LINE__);
                     }
                     copy_entry *c = &P->copies[P->copy_count < MAX_COPY_CACHE ? P->copy_count++ : P->copy_next++ % MAX_COPY_CACHE];
-                    c->addr = base;
-                    c->size = size;
-                    c->offset = off;
-                    c->patched = wb_earlier + 1;
+                    *c = (copy_entry){.addr = base, .size = size, .offset = off, .patched = wb_earlier + 1};
                 }
                 add_buffer(r, bl, off, ((size + 3) & ~3ull) + 16);
                 traffic_record(p, i, st->info.stage, stride, size, g_stat_bytes - copy_before);
@@ -7183,7 +7642,11 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             if (!site->store && !coherent && !windowed && size && phys_import_enabled(r)) {
                 VkDeviceSize ioff, irange = ((size + 3) & ~3ull) + 16;
                 bool shiftable = st->shapes[i].buffer_length == SH_BUFFER_SHIFTED && !st->shapes[i].address_map;
+                uint64_t mis_before = g_pimp.misaligned;
                 VkBuffer ibuf = phys_import_bind(r, base, irange, P->align, shiftable, &ioff, &g_pimp_extra[i]);
+                if (g_pimp.misaligned != mis_before) /* which sites (stage x kind x eligible) */
+                    g_pimp_mis[(st->info.stage & 7) * 8 + (p->sites[i].kind & 3) * 2 +
+                               (st->info.stage == SH_STAGE_VS && vertex_share_eligible(p, &st->eval, i))]++;
                 if (ibuf) {
                     add_buffer(r, bl, 0, irange + g_pimp_extra[i]);
                     bl->buf[bl->count - 1].buffer = ibuf;
@@ -7221,7 +7684,9 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             }
             if (windowed && P->arena_used < lo) P->arena_used = lo; /* the binding starts lo bytes before the window */
             g_copy_tag = (site->store || coherent) ? 3 : 2;
-            bool copied_ = (site->store || coherent) ? arena_copy_guest(r, wbase, wsize, &off) : arena_copy_guest_shared(r, base, copy_size, &off);
+            g_copy_defer = true;
+            bool copied_ = (site->store || coherent) ? arena_copy_guest(r, wbase, wsize, &off) : arena_copy_guest_shared(r, base, copy_size, &off, false);
+            g_copy_defer = false;
             g_copy_tag = 0;
             if (!copied_) return false;
             add_buffer(r, bl, off - (windowed ? lo : 0), (((windowed ? hi : size) + 3) & ~3ull) + 16);
@@ -7242,6 +7707,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                     if(wr->local_copies[c].offset==off && wr->local_copies[c].size==bytes){copied=true;break;}
                 if(!copied && wr->local_copy_count<PS5C_ARRAY_COUNT(wr->local_copies) &&
                    off<=wr->other_arena.size && bytes<=wr->other_arena.size-off) {
+                    copy_pool_drain_now();
                     memcpy((uint8_t*)wr->other_arena.mapped+off,arena_ptr(r,off),(size_t)bytes);
                     wr->local_copies[wr->local_copy_count].offset=off;
                     wr->local_copies[wr->local_copy_count++].size=bytes;copied=true;
@@ -7267,6 +7733,8 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                     nw->size = wsize;
                     nw->orig = writeback_original(P,wsize,&nw->orig_pooled);
                     if (!nw->orig) { P->writeback_oom = true; return false; }
+                    /* Merge against the exact snapshot uploaded to the GPU. */
+                    copy_pool_drain_now();
                     memcpy(nw->orig, arena_ptr(r, off), wsize);
                     nw->check_lo = checking ? lo : 0;
                     nw->check_hi = checking ? hi : 0;
@@ -7305,7 +7773,7 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                 gpu_lod_note(&r->lod_stats,v->desc);
             uint32_t mip_desc[8], mip_source, mip_literal;
             const uint32_t *desc = v->desc;
-            if (v->valid && st->shapes[i].img_type == 9 &&
+            if (v->valid && st->shapes[i].img_type == 9 && !zero_image_site(v, st->gcn) &&
                 sh_image_mip_source(p, &st->info, i, &mip_source, &mip_literal)) {
                 uint32_t lod = mip_source == RDNA2_OP_LITERAL ? mip_literal : st->eval.sgpr_init[mip_source];
                 if (!sh_image_mip_desc(v->desc, lod, mip_desc)) {
@@ -7341,8 +7809,9 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
                     desc = lod_desc;
                 }
             }
-            vk_image *img = v->valid && !site->store ? resident_mips(r,desc) : NULL;
-            if(!img && v->valid) img=texture(r,desc);
+            bool zero_site = !site->store && zero_image_site(v, st->gcn);
+            vk_image *img = v->valid && !site->store && !zero_site ? resident_mips(r,desc) : NULL;
+            if(!img && v->valid && !zero_site) img=texture(r,desc);
             if(img && site->store && (img->aspect&VK_IMAGE_ASPECT_DEPTH_BIT)) {
                 VkFormat pair=depth_integer_pair(img->format);
                 if(pair!=VK_FORMAT_UNDEFINED) img=depth_as_color(r,img,pair);
@@ -7475,8 +7944,15 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             bl->w[k].descriptorCount = 1;
             bl->w[k].descriptorType = site->store ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bl->bound_image[k] = img;
+            uint32_t clear_border[4]; /* null_image_shapes: a null T# reads zero outside too */
+            const uint32_t *samp = v->sampler;
+            if (placeholder && zero_site && (v->sampler[3] >> 30)) {
+                memcpy(clear_border, v->sampler, sizeof(clear_border));
+                clear_border[3] &= 0x3FFFFFFFu;
+                samp = clear_border;
+            }
             bl->img[k].sampler = site->store ? VK_NULL_HANDLE :
-                get_sampler(r, v->sampler, stencil_read ? VK_FORMAT_R8_UINT : view_fmt ? view_fmt : img ? img->format : VK_FORMAT_R8G8B8A8_UNORM);
+                get_sampler(r, samp, stencil_read ? VK_FORMAT_R8_UINT : view_fmt ? view_fmt : img ? img->format : VK_FORMAT_R8G8B8A8_UNORM);
             if(!site->store && !bl->img[k].sampler) {
                 if(r->image_cache_pressure)return false;
                 static uint32_t reported;
@@ -7535,7 +8011,10 @@ static bool stage_resources(renderer *r, stage_state *st, bind_list *bl, bool wr
             if(p->sites[s].kind==SH_SITE_SMEM && !st->shapes[s].address_map)continue;
             if(st->shapes[s].buffer_length==SH_BUFFER_SHIFTED && !st->shapes[s].address_map && p->sites[s].kind==SH_SITE_BUFFER) {
                 if(SH_U_SITE+s>=st->eval.smem_words)return false;
-                uniforms[SH_U_SITE+s]=(uint32_t)vertex_share_shift(p,&st->eval,s,NULL)+(g_pimp.on>0?g_pimp_extra[s]:0);
+                uniforms[SH_U_SITE+s]=(uint32_t)vertex_share_shift(p,&st->eval,s,NULL)+g_pimp_extra[s];
+            } else if(st->shapes[s].buffer_length==SH_BUFFER_SHIFTED && !st->shapes[s].address_map && p->sites[s].kind==SH_SITE_SBUFFER) {
+                if(SH_U_SITE+s>=st->eval.smem_words)return false;
+                uniforms[SH_U_SITE+s]=g_pimp_extra[s];
             } else if(st->shapes[s].buffer_length==SH_BUFFER_LENGTH && !st->shapes[s].address_map &&
                (p->sites[s].kind==SH_SITE_BUFFER || p->sites[s].kind==SH_SITE_SBUFFER)) {
                 if(binding>=bl->count || SH_U_SITE+s>=st->eval.smem_words)return false;
@@ -7629,7 +8108,7 @@ static bool prepare_linear_image_copies(renderer *r,const stage_state *st,const 
         if(seen)continue;
         if(plan->count==MAX_WRITEBACKS)return false;
         writeback *prior=find_writeback(P,addr,bytes);
-        if(prior && (prior->res || prior->slot!=work_slot(P)))return false; /* resident or another slot's arena: not this bounded path */
+        if(prior && (prior->res || prior->direct || prior->slot!=work_slot(P)))return false; /* resident or another slot's arena: not this bounded path */
         VkDeviceSize offset;
         if(prior) {
             wb_scope_add(prior,addr,0,bytes,true);
@@ -7805,7 +8284,9 @@ static eval_entry *eval_lookup(renderer *r, const stage_state *st, uint64_t key)
     vk_pipelines *P = r->pipes;
     static int off = -1; /* PS5C_NO_EVAL_CACHE=1: every draw evaluates (comparison) */
     if (off < 0) off = getenv("PS5C_NO_EVAL_CACHE") != NULL;
+    g_eval_lk_why = LK_OTHER;
     if (!P->evals || off) return NULL;
+    g_eval_lk_why = LK_NONE;
     uint32_t base = eval_set_base(key);
     for (uint32_t w = 0; w < EVAL_WAYS; w++) {
         eval_entry *c = &P->evals[base + w];
@@ -7813,15 +8294,18 @@ static eval_entry *eval_lookup(renderer *r, const stage_state *st, uint64_t key)
             /* A compute store can reuse an existing writeback allocation.
              * Checking the live ranges also covers that case; the SGPR key
              * and submission epoch alone do not make its snapshot current. */
+            g_eval_lk_why = LK_PENDING;
             if (c->read.overflow && (P->wb_count || P->held_count)) return NULL;
             for (uint32_t k = 0; k < c->read.count; k++)
                 if (eval_read_pending(P, c->read.start[k], c->read.end[k] - c->read.start[k])) return NULL;
             if (c->epoch != P->epoch) {
                 uint64_t h;
+                g_eval_lk_why = LK_OTHER;
                 if (!c->ok || c->read.overflow || !c->source_hash_valid || !eval_source_hash(r, &c->read, &h)) {
                     c->key = 0;
                     return NULL;
                 }
+                g_eval_lk_why = LK_CHANGED;
                 if (h != c->source_hash) {
                     for (uint32_t k = 0; k < c->read.count; k++)
                         copies_written(P, c->read.start[k], c->read.end[k] - c->read.start[k]);
@@ -7874,22 +8358,29 @@ static const eval_entry *eval_relocated(renderer *r, const stage_state *st, uint
     static int off = -1;
     if (off < 0) { const char *e = getenv("PS5C_EVAL_RELOCATE"); off = (e && !strcmp(e, "0")) || getenv("PS5C_NO_EVAL_CACHE"); }
     uint16_t index = P->evals && !off ? P->eval_reloc[(reloc_key >> 7) & (EVAL_RELOC - 1u)] : 0;
+    g_eval_rl_why = RL_NONE;
     if (!index) return NULL;
     eval_entry *c = &P->evals[index - 1u];
+    g_eval_rl_why = RL_OTHER;
     if (!c->key || c->reloc_key != reloc_key || c->prog != st->prog || !c->ok || c->read.overflow || !c->source_hash_valid)
         return NULL;
+    g_eval_rl_why = RL_PENDING;
     eval_ranges moved = c->read;
     for (uint32_t k = 0; k < moved.count; k++) {
-        uint32_t b = moved.sbase[k], slot = 0;
-        if (b >= 64 || !(st->prog->eval_reloc_sgprs >> b & 1)) continue;
-        for (uint64_t m = st->prog->eval_reloc_sgprs & ((1ull << b) - 1u); m; m &= m - 1) slot++;
-        int64_t delta = (int64_t)st->eval.sgpr_init[b] - (int64_t)c->reloc_value[slot]; /* the high word is keyed */
+        int64_t delta = 0;
+        for (int w = 0; w < 2; w++) { /* the base register, then the offset register */
+            uint32_t b = w ? moved.soff[k] : moved.sbase[k], slot = 0;
+            if (b >= 64 || !(st->prog->eval_reloc_sgprs >> b & 1)) continue;
+            for (uint64_t m = st->prog->eval_reloc_sgprs & ((1ull << b) - 1u); m; m &= m - 1) slot++;
+            delta += (int64_t)st->eval.sgpr_init[b] - (int64_t)c->reloc_value[slot]; /* the high word is keyed */
+        }
         moved.start[k] += (guest_addr)delta;
         moved.end[k] += (guest_addr)delta;
     }
     for (uint32_t k = 0; k < moved.count; k++)
         if (eval_read_pending(P, moved.start[k], moved.end[k] - moved.start[k])) return NULL;
     uint64_t h;
+    g_eval_rl_why = RL_CHANGED;
     if (!eval_source_hash(r, &moved, &h) || h != c->source_hash) return NULL;
     return c;
 }
@@ -7946,24 +8437,21 @@ static bool eval_copy_sparse(uint32_t **data, uint32_t *words, uint32_t *cap, ui
     return true;
 }
 
+/* The cache entry a new evaluation goes to: the same key's, a free one, else the next of its set */
+static eval_entry *eval_slot(vk_pipelines *P, uint64_t key, const sh_program *prog) {
+    if (!P->evals && !(P->evals = (eval_entry *)calloc(EVAL_CACHE, sizeof(eval_entry)))) return NULL;
+    uint32_t base = eval_set_base(key);
+    for (uint32_t w = 0; w < EVAL_WAYS; w++)
+        if (P->evals[base + w].key == key && P->evals[base + w].prog == prog) return &P->evals[base + w];
+    for (uint32_t w = 0; w < EVAL_WAYS; w++)
+        if (!P->evals[base + w].key) return &P->evals[base + w];
+    return &P->evals[base + (P->eval_next++ & (EVAL_WAYS - 1u))];
+}
+
 static void eval_store(renderer *r, const stage_state *st, uint64_t key, uint64_t reloc_key, bool ok, const eval_ranges *read) {
     vk_pipelines *P = r->pipes;
-    if (!P->evals && !(P->evals = (eval_entry *)calloc(EVAL_CACHE, sizeof(eval_entry)))) return;
-    uint32_t base = eval_set_base(key);
-    eval_entry *c = NULL;
-    for (uint32_t w = 0; w < EVAL_WAYS; w++) {
-        if (P->evals[base + w].key == key && P->evals[base + w].prog == st->prog) {
-            c = &P->evals[base + w];
-            break;
-        }
-    }
-    for (uint32_t w = 0; !c && w < EVAL_WAYS; w++) {
-        if (!P->evals[base + w].key) {
-            c = &P->evals[base + w];
-            break;
-        }
-    }
-    if (!c) c = &P->evals[base + (P->eval_next++ & (EVAL_WAYS - 1u))];
+    eval_entry *c = eval_slot(P, key, st->prog);
+    if (!c) return;
     uint32_t n = st->prog->site_count;
     if (n > c->site_cap) {
         sh_site_value *site = (sh_site_value *)realloc(c->site, sizeof(sh_site_value) * n);
@@ -8042,6 +8530,95 @@ static bool evaluate_stage_calls(renderer *r, stage_state *st) {
 }
 
 /* A PS4 stage's evaluated descriptors, GFX7 ones, as the GFX10 ones the rest reads */
+/* A null T# (address and word 3 zero: no image type, every DST_SEL 0) reads
+ * zero. Its shape (all selects 0) differed from the shape of the same site bound
+ * to a real texture, so each combination of a material's optional textures was
+ * a new translation and pipeline (Tearaway Unfolded: ~165 variants of two
+ * 1.6K-2K-instruction pixel shaders, ~700 ms each on the Iris Xe). A null site
+ * takes the first real shape seen at that site when that gives the same zero:
+ * plain samples/loads whose selects only read channels (no constant 1) of the
+ * zero stand-in image, bound with a transparent-black border.
+ * PS5C_NULL_IMAGE_SHAPES=0: the null shape, as before (comparisons). */
+static bool null_tsharp(const sh_site_value *v) {
+    return v->valid && !v->desc_unknown && !v->desc[0] && !(v->desc[1] & 0xFF) && !v->desc[3];
+}
+
+/* Sites bound to the zero stand-in whatever their shape: not reached by the evaluation, a null
+ * T#, or (PS4) a T# without an image type, which the hardware does not read as an image
+ * (Tearaway leaves stale buffer words in the slots of unused material textures). */
+static bool zero_image_site(const sh_site_value *v, bool gcn) {
+    return !v->valid || null_tsharp(v) || (gcn && !v->desc_unknown && (v->desc[3] >> 28) < 8);
+}
+
+static bool null_fill_site(const sh_program *p, uint32_t site) {
+    const sh_site *s = &p->sites[site];
+    if (s->kind != SH_SITE_IMAGE || s->store || s->pops_load) return false;
+    const char *name = p->insts[s->inst].name ? p->insts[s->inst].name : "";
+    size_t len = strlen(name);
+    if (strncmp(name, "image_sample", 12) && strncmp(name, "image_gather4", 13) && strncmp(name, "image_load", 10))
+        return false;
+    return !strstr(name, "_c_") && !(len >= 2 && !strcmp(name + len - 2, "_c")); /* depth compares give 1 on zero */
+}
+
+/* PS4 programs: the DST_SEL of plain samples and loads of sampled images is read at run time
+ * (SH_DST_SEL_DYNAMIC), so one translation serves textures of different channel counts at a site
+ * (Tearaway Unfolded's materials bind R8 or R8G8 maps, X001 / XY01, at the same sites).
+ * PS5C_DYNAMIC_SWIZZLE=0: baked as before; =all: PS5 programs too. */
+static void dynamic_swizzles(renderer *r, stage_state *st) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PS5C_DYNAMIC_SWIZZLE");
+        mode = e && !strcmp(e, "0") ? 0 : e && !strcmp(e, "all") ? 2 : 1;
+    }
+    if (!mode || (mode == 1 && !st->gcn) || r->rt_scale) return; /* RT_SCALE keeps its float in the site word */
+    for (uint32_t i = 0; i < st->prog->site_count && SH_U_SITE + i < st->eval.smem_words; i++) {
+        const sh_site *s = &st->prog->sites[i];
+        const sh_site_value *v = &st->eval.site[i];
+        const char *name = st->prog->insts[s->inst].name ? st->prog->insts[s->inst].name : "";
+        if (s->kind != SH_SITE_IMAGE || sh_site_storage(s, &st->shapes[i]) || st->shapes[i].address_map ||
+            !v->valid || v->desc_unknown || (strncmp(name, "image_sample", 12) && strncmp(name, "image_load", 10)))
+            continue;
+        st->eval.smem_data[SH_U_SITE + i] = v->desc[3] & 0xFFF;
+        memset(st->shapes[i].dst_sel, SH_DST_SEL_DYNAMIC, sizeof(st->shapes[i].dst_sel));
+    }
+}
+
+static void null_image_shapes(renderer *r, stage_state *st) {
+    vk_pipelines *P = r->pipes;
+    dynamic_swizzles(r, st);
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PS5C_NULL_IMAGE_SHAPES"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return;
+    for (uint32_t i = 0; i < st->prog->site_count; i++) {
+        if (!null_fill_site(st->prog, i)) continue;
+        const sh_site_value *v = &st->eval.site[i];
+        sh_site_shape *sh = &st->shapes[i];
+        uint64_t key = st->prog->hash ^ ((uint64_t)(i + 1) * 0x9E3779B97F4A7C15ull), idx;
+        if (zero_image_site(v, st->gcn)) {
+            if (!sh->address_map && hmap64_get(&P->null_fill_map, key, &idx)) {
+                *sh = P->null_fill[idx];
+                if (sh->dst_sel[0] == SH_DST_SEL_DYNAMIC && SH_U_SITE + i < st->eval.smem_words)
+                    st->eval.smem_data[SH_U_SITE + i] = v->valid && !v->desc_unknown ? v->desc[3] & 0xFFF : 0;
+            }
+            continue;
+        }
+        if (!v->valid || v->desc_unknown || (v->desc[3] >> 28) < 8 || sh->address_map || sh->ordered_load ||
+            sh->buf_format || hmap64_get(&P->null_fill_map, key, &idx)) continue;
+        bool reads_only = true;
+        for (int k = 0; k < 4; k++) reads_only &= sh->dst_sel[k] == 0 || sh->dst_sel[k] >= 4;
+        if (!reads_only) continue;
+        if (P->null_fill_count == P->null_fill_cap) {
+            uint32_t cap = P->null_fill_cap ? P->null_fill_cap * 2 : 256;
+            sh_site_shape *grown = (sh_site_shape *)realloc(P->null_fill, cap * sizeof(*grown));
+            if (!grown) return;
+            P->null_fill = grown;
+            P->null_fill_cap = cap;
+        }
+        P->null_fill[P->null_fill_count] = *sh;
+        if (hmap64_put(&P->null_fill_map, key, P->null_fill_count)) P->null_fill_count++;
+    }
+}
+
 static void gcn_descriptors(stage_state *st) {
     for (uint32_t i = 0; i < st->prog->site_count; i++) {
         sh_site_value *v = &st->eval.site[i];
@@ -8052,6 +8629,560 @@ static void gcn_descriptors(stage_state *st) {
         default: break;
         }
     }
+}
+
+/* After a successful evaluation: GFX10 descriptors of a PS4 stage, the shapes of the
+ * sites and their buffer bindings (everything kept in the cache but null_image_shapes,
+ * which every use applies) */
+static void eval_post(renderer *r, stage_state *st) {
+    if (st->gcn) gcn_descriptors(st);
+    static int explicit_lengths=-1;
+    if(explicit_lengths<0){const char *s=getenv("PS5C_EXPLICIT_BUFFER_LENGTHS");explicit_lengths=s && !strcmp(s,"1");}
+    for (uint32_t i = 0; i < st->prog->site_count; i++) {
+        sh_site_shape_of(st->prog, &st->eval, i, &st->shapes[i]);
+        sh_site_kind kind=st->prog->sites[i].kind;
+        uint32_t enc=st->prog->insts[st->prog->sites[i].inst].enc;
+        if(explicit_lengths && !st->shapes[i].address_map &&
+           (kind==SH_SITE_SBUFFER || (kind==SH_SITE_BUFFER && (enc==RDNA2_ENC_MUBUF || enc==RDNA2_ENC_MTBUF))))
+            st->shapes[i].buffer_length=SH_BUFFER_LENGTH;
+    }
+    static int share=-1;
+    if(share<0)share=getenv("PS5C_NO_VERTEX_SHARE")==NULL;
+    if(share && st->info.stage==SH_STAGE_VS && !st->gcn && st->prog->site_count<=256)
+        for (uint32_t i = 0; i < st->prog->site_count; i++) {
+            uint32_t first;
+            if (st->shapes[i].address_map || st->shapes[i].buffer_length || SH_U_SITE + i >= st->eval.smem_words ||
+                !vertex_share_shift(st->prog, &st->eval, i, &first) || st->shapes[first].address_map ||
+                (st->shapes[first].buffer_length && st->shapes[first].buffer_length != SH_BUFFER_SHIFTED) ||
+                SH_U_SITE + first >= st->eval.smem_words) continue;
+            st->shapes[i].buffer_length = st->shapes[first].buffer_length = SH_BUFFER_SHIFTED;
+        }
+    /* direct memory reads (vk_phys_import.h): a vertex fetch may bind from below its base */
+    if(st->info.stage==SH_STAGE_VS && !st->gcn && (phys_import_enabled(r) || wb_shift_on()))
+        for (uint32_t i = 0; i < st->prog->site_count; i++)
+            if (!st->shapes[i].address_map && !st->shapes[i].buffer_length && SH_U_SITE + i < st->eval.smem_words &&
+                vertex_share_eligible(st->prog, &st->eval, i))
+                st->shapes[i].buffer_length = SH_BUFFER_SHIFTED;
+    /* and constant buffers (S_BUFFER_LOAD) of every stage: half the direct reads were
+     * copied for their base off the binding alignment (Minecraft: ~20k/s, ~360 MB/s).
+     * PS5C_PHYS_SBUFFER_SHIFT=0 = copy them as before. */
+    static int sbuf_shift = -1;
+    if (sbuf_shift < 0) { const char *e = getenv("PS5C_PHYS_SBUFFER_SHIFT"); sbuf_shift = !(e && !strcmp(e, "0")); }
+    if (sbuf_shift && !st->gcn && phys_import_enabled(r))
+        for (uint32_t i = 0; i < st->prog->site_count; i++)
+            if (st->prog->sites[i].kind == SH_SITE_SBUFFER && !st->prog->sites[i].store && !st->shapes[i].address_map &&
+                !st->shapes[i].buffer_length && SH_U_SITE + i < st->eval.smem_words)
+                st->shapes[i].buffer_length = SH_BUFFER_SHIFTED;
+}
+
+/* setup_stage's cache key of an evaluation (and the key without the relocatable SGPRs, 0 without them) */
+static uint64_t eval_keys(const sh_program *prog, const uint32_t *sgpr_init, uint32_t eval_context, uint64_t *reloc_key_out,
+                          uint64_t *reloc_out) {
+    uint64_t key, reloc_key = 0, reloc = 0;
+    if (prog->count && (prog->iflags[0] & SH_IF_ANALYZED)) {
+        uint64_t sgpr_mask = (uint64_t)prog->eval_sgpr_lo | ((uint64_t)prog->eval_sgpr_hi << 32);
+        if (__builtin_popcountll(prog->eval_reloc_sgprs) <= EVAL_RELOC_SGPRS) reloc = prog->eval_reloc_sgprs;
+        uint32_t masked_sgprs[48], kept_sgprs[48];
+        uint32_t masked_count = 0;
+        while (sgpr_mask) {
+            uint32_t idx = (uint32_t)__builtin_ctzll(sgpr_mask);
+            kept_sgprs[masked_count] = reloc >> idx & 1 ? 0 : sgpr_init[idx];
+            masked_sgprs[masked_count++] = sgpr_init[idx];
+            sgpr_mask &= sgpr_mask - 1;
+        }
+        key = texture_hash_words(masked_sgprs, (size_t)masked_count * sizeof(uint32_t), prog->hash);
+        if (reloc) reloc_key = texture_hash_words(kept_sgprs, (size_t)masked_count * sizeof(uint32_t), prog->hash ^ 1);
+    } else {
+        key = texture_hash_words(sgpr_init, (size_t)SH_SGPRS * sizeof(uint32_t), prog->hash);
+    }
+    key = texture_hash_words(&prog->wave32, sizeof(prog->wave32), key) | 1;
+    key = texture_hash_words(&eval_context, sizeof(eval_context), key) | 1;
+    if (reloc) {
+        reloc_key = texture_hash_words(&prog->wave32, sizeof(prog->wave32), reloc_key) | 1;
+        reloc_key = texture_hash_words(&eval_context, sizeof(eval_context), reloc_key) | 1;
+    }
+    *reloc_key_out = reloc_key;
+    *reloc_out = reloc;
+    return key;
+}
+
+/* Programs with calls keep no evaluation (each may link a callee) */
+static bool eval_has_calls(const sh_program *p) {
+    if (!p->count) return false;
+    if (p->iflags[0] & SH_IF_ANALYZED) return (p->iflags[0] & SH_IF_HAS_SWAPPC) != 0;
+    for (uint32_t i = 0; i < p->count; i++)
+        if (p->ops[i] == SH_OP_S_SWAPPC_B64) return true;
+    return false;
+}
+
+/* ---- Evaluations ahead of the command processor (PS5C_EVAL_PREFETCH=<threads>) ----
+ * The command processor spends most of a PS4 uber-shader frame evaluating pixel shaders
+ * one draw after another (Tearaway Unfolded: ~95 us each, ~30 ms a frame), while the
+ * command buffers the game submitted wait in the driver's queue, up to two frames of them.
+ * Worker threads read each buffer when it is submitted, evaluate the pixel shader of each
+ * draw from the user data it sets and keep the results. A draw that misses the cache takes
+ * a kept result of its key through the checks of an entry of another epoch: no range it
+ * read holds pending GPU results, and the memory it read hashes the same. A wrong guess of
+ * a draw's state only costs work. Pixel shaders only, programs the draws already used. */
+#define PRE_SLOTS 2048u /* kept results, in sets of PRE_WAYS */
+#define PRE_WAYS 4u
+#define PRE_CANDS 8192u /* draws to evaluate */
+#define PRE_JOBS 256u   /* submitted command buffers to read */
+#define PRE_PROGS 2048u /* pixel shader address -> program */
+#define PRE_THREADS 8u
+#define PRE_SH_REGS 0x400u
+
+typedef struct pre_cand {
+    guest_addr ps;
+    uint64_t ticket;
+    uint32_t user[32];
+    uint32_t users;
+} pre_cand;
+
+typedef struct pre_prog {
+    guest_addr addr;
+    const sh_program *prog;
+    bool gcn;
+} pre_prog;
+
+typedef struct pre_worker {
+    struct eval_prefetch *pre;
+    gmem_access acc;
+    stage_state *st;
+    eval_ranges read;
+    eval_entry out;
+} pre_worker;
+
+typedef struct eval_prefetch {
+    renderer *r;
+    /* Lock order: a worker pins guest memory, then prog_lock, then lock. The command
+     * processor (pinned) takes prog_lock before it changes or frees a program the
+     * workers may read, and lock alone for the rest. */
+    pal_mutex *lock;
+    pal_mutex *prog_lock;
+    pal_cond *changed;
+    pal_thread *threads[PRE_THREADS];
+    pre_worker workers[PRE_THREADS];
+    uint32_t nthreads;
+    bool stop, scanning;
+    struct { guest_addr addr; uint32_t dwords; uint64_t ticket; } jobs[PRE_JOBS];
+    uint32_t job_head, job_tail;
+    pre_cand cands[PRE_CANDS];
+    uint32_t cand_head, cand_tail;
+    eval_entry slots[PRE_SLOTS];
+    uint32_t slot_next;
+    pre_prog progs[PRE_PROGS];
+    uint32_t prog_count, prog_next;
+    hmap64 prog_map; /* address -> progs index */
+    _Atomic uint64_t running; /* the ticket of the buffer the command processor runs */
+    /* the scanner's (one at a time) */
+    uint32_t sh[PRE_SH_REGS];
+    pre_cand last;
+    /* statistics (lock) */
+    uint64_t st_draws, st_dropped, st_late, st_noprog, st_evals, st_failed, st_kept, st_adopted, st_stale, st_ns;
+} eval_prefetch;
+
+static inline uint32_t pre_set_base(uint64_t key) {
+    return (uint32_t)(((key >> 1) ^ (key >> 13)) & ((PRE_SLOTS / PRE_WAYS) - 1u)) * PRE_WAYS;
+}
+
+/* lock held */
+static eval_entry *pre_find(eval_prefetch *pre, uint64_t key, const sh_program *prog) {
+    uint32_t base = pre_set_base(key);
+    for (uint32_t w = 0; w < PRE_WAYS; w++)
+        if (pre->slots[base + w].key == key && pre->slots[base + w].prog == prog) return &pre->slots[base + w];
+    return NULL;
+}
+
+static eval_entry *pre_slot(eval_prefetch *pre, uint64_t key, const sh_program *prog) {
+    eval_entry *e = pre_find(pre, key, prog);
+    if (e) return e;
+    uint32_t base = pre_set_base(key);
+    for (uint32_t w = 0; w < PRE_WAYS; w++)
+        if (!pre->slots[base + w].key) return &pre->slots[base + w];
+    return &pre->slots[base + (pre->slot_next++ & (PRE_WAYS - 1u))];
+}
+
+static void *pre_host_cb(void *user, guest_addr addr, uint64_t size) {
+    pre_worker *w = (pre_worker *)user;
+    eval_ranges_add(&w->read, w->st->eval.host_sbase, w->st->eval.host_soff, addr, size);
+    return gmem_access_host(&w->acc, addr, size);
+}
+
+/* eval_source_hash through the worker's own scope */
+static bool pre_source_hash(pre_worker *w, const eval_ranges *read, uint64_t *hash) {
+    if (read->overflow) return false;
+    uint64_t bytes = 0, h = FNV_INIT;
+    for (uint32_t i = 0; i < read->count; i++) {
+        if (read->end[i] < read->start[i]) return false;
+        uint64_t size = read->end[i] - read->start[i];
+        if (size > 65536 - bytes) return false;
+        bytes += size;
+        const void *p = size ? gmem_access_host(&w->acc, read->start[i], size) : NULL;
+        if (size && !p) return false;
+        if (size) h = texture_hash_words(p, (size_t)size, h);
+    }
+    *hash = h;
+    return true;
+}
+
+/* A draw read from a submitted buffer: its pixel shader and user data (PS registers) */
+static void pre_draw(eval_prefetch *pre, uint64_t ticket) {
+    const uint32_t *sh = pre->sh;
+    guest_addr ps = ((guest_addr)sh[mmSPI_SHADER_PGM_LO_PS - GPU_REG_SH_BASE] << 8) |
+                    ((guest_addr)(sh[mmSPI_SHADER_PGM_LO_PS + 1 - GPU_REG_SH_BASE] & 0xFF) << 40);
+    if (!ps) return;
+    uint32_t rsrc2 = sh[mmSPI_SHADER_PGM_RSRC2_PS - GPU_REG_SH_BASE];
+    uint32_t users = ((rsrc2 >> 1) & 0x1F) | ((rsrc2 >> 22) & 0x20); /* as renderer_draw */
+    if (users > 32) users = 32;
+    pre_cand c;
+    memset(&c, 0, sizeof(c));
+    c.ps = ps;
+    c.ticket = ticket;
+    c.users = users;
+    memcpy(c.user, sh + (mmSPI_SHADER_USER_DATA_PS_0 - GPU_REG_SH_BASE), users * sizeof(uint32_t));
+    pal_mutex_lock(pre->lock);
+    pre->st_draws++;
+    bool same = pre->last.ps == ps && pre->last.users == users && !memcmp(pre->last.user, c.user, sizeof(c.user));
+    if (!same) {
+        if (pre->cand_tail - pre->cand_head < PRE_CANDS) {
+            pre->cands[pre->cand_tail++ % PRE_CANDS] = c;
+            pal_cond_signal(pre->changed);
+        } else {
+            pre->st_dropped++;
+        }
+        pre->last = c;
+    }
+    pal_mutex_unlock(pre->lock);
+}
+
+/* The packets of a submitted buffer that matter here: SH registers, nested and chained
+ * buffers, draws (a reduced run_packets). The worker holds its scope. */
+static void pre_scan(eval_prefetch *pre, pre_worker *w, guest_addr addr, uint32_t dwords, uint64_t ticket, int depth) {
+    uint32_t hops = 0;
+    const uint32_t *cmd = dwords ? (const uint32_t *)gmem_access_host(&w->acc, addr, (uint64_t)dwords * 4) : NULL;
+    for (uint32_t pos = 0; cmd && pos < dwords && !pre->stop;) {
+        uint32_t hdr = cmd[pos], type = hdr >> 30;
+        if (type == 2 || hdr == 0xFFFF1000u) {
+            pos++;
+            continue;
+        }
+        uint32_t len = ((hdr >> 16) & 0x3FFF) + 2;
+        if (pos + len > dwords) return;
+        const uint32_t *p = cmd + pos;
+        pos += len;
+        if (type != 3) continue;
+        switch ((hdr >> 8) & 0xFF) {
+        case 0x76: case 0x9B: { /* SET_SH_REG(_INDEX) */
+            if (len < 3) break;
+            uint32_t reg = p[1] & 0xFFFF;
+            for (uint32_t i = 2; i < len && reg < PRE_SH_REGS; i++) pre->sh[reg++] = p[i];
+            break;
+        }
+        case 0x3F: case 0x33: { /* INDIRECT_BUFFER(_CNST); conditional ones are not followed */
+            if (len < 4 || len == 14) break;
+            guest_addr ib = (guest_addr)(p[1] & ~3u) | ((guest_addr)(p[2] & 0xFFFF) << 32);
+            uint32_t ib_dwords = p[3] & 0xFFFFF;
+            if (p[3] & 0x100000u) { /* chained: a tail jump */
+                if (hops++ == 64) return;
+                addr = ib;
+                dwords = ib_dwords;
+                cmd = dwords ? (const uint32_t *)gmem_access_host(&w->acc, addr, (uint64_t)dwords * 4) : NULL;
+                pos = 0;
+                continue;
+            }
+            if (depth < 4) pre_scan(pre, w, ib, ib_dwords, ticket, depth + 1);
+            break;
+        }
+        case 0x2D: case 0x27: case 0x35: case 0x24: case 0x25: /* DRAW_INDEX_AUTO, _2, _OFFSET_2, (INDEX_)INDIRECT */
+            pre_draw(pre, ticket);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* Evaluates one draw's pixel shader and keeps the result (setup_stage's miss path) */
+static void pre_evaluate(eval_prefetch *pre, pre_worker *w, const pre_cand *cand, const sh_program *prog) {
+    renderer *r = pre->r;
+    if (!gmem_access_begin(&w->acc, r->mem, false)) return;
+    pal_mutex_lock(pre->prog_lock);
+    pal_mutex_lock(pre->lock);
+    uint64_t idx;
+    bool current = hmap64_get(&pre->prog_map, cand->ps, &idx) && pre->progs[idx].prog == prog;
+    bool gcn = current && pre->progs[idx].gcn;
+    pal_mutex_unlock(pre->lock);
+    stage_state *st = w->st;
+    sh_eval *e = &st->eval;
+    uint64_t t0 = pal_time_ns();
+    bool kept = false, tried = false;
+    if (current && !eval_has_calls(prog)) {
+        memset(e->sgpr_init, 0, sizeof(e->sgpr_init));
+        memcpy(e->sgpr_init, cand->user, cand->users * sizeof(uint32_t));
+        e->sgpr_init[126] = e->sgpr_init[127] = 0xFFFFFFFFu; /* exec */
+        uint32_t cap = e->smem_cap;
+        memset(&e->smem_words, 0, sizeof(*e) - offsetof(sh_eval, smem_words)); /* as reset_stage */
+        e->smem_cap = cap;
+        uint64_t reloc_key, reloc;
+        uint64_t key = eval_keys(prog, e->sgpr_init, 0, &reloc_key, &reloc);
+        pal_mutex_lock(pre->lock);
+        bool have = pre_find(pre, key, prog) != NULL;
+        pal_mutex_unlock(pre->lock);
+        if (!have) {
+            tried = true;
+            st->prog = prog;
+            st->gcn = gcn;
+            st->info.stage = SH_STAGE_PS;
+            memset(&w->read, 0, sizeof(w->read));
+            e->host = pre_host_cb;
+            e->host_user = w;
+            e->host_sbase = e->host_soff = 0xFF;
+            static int known_forks = -1;
+            if (known_forks < 0) known_forks = getenv("PS5C_EVAL_KNOWN_FORKS") && atoi(getenv("PS5C_EVAL_KNOWN_FORKS"));
+            e->known_side_only = gcn && !known_forks;
+            bool ok = sh_evaluate(prog, r->mem, e);
+            uint64_t h;
+            if (ok && !e->call_pending && !e->deferred && !w->read.overflow && !eval_reads_globals(prog)) {
+                eval_post(r, st);
+                eval_entry *o = &w->out;
+                uint32_t n = prog->site_count;
+                if (n > o->site_cap) {
+                    sh_site_value *site = (sh_site_value *)realloc(o->site, sizeof(sh_site_value) * n);
+                    if (site) o->site = site;
+                    sh_site_shape *shapes = site ? (sh_site_shape *)realloc(o->shapes, sizeof(sh_site_shape) * n) : NULL;
+                    if (shapes) o->shapes = shapes;
+                    if (site && shapes) o->site_cap = n;
+                }
+                if (o->site_cap >= n && pre_source_hash(w, &w->read, &h) &&
+                    eval_copy_sparse(&o->smem_data, &o->smem_words, &o->smem_cap, &o->site_dirty, e->smem_data, e->smem_words, n, NULL)) {
+                    memcpy(o->site, e->site, sizeof(sh_site_value) * n);
+                    memcpy(o->shapes, st->shapes, sizeof(sh_site_shape) * n);
+                    o->key = key;
+                    o->epoch = 0;
+                    o->prog = prog;
+                    o->ok = true;
+                    o->read = w->read;
+                    o->source_hash = h;
+                    o->source_hash_valid = true;
+                    o->reloc_key = 0;
+                    kept = true;
+                }
+            }
+        }
+    }
+    pal_mutex_lock(pre->lock);
+    if (!current) pre->st_noprog++;
+    if (tried) pre->st_evals++, pre->st_failed += !kept, pre->st_ns += pal_time_ns() - t0;
+    if (kept) {
+        eval_entry *s = pre_slot(pre, w->out.key, prog), t = *s;
+        *s = w->out;
+        w->out = t; /* its buffers for the next one */
+        pre->st_kept++;
+    }
+    pal_mutex_unlock(pre->lock);
+    pal_mutex_unlock(pre->prog_lock);
+    gmem_access_end(&w->acc);
+}
+
+static int32_t pre_thread(void *arg) {
+    pre_worker *w = (pre_worker *)arg;
+    eval_prefetch *pre = w->pre;
+    pal_mutex_lock(pre->lock);
+    while (!pre->stop) {
+        if (!pre->scanning && pre->job_head != pre->job_tail) {
+            uint32_t i = pre->job_head++ % PRE_JOBS;
+            guest_addr addr = pre->jobs[i].addr;
+            uint32_t dwords = pre->jobs[i].dwords;
+            uint64_t ticket = pre->jobs[i].ticket;
+            pre->scanning = true;
+            pal_mutex_unlock(pre->lock);
+            if (gmem_access_begin(&w->acc, pre->r->mem, false)) {
+                pre_scan(pre, w, addr, dwords, ticket, 0);
+                gmem_access_end(&w->acc);
+            }
+            pal_mutex_lock(pre->lock);
+            pre->scanning = false;
+            pal_cond_broadcast(pre->changed);
+            continue;
+        }
+        if (pre->cand_head != pre->cand_tail) {
+            pre_cand c = pre->cands[pre->cand_head++ % PRE_CANDS];
+            if (c.ticket < atomic_load(&pre->running)) { /* the command processor is past it */
+                pre->st_late++;
+                continue;
+            }
+            uint64_t idx;
+            const sh_program *prog = hmap64_get(&pre->prog_map, c.ps, &idx) ? pre->progs[idx].prog : NULL;
+            if (!prog) {
+                pre->st_noprog++;
+                continue;
+            }
+            pal_mutex_unlock(pre->lock);
+            pre_evaluate(pre, w, &c, prog);
+            pal_mutex_lock(pre->lock);
+            continue;
+        }
+        pal_cond_wait(pre->changed, pre->lock);
+    }
+    pal_mutex_unlock(pre->lock);
+    return 0;
+}
+
+static void prefetch_init(renderer *r) {
+    const char *e = getenv("PS5C_EVAL_PREFETCH");
+    uint32_t n = e ? (uint32_t)atoi(e) : 0;
+    if (!n) return;
+    if (n > PRE_THREADS) n = PRE_THREADS;
+    eval_prefetch *pre = (eval_prefetch *)calloc(1, sizeof(*pre));
+    if (!pre) return;
+    if (pal_mutex_create(&pre->lock) != PS5C_OK || pal_mutex_create(&pre->prog_lock) != PS5C_OK ||
+        pal_cond_create(&pre->changed) != PS5C_OK) {
+        if (pre->lock) pal_mutex_destroy(pre->lock);
+        if (pre->prog_lock) pal_mutex_destroy(pre->prog_lock);
+        free(pre);
+        return;
+    }
+    pre->r = r;
+    hmap64_init(&pre->prog_map);
+    r->pipes->pre = pre;
+    for (uint32_t i = 0; i < n; i++) {
+        pre_worker *w = &pre->workers[pre->nthreads];
+        w->pre = pre;
+        w->st = (stage_state *)calloc(1, sizeof(stage_state));
+        if (!w->st) break;
+        if (pal_thread_create(&pre->threads[pre->nthreads], pre_thread, w, "eval prefetch", 0) != PS5C_OK) {
+            free(w->st);
+            w->st = NULL;
+            break;
+        }
+        pre->nthreads++;
+    }
+    LOG_I(GPU, "evaluations ahead of the command processor: %u threads (PS5C_EVAL_PREFETCH)", pre->nthreads);
+}
+
+static void prefetch_shutdown(renderer *r) {
+    eval_prefetch *pre = r->pipes->pre;
+    if (!pre) return;
+    pal_mutex_lock(pre->lock);
+    pre->stop = true;
+    pal_cond_broadcast(pre->changed);
+    pal_mutex_unlock(pre->lock);
+    for (uint32_t i = 0; i < pre->nthreads; i++) pal_thread_join(pre->threads[i], NULL);
+    for (uint32_t i = 0; i < PRE_THREADS; i++) {
+        pre_worker *w = &pre->workers[i];
+        if (w->st) sh_eval_free(&w->st->eval);
+        free(w->st);
+        free(w->out.smem_data), free(w->out.site), free(w->out.shapes);
+    }
+    for (uint32_t i = 0; i < PRE_SLOTS; i++)
+        free(pre->slots[i].smem_data), free(pre->slots[i].site), free(pre->slots[i].shapes);
+    hmap64_free(&pre->prog_map);
+    pal_cond_destroy(pre->changed);
+    pal_mutex_destroy(pre->prog_lock);
+    pal_mutex_destroy(pre->lock);
+    free(pre);
+    r->pipes->pre = NULL;
+}
+
+/* A program about to change or go: the workers forget it (command processor) */
+static void prefetch_forget(vk_pipelines *P, const sh_program *prog) {
+    eval_prefetch *pre = P->pre;
+    if (P->pre_noted_prog == prog) P->pre_noted_prog = NULL, P->pre_noted_addr = 0;
+    if (!pre || !prog) return;
+    pal_mutex_lock(pre->prog_lock);
+    pal_mutex_lock(pre->lock);
+    for (uint32_t i = 0; i < pre->prog_count; i++)
+        if (pre->progs[i].prog == prog) {
+            hmap64_remove(&pre->prog_map, pre->progs[i].addr);
+            pre->progs[i].prog = NULL;
+            pre->progs[i].addr = 0;
+        }
+    for (uint32_t i = 0; i < PRE_SLOTS; i++)
+        if (pre->slots[i].prog == prog) pre->slots[i].key = 0;
+    pal_mutex_unlock(pre->lock);
+    pal_mutex_unlock(pre->prog_lock);
+}
+
+/* The program a draw's pixel shader address ran (the GCN address for a PS4 draw) */
+static void prefetch_note(vk_pipelines *P, guest_addr addr, const sh_program *prog, bool gcn) {
+    eval_prefetch *pre = P->pre;
+    if (!pre || !addr || !prog || (P->pre_noted_addr == addr && P->pre_noted_prog == prog)) return;
+    P->pre_noted_addr = addr;
+    P->pre_noted_prog = prog;
+    pal_mutex_lock(pre->lock);
+    uint64_t idx;
+    bool ok = hmap64_get(&pre->prog_map, addr, &idx);
+    if (!ok) {
+        if (pre->prog_count < PRE_PROGS) idx = pre->prog_count++;
+        else {
+            idx = pre->prog_next++ % PRE_PROGS;
+            if (pre->progs[idx].prog) hmap64_remove(&pre->prog_map, pre->progs[idx].addr);
+        }
+        ok = hmap64_put(&pre->prog_map, addr, idx);
+    }
+    if (ok) pre->progs[idx] = (pre_prog){addr, prog, gcn};
+    pal_mutex_unlock(pre->lock);
+}
+
+/* A kept result for a draw the cache missed, through eval_lookup's checks */
+static const eval_entry *prefetch_adopt(renderer *r, const stage_state *st, uint64_t key) {
+    vk_pipelines *P = r->pipes;
+    eval_prefetch *pre = P->pre;
+    pal_mutex_lock(pre->lock);
+    eval_entry *s = pre_find(pre, key, st->prog), *c = s ? eval_slot(P, key, st->prog) : NULL;
+    if (c) {
+        eval_entry t = *c;
+        *c = *s;
+        *s = t;
+        s->key = 0;
+    }
+    pal_mutex_unlock(pre->lock);
+    if (!c) return NULL;
+    c->epoch = P->epoch - 1; /* checked as an entry of another epoch */
+    if (P->eval_pages_epoch == P->epoch) eval_pages_mark(P, c, (uint32_t)(c - P->evals));
+    const eval_entry *hit = eval_lookup(r, st, key);
+    pal_mutex_lock(pre->lock);
+    pre->st_adopted += hit != NULL;
+    pre->st_stale += hit == NULL;
+    pal_mutex_unlock(pre->lock);
+    return hit;
+}
+
+/* The statistics line (stat_report) */
+static void prefetch_report(renderer *r) {
+    eval_prefetch *pre = r->pipes ? r->pipes->pre : NULL;
+    if (!pre) return;
+    pal_mutex_lock(pre->lock);
+    LOG_I(GPU, "evaluations ahead: %llu draws read (%llu dropped), %llu evaluated in %.1f ms (%llu failed), %llu kept; "
+          "%llu taken, %llu stale; %llu late, %llu without a known program",
+          (unsigned long long)pre->st_draws, (unsigned long long)pre->st_dropped, (unsigned long long)pre->st_evals,
+          pre->st_ns / 1e6, (unsigned long long)pre->st_failed, (unsigned long long)pre->st_kept,
+          (unsigned long long)pre->st_adopted, (unsigned long long)pre->st_stale, (unsigned long long)pre->st_late,
+          (unsigned long long)pre->st_noprog);
+    pre->st_draws = pre->st_dropped = pre->st_evals = pre->st_ns = pre->st_failed = pre->st_kept = 0;
+    pre->st_adopted = pre->st_stale = pre->st_late = pre->st_noprog = 0;
+    pal_mutex_unlock(pre->lock);
+}
+
+/* renderer.h */
+void renderer_prefetch_submit(renderer *r, guest_addr addr, uint32_t dwords, uint64_t ticket) {
+    eval_prefetch *pre = r && r->pipes ? r->pipes->pre : NULL;
+    if (!pre || !dwords) return;
+    pal_mutex_lock(pre->lock);
+    if (pre->job_tail - pre->job_head < PRE_JOBS) {
+        uint32_t i = pre->job_tail++ % PRE_JOBS;
+        pre->jobs[i].addr = addr;
+        pre->jobs[i].dwords = dwords;
+        pre->jobs[i].ticket = ticket;
+        pal_cond_broadcast(pre->changed);
+    }
+    pal_mutex_unlock(pre->lock);
+}
+
+void renderer_prefetch_running(renderer *r, uint64_t ticket) {
+    eval_prefetch *pre = r && r->pipes ? r->pipes->pre : NULL;
+    if (pre) atomic_store(&pre->running, ticket);
 }
 
 static bool setup_stage(renderer *r, stage_state *st) {
@@ -8068,46 +9199,35 @@ static bool setup_stage(renderer *r, stage_state *st) {
     }
     uint64_t t0 = stat_now();
     vk_pipelines *P = r->pipes;
-    uint64_t key, reloc_key = 0, reloc = 0;
-    if (st->prog->count && (st->prog->iflags[0] & SH_IF_ANALYZED)) {
-        uint64_t sgpr_mask = (uint64_t)st->prog->eval_sgpr_lo | ((uint64_t)st->prog->eval_sgpr_hi << 32);
-        if (__builtin_popcountll(st->prog->eval_reloc_sgprs) <= EVAL_RELOC_SGPRS) reloc = st->prog->eval_reloc_sgprs;
-        uint32_t masked_sgprs[48], kept_sgprs[48];
-        uint32_t masked_count = 0;
-        while (sgpr_mask) {
-            uint32_t idx = (uint32_t)__builtin_ctzll(sgpr_mask);
-            kept_sgprs[masked_count] = reloc >> idx & 1 ? 0 : st->eval.sgpr_init[idx];
-            masked_sgprs[masked_count++] = st->eval.sgpr_init[idx];
-            sgpr_mask &= sgpr_mask - 1;
-        }
-        key = texture_hash_words(masked_sgprs, (size_t)masked_count * sizeof(uint32_t), st->prog->hash);
-        if (reloc) reloc_key = texture_hash_words(kept_sgprs, (size_t)masked_count * sizeof(uint32_t), st->prog->hash ^ 1);
-    } else {
-        key = texture_hash_words(st->eval.sgpr_init, sizeof(st->eval.sgpr_init), st->prog->hash);
-    }
-    st->info.uniform_shift=P->uniform_compact?sh_uniform_compact_shift(st->prog->site_count):0;
     /* Equal SGPR bits can mean user data in one dispatch and a non-uniform
      * workgroup ID in another. Source-content hashes cannot distinguish it. */
     uint32_t eval_context = st->eval.group_sgpr | ((uint32_t)st->eval.group_sgprs << 8);
-    key = texture_hash_words(&st->prog->wave32,sizeof(st->prog->wave32),key) | 1;
-    key = texture_hash_words(&eval_context, sizeof(eval_context), key) | 1;
-    if (reloc) {
-        reloc_key = texture_hash_words(&st->prog->wave32,sizeof(st->prog->wave32),reloc_key) | 1;
-        reloc_key = texture_hash_words(&eval_context, sizeof(eval_context), reloc_key) | 1;
+    uint64_t reloc_key, reloc;
+    uint64_t key = eval_keys(st->prog, st->eval.sgpr_init, eval_context, &reloc_key, &reloc);
+    if (st->prog->count && (st->prog->iflags[0] & SH_IF_ANALYZED)) {
+        static int watch = -1;
+        if (watch < 0) { const char *e = getenv("PS5C_SGPR_DIFF"); g_sgpr_watch = e ? strtoull(e, NULL, 16) : 0; watch = 1; }
+        if (g_sgpr_watch && st->prog->hash == g_sgpr_watch) {
+            g_sgpr_calls++;
+            for (uint64_t m = (uint64_t)st->prog->eval_sgpr_lo | ((uint64_t)st->prog->eval_sgpr_hi << 32); m; m &= m - 1) {
+                uint32_t idx = (uint32_t)__builtin_ctzll(m);
+                if (idx < 48 && st->eval.sgpr_init[idx] != g_sgpr_prev[idx]) { g_sgpr_diff[idx]++; g_sgpr_prev[idx] = st->eval.sgpr_init[idx]; }
+            }
+        }
     }
-    bool calls = st->prog->count && (st->prog->iflags[0] & SH_IF_ANALYZED)
-                     ? (st->prog->iflags[0] & SH_IF_HAS_SWAPPC) != 0
-                     : false;
-    if (st->prog->count && !(st->prog->iflags[0] & SH_IF_ANALYZED))
-        for(uint32_t i=0;i<st->prog->count;i++) calls|=st->prog->ops[i]==SH_OP_S_SWAPPC_B64;
+    st->info.uniform_shift=P->uniform_compact?sh_uniform_compact_shift(st->prog->site_count):0;
+    bool calls = eval_has_calls(st->prog);
     const eval_entry *c = st->eval.vsrc || calls ? NULL : eval_lookup(r, st, key); /* records are not kept */
     bool relocated = false;
+    g_eval_rl_why = RL_NOSGPRS;
     if (!c && reloc_key && !st->eval.vsrc && !calls) relocated = (c = eval_relocated(r, st, reloc_key)) != NULL;
+    if (!c && P->pre && !st->eval.vsrc && !calls) c = prefetch_adopt(r, st, key);
     uint32_t n = st->prog->site_count;
     if (c && c->site_cap >= n && eval_copy_sparse(&st->eval.smem_data, &st->eval.smem_words, &st->eval.smem_cap, &st->eval.site_dirty,
                               c->smem_data, c->smem_words, n, st->eval.sgpr_init)) {
         memcpy(st->eval.site, c->site, sizeof(sh_site_value) * n);
         memcpy(st->shapes, c->shapes, sizeof(sh_site_shape) * n);
+        null_image_shapes(r, st);
         for (uint32_t i = 0; relocated && i < n; i++) { /* the V# base words of this draw */
             uint32_t b = st->prog->insts[st->prog->sites[i].inst].sbase;
             if (st->prog->sites[i].kind == SH_SITE_SBUFFER && b < 64 && (reloc >> b & 1) && st->eval.site[i].valid)
@@ -8120,7 +9240,11 @@ static bool setup_stage(renderer *r, stage_state *st) {
     }
     if (g_stats_on) {
         if (st->eval.vsrc) g_stat_eval_vsrc++;
-        else g_stat_eval_misses++;
+        else {
+            g_stat_eval_misses++;
+            g_stat_eval_lk[g_eval_lk_why < LK_N ? g_eval_lk_why : LK_OTHER]++;
+            g_stat_eval_rl[g_eval_rl_why < RL_N ? g_eval_rl_why : RL_NONE]++;
+        }
     }
     st->eval.host = guest_host_cb;
     st->eval.host_user = r;
@@ -8129,10 +9253,17 @@ static bool setup_stage(renderer *r, stage_state *st) {
     P->eval_reading = &read;
     P->eval_current = &st->eval;
     st->eval.host_sbase = 0xFF;
+    st->eval.host_soff = 0xFF;
     g_eval_base = st->prog->base;
     static int no_defer = -1;
     if (no_defer < 0) no_defer = getenv("PS5C_EVAL_NO_DEFER") != NULL;
     st->eval.defer = no_defer || st->eval.vsrc ? NULL : eval_defer_cb;
+    /* PS4 uber-shaders test material flags at every feature (Tearaway Unfolded: 75 forks and
+     * ~3400 steps an evaluation, most of the command processor's time); PS5C_EVAL_KNOWN_FORKS=1
+     * explores the untaken sides as for PS5 draws */
+    static int known_forks = -1;
+    if (known_forks < 0) known_forks = getenv("PS5C_EVAL_KNOWN_FORKS") && atoi(getenv("PS5C_EVAL_KNOWN_FORKS"));
+    st->eval.known_side_only = st->gcn && !known_forks;
     bool ok = evaluate_stage_calls(r, st);
     if (st->eval.deferred) {
         /* again when the unknown values reached a descriptor, a scalar load address or a branch */
@@ -8180,36 +9311,10 @@ static bool setup_stage(renderer *r, stage_state *st) {
                   (unsigned long long)st->prog->base, (unsigned long long)st->prog->hash,
                   (double)(pal_time_ns() - t0) / 1e6, st->prog->count, st->eval.smem_words);
     }
-    if (ok && st->gcn) gcn_descriptors(st);
     if (ok) {
         st->info.uniform_shift=P->uniform_compact?sh_uniform_compact_shift(st->prog->site_count):0;
-        static int explicit_lengths=-1;
-        if(explicit_lengths<0){const char *s=getenv("PS5C_EXPLICIT_BUFFER_LENGTHS");explicit_lengths=s && !strcmp(s,"1");}
-        for (uint32_t i = 0; i < st->prog->site_count; i++) {
-            sh_site_shape_of(st->prog, &st->eval, i, &st->shapes[i]);
-            sh_site_kind kind=st->prog->sites[i].kind;
-            uint32_t enc=st->prog->insts[st->prog->sites[i].inst].enc;
-            if(explicit_lengths && !st->shapes[i].address_map &&
-               (kind==SH_SITE_SBUFFER || (kind==SH_SITE_BUFFER && (enc==RDNA2_ENC_MUBUF || enc==RDNA2_ENC_MTBUF))))
-                st->shapes[i].buffer_length=SH_BUFFER_LENGTH;
-        }
-        static int share=-1;
-        if(share<0)share=getenv("PS5C_NO_VERTEX_SHARE")==NULL;
-        if(share && st->info.stage==SH_STAGE_VS && !st->gcn && st->prog->site_count<=256)
-            for (uint32_t i = 0; i < st->prog->site_count; i++) {
-                uint32_t first;
-                if (st->shapes[i].address_map || st->shapes[i].buffer_length || SH_U_SITE + i >= st->eval.smem_words ||
-                    !vertex_share_shift(st->prog, &st->eval, i, &first) || st->shapes[first].address_map ||
-                    (st->shapes[first].buffer_length && st->shapes[first].buffer_length != SH_BUFFER_SHIFTED) ||
-                    SH_U_SITE + first >= st->eval.smem_words) continue;
-                st->shapes[i].buffer_length = st->shapes[first].buffer_length = SH_BUFFER_SHIFTED;
-            }
-        /* direct memory reads (vk_phys_import.h): a vertex fetch may bind from below its base */
-        if(st->info.stage==SH_STAGE_VS && !st->gcn && phys_import_enabled(r))
-            for (uint32_t i = 0; i < st->prog->site_count; i++)
-                if (!st->shapes[i].address_map && !st->shapes[i].buffer_length && SH_U_SITE + i < st->eval.smem_words &&
-                    vertex_share_eligible(st->prog, &st->eval, i))
-                    st->shapes[i].buffer_length = SH_BUFFER_SHIFTED;
+        eval_post(r, st);
+        null_image_shapes(r, st);
     }
     if (!st->eval.vsrc && !calls) eval_store(r, st, key, reloc_key, ok, &read);
     if (g_stats_on) prog_stat_add(g_stat_eval_prog, st->prog, pal_time_ns() - t0);
@@ -8309,6 +9414,41 @@ static bool setup_stage(renderer *r, stage_state *st) {
     return ok;
 }
 
+/* PS4 CB fast clear (CB_COLOR_INFO.FAST_CLEAR) of a target that is resolved every frame:
+ * its CMASK stays 0 in memory ("holds the clear color", nothing here writes it back) and the
+ * game never clears the target otherwise; after its resolve, the next draw finds it holding
+ * CB_COLOR_CLEAR_WORD. Tearaway Unfolded adds alpha over its 8x MSAA scene every frame
+ * (videos drawn with alpha ONE + ONE): kept, the alpha grows and its composite divides by
+ * it (black picture). */
+#define PS4_RESOLVED_MAX 8
+static guest_addr g_ps4_resolved[PS4_RESOLVED_MAX];
+
+static bool ps4_cmask_says_cleared(renderer *r, const gpu *g, uint32_t o) {
+    guest_addr cmask = (guest_addr)gpu_reg(g, mmCB_COLOR0_CMASK + o) << 8;
+    const uint32_t *word = cmask ? (const uint32_t *)gmem_host(r->mem, cmask, 4) : NULL;
+    return word && !*word;
+}
+
+static void ps4_resolved(renderer *r, const gpu *g, guest_addr src) {
+    if (!g->gcn || !(g->gcn_fast_clear & 1) || !ps4_cmask_says_cleared(r, g, 0)) return;
+    uint32_t free_at = PS4_RESOLVED_MAX;
+    for (uint32_t k = 0; k < PS4_RESOLVED_MAX; k++) {
+        if (g_ps4_resolved[k] == src) return;
+        if (!g_ps4_resolved[k] && free_at == PS4_RESOLVED_MAX) free_at = k;
+    }
+    if (free_at < PS4_RESOLVED_MAX) g_ps4_resolved[free_at] = src;
+}
+
+static bool ps4_fast_clear_due(renderer *r, const gpu *g, uint32_t i, guest_addr base) {
+    if (!g->gcn || !((g->gcn_fast_clear >> i) & 1)) return false;
+    for (uint32_t k = 0; k < PS4_RESOLVED_MAX; k++)
+        if (g_ps4_resolved[k] == base) {
+            g_ps4_resolved[k] = 0;
+            return ps4_cmask_says_cleared(r, g, i * GPU_CB_STRIDE);
+        }
+    return false;
+}
+
 /* CB resolve (MSAA -> single sample): targets are single-sampled here, so it is a copy. */
 static void resolve(renderer *r, const gpu *g) {
     uint32_t info0 = gpu_reg(g, mmCB_COLOR0_INFO), info1 = gpu_reg(g, mmCB_COLOR0_INFO + GPU_CB_STRIDE);
@@ -8339,6 +9479,7 @@ static void resolve(renderer *r, const gpu *g) {
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     dst->gpu_written = true;
     dst->written_seq = ++r->write_seq;
+    ps4_resolved(r, g, src_addr);
 }
 
 static float f32_of(uint32_t bits) {
@@ -8577,6 +9718,7 @@ static void htile_written(vk_pipelines *P, guest_addr addr, uint64_t size, const
 
 void renderer_mem_written(renderer *r, guest_addr addr, uint64_t size) {
     pal_mutex_lock(r->lock);
+    copy_pool_drain_now(); /* queued copies take the memory as it was before this write */
     if (r->pipes) {
         htile_written(r->pipes, addr, size, "DMA", 0, true);
         copies_written(r->pipes, addr, size);
@@ -8616,6 +9758,10 @@ static bool htile_take_clear(vk_pipelines *P, const gpu *g, const vk_image *z, u
     h->end = base + size;
     bool c = h->cleared;
     h->cleared = false;
+    /* PS4: a depth surface never drawn here starts as its metadata says. Cleared tiles
+     * (HTILE ZMASK 0) read the clear value: Tearaway Unfolded draws its shadow map once,
+     * with no clear, over metadata in that state. The memory check is htile_says_cleared. */
+    if (!c && g->gcn && !z->gpu_written) c = true;
     return c;
 }
 
@@ -8836,37 +9982,7 @@ static void dcc_sample(renderer *r, vk_image *img) {
     }
 }
 
-/* The largest index of a draw (index buffer copied to `indices`): a scan the
- * compiler vectorizes, kept per epoch for the draws that share the buffer. */
-static uint32_t largest_index(vk_pipelines *P, const gpu_draw *d, const void *indices) {
-    for (uint32_t i = 0; i < INDEX_MAX_CACHE; i++) {
-        if (P->index_max[i].addr == d->index_addr && P->index_max[i].epoch == P->epoch &&
-            P->index_max[i].count == d->count && P->index_max[i].size == d->index_size)
-            return P->index_max[i].max;
-    }
-    uint32_t max = 0;
-    if (d->index_size == 1) { /* 8-bit indices: read as 32-bit, the scan ran past the buffer */
-        const uint8_t *ix = (const uint8_t *)indices;
-        uint8_t m = 0;
-        for (uint32_t i = 0; i < d->count; i++) m = ix[i] > m ? ix[i] : m;
-        max = m;
-    } else if (d->index_size == 2) {
-        const uint16_t *ix = (const uint16_t *)indices;
-        uint16_t m = 0;
-        for (uint32_t i = 0; i < d->count; i++) m = ix[i] > m ? ix[i] : m;
-        max = m;
-    } else {
-        const uint32_t *ix = (const uint32_t *)indices;
-        for (uint32_t i = 0; i < d->count; i++) max = ix[i] > max ? ix[i] : max;
-    }
-    uint32_t k = P->index_max_next++ % INDEX_MAX_CACHE;
-    P->index_max[k].addr = d->index_addr;
-    P->index_max[k].epoch = P->epoch;
-    P->index_max[k].count = d->count;
-    P->index_max[k].size = d->index_size;
-    P->index_max[k].max = max;
-    return max;
-}
+_Static_assert(COPY_CACHE_MIN == VK_INDEX_BOUNDS_MIN_BYTES, "index snapshot reuse threshold");
 
 /* PS5C_SAVE_TEXTURES=<program hash> (+ PS5C_SAVE_TEXTURES_FRAME=<flip>|@<file>): the images the
  * first draw of that pixel shader samples go to user/frames/tex_*.bmp (debugging aid: textures that
@@ -9159,7 +10275,13 @@ static bool draw_fail(uint32_t line) {
     return false;
 }
 
-static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *vs, stage_state *ps) {
+#if defined(_MSC_VER)
+#define VK_DRAW_NOINLINE __declspec(noinline)
+#else
+#define VK_DRAW_NOINLINE __attribute__((noinline))
+#endif
+static VK_DRAW_NOINLINE bool do_draw_impl(renderer *r, const gpu *g, const gpu_draw *d,
+                                       stage_state *vs, stage_state *ps, bind_list *bl) {
     uint64_t t_phase = stat_now();
     /* Diagnostic settings are process configuration, just like frame_trigger's
      * environment. Avoid taking the CRT environment lock for every target/draw.
@@ -9250,6 +10372,10 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
             static uint32_t unsupported;
             if(unsupported++<8) LOG_W(GPU,"color target format %d is sampling-only on this host",(int)rts[i]->format);
             P->skipped++;return true;
+        }
+        if (ps4_fast_clear_due(r, g, i, base)) {
+            uint32_t cw[2] = {gpu_reg(g, mmCB_COLOR0_CLEAR_WORD0 + o), gpu_reg(g, mmCB_COLOR0_CLEAR_WORD0 + o + 1)};
+            dcc_clear_image(r, rts[i], 0x20, cw);
         }
         if (((info >> 28) & 1) && !no_dcc_clear) /* DCC_ENABLE */
             dcc_target(r, g, rts[i], i, (uint64_t)w * h * vk_format_bytes(f));
@@ -9407,9 +10533,22 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         static uint32_t logged; /* PS5C_LOG_DEPTH_FRAME=<flip>: the draws of that frame */
         static int64_t frame = -2;
         static uint32_t max; /* PS5C_LOG_DEPTH_MAX: lines (400) */
+        static const char *trigger; /* PS5C_LOG_DEPTH_FRAME=@<file>: the frame after <file> appears (removed) */
+        static uint64_t checked_flip = UINT64_MAX;
         if (frame == -2) {
-            frame = getenv("PS5C_LOG_DEPTH_FRAME") ? atoll(getenv("PS5C_LOG_DEPTH_FRAME")) : -1;
+            const char *e = getenv("PS5C_LOG_DEPTH_FRAME");
+            trigger = e && e[0] == '@' ? e + 1 : NULL;
+            frame = trigger ? INT64_MAX : e ? atoll(e) : -1;
             max = getenv("PS5C_LOG_DEPTH_MAX") ? (uint32_t)atoi(getenv("PS5C_LOG_DEPTH_MAX")) : 400;
+        }
+        pal_path_info trig_info;
+        if (trigger && checked_flip != g->stats.flips) {
+            checked_flip = g->stats.flips;
+            if (pal_path_stat(trigger, &trig_info) == PS5C_OK) {
+                pal_file_remove(trigger);
+                frame = (int64_t)g->stats.flips + 1;
+                LOG_I(GPU, "depth log: frame %lld", (long long)frame);
+            }
         }
         if ((frame < 0 || (int64_t)g->stats.flips == frame) && logged++ < max)
             LOG_I(GPU, "depth: %s 0x%llx %ux%u ctl %08x render %08x clear %08x zinfo %08x vte %x zscale %08x zoffset %08x "
@@ -9655,11 +10794,10 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     if (!fb) return P->fb_count != MAX_FBS || draw_fail(__LINE__);
 
     /* resources */
-    bind_list bl;
-    bl.count = 0;
-    bl.sampled_count = 0;
-    bl.written_count = 0;
-    bl.missing = false;
+    bl->count = 0;
+    bl->sampled_count = 0;
+    bl->written_count = 0;
+    bl->missing = false;
     VkDeviceSize index_off = 0;
     /* GE adds this signed offset to both DMA indices and generated indices.
      * Passing zero repeats the first glyphs/vertices of later UI draws. */
@@ -9688,15 +10826,18 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         uint64_t size = (uint64_t)d->count * d->index_size;
         if (!index_ptr) {
             g_copy_tag = 4;
-            bool copied_ = arena_copy_guest_shared(r, d->index_addr, size, &index_off);
+            bool copied_ = arena_copy_guest_shared(r, d->index_addr, size, &index_off, true);
             g_copy_tag = 0;
             if (!copied_) return draw_fail(__LINE__);
-            if(vs->trim_vertex_buffers)vs->vertex_max = largest_index(P, d, arena_ptr(r, index_off));
+            if (vs->trim_vertex_buffers)
+                vs->vertex_max = vk_index_maximum(&P->index_bounds, arena_ptr(r, index_off),
+                                                 d->count, d->index_size, P->epoch);
         } else if (vs->trim_vertex_buffers) {
-            if (!index_entry->has_max) {
-                const void *src = gmem_host(r->mem, d->index_addr, size); /* not the write-combined copy */
-                index_entry->index_max = largest_index(P, d, src ? src : index_ptr);
-                index_entry->has_max = true;
+            /* The guest address can change after this persistent upload. The
+             * scan must describe the bytes and index width of the actual draw. */
+            if (index_entry->index_size != d->index_size) {
+                index_entry->index_max = vk_index_scan(index_ptr, d->count, d->index_size);
+                index_entry->index_size = d->index_size;
             }
             vs->vertex_max = index_entry->index_max;
         }
@@ -9728,22 +10869,22 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         vs->eval.smem_data[SH_U_MESH+1]=gpu_reg(g,mmGE_INDX_OFFSET);
         vs->eval.smem_data[SH_U_MESH+2]=0;
     }
-    bool res_ok = stage_resources(r, vs, &bl, false, NULL, NULL) && stage_resources(r, ps, &bl, false, NULL, NULL);
+    bool res_ok = stage_resources(r, vs, bl, false, NULL, NULL) && stage_resources(r, ps, bl, false, NULL, NULL);
     stat_add(ST_BUFFERS, t0);
     /* Image promotion can complete a batch while binding resources.
      * Rebuild all bindings before using an earlier view or framebuffer. */
     if (r->use_seq != target_batch) return draw_fail(__LINE__);
     if (!res_ok) {
-        if (bl.missing) P->skipped++;
-        return bl.missing || draw_fail(__LINE__);
+        if (bl->missing) P->skipped++;
+        return bl->missing || draw_fail(__LINE__);
     }
     /* Diagnostics only: storage writes cannot overlap native attachments.
      * Record the actual resources before selecting a faithful alias strategy. */
     if(log_alias) {
         static unsigned logged;
         for(uint32_t rt=0;rt<k.rt_count && logged<48;rt++) if(rts[rt])
-            for(uint32_t b=0;b<bl.count && logged<48;b++)
-                if(bl.w[b].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && bl.bound_image[b]==rts[rt]) {
+            for(uint32_t b=0;b<bl->count && logged<48;b++)
+                if(bl->w[b].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && bl->bound_image[b]==rts[rt]) {
                     int site=-1;uint32_t binding=sh_binding_count(vs->prog)+1;
                     for(uint32_t s=0;s<ps->prog->site_count;s++) {
                         if(ps->prog->sites[s].kind==SH_SITE_SMEM) continue;
@@ -9761,13 +10902,13 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
                     logged++;
                 }
     }
-    if (zimg && !depth_read_only && !depth_feedback(r, &bl, zimg)) return draw_fail(__LINE__);
+    if (zimg && !depth_read_only && !depth_feedback(r, bl, zimg)) return draw_fail(__LINE__);
     for(uint32_t i=0;i<k.rt_count;i++)
-        if(rts[i] && !depth_feedback(r,&bl,rts[i])) return draw_fail(__LINE__);
+        if(rts[i] && !depth_feedback(r,bl,rts[i])) return draw_fail(__LINE__);
     if (d->indexed && !vs->trim_vertex_buffers && vs->info.stage!=SH_STAGE_MESH && !index_ptr) {
         uint64_t size = (uint64_t)d->count * d->index_size;
         g_copy_tag = 4;
-        bool copied_ = arena_copy_guest_shared(r, d->index_addr, size, &index_off);
+        bool copied_ = arena_copy_guest_shared(r, d->index_addr, size, &index_off, true);
         g_copy_tag = 0;
         if (!copied_) return draw_fail(__LINE__);
     }
@@ -9829,21 +10970,21 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         uint64_t bytes=total*geometry_stride*4;
         if(total>UINT32_MAX || geometry_groups>r->props.limits.maxComputeWorkGroupCount[0] ||
            (d->instances?d->instances:1)>r->props.limits.maxComputeWorkGroupCount[1] ||
-           bytes>r->props.limits.maxStorageBufferRange || bl.count>=PS5C_ARRAY_COUNT(bl.w) || !arena_alloc(r,bytes,&geometry_off))return draw_fail(__LINE__);
-        geometry_total=(uint32_t)total;add_buffer(r,&bl,geometry_off,bytes);
+           bytes>r->props.limits.maxStorageBufferRange || bl->count>=PS5C_ARRAY_COUNT(bl->w) || !arena_alloc(r,bytes,&geometry_off))return draw_fail(__LINE__);
+        geometry_total=(uint32_t)total;add_buffer(r,bl,geometry_off,bytes);
         vs->mesh_output_off=geometry_off;vs->mesh_output_groups=geometry_total;
     }
     if(P->occlusion_pool && P->occlusion_count==1024)return draw_fail(__LINE__);
     t_phase = stat_phase(t_phase); /* pipeline + resources */
-    shared_image_layouts(&bl);
+    shared_image_layouts(bl);
     if (depth_read_only) {
-        for (uint32_t i = 0; i < bl.count; i++)
-            if (bl.bound_image[i] == zimg &&
-                bl.w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                bl.img[i].imageLayout = depth_layout;
+        for (uint32_t i = 0; i < bl->count; i++)
+            if (bl->bound_image[i] == zimg &&
+                bl->w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                bl->img[i].imageLayout = depth_layout;
     }
-    if (!descriptor_plan_confirm(&bindings, &bl)) {
-        if (bindings.count != bl.count) return true;
+    if (!descriptor_plan_confirm(&bindings, bl)) {
+        if (bindings.count != bl->count) return true;
         e = find_pipe(r, descriptor_base_key);
         if (!e || e->failed) return true;
         if (!e->pipe) {
@@ -9858,43 +10999,43 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     }
     VkDescriptorSet set = e->push ? VK_NULL_HANDLE : alloc_set(r, e->dsl, e->update_after_bind);
     if (!set && !e->push) return draw_fail(__LINE__);
-    if (set) update_descriptor_set(r, set, &bl, &bindings);
+    if (set) update_descriptor_set(r, set, bl, &bindings);
     t_phase = stat_phase(t_phase); /* descriptor set */
 
     if (tex_save_wanted(g, ps->prog))
-        for (uint32_t i = 0; i < bl.sampled_count && g_tex_save_count < PS5C_ARRAY_COUNT(g_tex_save); i++) {
+        for (uint32_t i = 0; i < bl->sampled_count && g_tex_save_count < PS5C_ARRAY_COUNT(g_tex_save); i++) {
             /* Blur/effect shaders can bind one image at many sites. Save it
              * once so a single diagnostic does not exhaust the disk budget. */
             bool seen=false;
-            for(uint32_t j=0;j<g_tex_save_count;j++) seen|=g_tex_save[j]==bl.sampled[i];
-            if(!seen) g_tex_save[g_tex_save_count++] = bl.sampled[i];
+            for(uint32_t j=0;j<g_tex_save_count;j++) seen|=g_tex_save[j]==bl->sampled[i];
+            if(!seen) g_tex_save[g_tex_save_count++] = bl->sampled[i];
         }
     /* layouts: sampled images, then targets */
     VkCommandBuffer cmd = r->cmd;
     /* GENERAL-to-GENERAL storage hazards still emit barriers. They cannot be
      * recorded inside our render pass (which has no self-dependency). */
-    bool need_barrier = bl.written_count != 0 || k.mesh==2;
-    for (uint32_t i = 0; i < bl.sampled_count; i++)
-        need_barrier |= bl.sampled[i]->layout != (depth_read_only && bl.sampled[i] == zimg ? depth_layout :
-                                                    image_written(&bl, bl.sampled[i]) ? VK_IMAGE_LAYOUT_GENERAL :
+    bool need_barrier = bl->written_count != 0 || k.mesh==2;
+    for (uint32_t i = 0; i < bl->sampled_count; i++)
+        need_barrier |= bl->sampled[i]->layout != (depth_read_only && bl->sampled[i] == zimg ? depth_layout :
+                                                    image_written(bl, bl->sampled[i]) ? VK_IMAGE_LAYOUT_GENERAL :
                                                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    for (uint32_t i = 0; i < bl.written_count; i++) need_barrier |= bl.written[i]->layout != VK_IMAGE_LAYOUT_GENERAL;
+    for (uint32_t i = 0; i < bl->written_count; i++) need_barrier |= bl->written[i]->layout != VK_IMAGE_LAYOUT_GENERAL;
     for (uint32_t i = 0; i < k.rt_count; i++) need_barrier |= rts[i] && rts[i]->layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     need_barrier |= zimg && zimg->layout != depth_layout;
     if (need_barrier) end_pass(r);
     VkPipelineStageFlags draw_shader_stages=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
         (k.mesh==1 ? VK_PIPELINE_STAGE_MESH_SHADER_BIT_NV : k.mesh==2 ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-    for (uint32_t i = 0; i < bl.sampled_count; i++) {
-        if (image_written(&bl, bl.sampled[i]) || (depth_read_only && bl.sampled[i] == zimg)) continue;
-        vk_barrier(cmd, bl.sampled[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+    for (uint32_t i = 0; i < bl->sampled_count; i++) {
+        if (image_written(bl, bl->sampled[i]) || (depth_read_only && bl->sampled[i] == zimg)) continue;
+        vk_barrier(cmd, bl->sampled[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                    draw_shader_stages);
     }
-    for (uint32_t i = 0; i < bl.written_count; i++) {
-        vk_barrier(cmd, bl.written[i], VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    for (uint32_t i = 0; i < bl->written_count; i++) {
+        vk_barrier(cmd, bl->written[i], VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                    draw_shader_stages);
-        bl.written[i]->gpu_written = true;
-        texture_gpu_write(r,bl.written[i]);
-        bl.written[i]->written_seq = ++r->write_seq;
+        bl->written[i]->gpu_written = true;
+        texture_gpu_write(r,bl->written[i]);
+        bl->written[i]->written_seq = ++r->write_seq;
     }
     uint64_t rt_prev[GPU_MAX_RENDER_TARGETS] = {0}; /* for vk_image_note_draw below */
     for (uint32_t i = 0; i < k.rt_count; i++) {
@@ -9934,7 +11075,7 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     }
     if(k.mesh==2) {
         vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,e->prepass);
-        bind_set(r,cmd,VK_PIPELINE_BIND_POINT_COMPUTE,e,set,&bl,&bindings);
+        bind_set(r,cmd,VK_PIPELINE_BIND_POINT_COMPUTE,e,set,bl,&bindings);
         /* Include geometry expansion, not just its later raster replay.
          * It is reported as CS at the guest GS address (no pixel shader). */
         int geometry_prof = prof_start(r);
@@ -10138,7 +11279,9 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
         float constants[4];memcpy(constants,bits,sizeof(constants));
         vkCmdSetBlendConstants(cmd,constants);
     }
-    bind_set(r, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e, set, &bl, &bindings);
+    t_phase = stat_phase(t_phase); /* pipeline, dynamic state, blend constants */
+    bind_set(r, cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e, set, bl, &bindings);
+    t_phase = stat_phase(t_phase); /* descriptor set */
     uint32_t instances = d->instances ? d->instances : 1;
     int occlusion_i=-1;
     /* DB_COUNT_CONTROL at byte register 0x28004: bit0 disables increments. */
@@ -10227,6 +11370,25 @@ static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *v
     P->draws++;
     return true;
 }
+
+static VK_DRAW_NOINLINE bool do_draw_stack(renderer *r, const gpu *g, const gpu_draw *d,
+                                        stage_state *vs, stage_state *ps) {
+    bind_list bl;
+    return do_draw_impl(r, g, d, vs, ps, &bl);
+}
+
+static bool do_draw(renderer *r, const gpu *g, const gpu_draw *d, stage_state *vs, stage_state *ps) {
+    vk_pipelines *P = r->pipes;
+    if (!P->draw_bindings_reuse || P->draw_bindings_busy)
+        return do_draw_stack(r, g, d, vs, ps);
+    if (!P->draw_bindings) P->draw_bindings = malloc(sizeof(*P->draw_bindings));
+    if (!P->draw_bindings) return do_draw_stack(r, g, d, vs, ps);
+    P->draw_bindings_busy = true;
+    bool ok = do_draw_impl(r, g, d, vs, ps, P->draw_bindings);
+    P->draw_bindings_busy = false;
+    return ok;
+}
+#undef VK_DRAW_NOINLINE
 
 /* Keep diagnostic draws on the same retry path as ordinary rendering.
  * A handled pipeline failure also returns true from do_draw; only the
@@ -10486,6 +11648,7 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
     g_trace_flip = g_flow_flip = g->stats.flips;
     pal_mutex_lock(r->lock);
     if (!vk_guest_access_begin(r)) { pal_mutex_unlock(r->lock); return; }
+    ps4_programs(r->pipes, g);
     vk_cpu_prepare(r,g->stats.flips);
     uint64_t t_draw = stat_now();
     vk_begin(r);
@@ -10546,6 +11709,7 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
                                             gpu_reg(g, mmCB_TARGET_MASK));
     guest_addr ps_addr = gpu_reg_addr256(g, mmSPI_SHADER_PGM_LO_PS);
     const sh_program *guest_ps = clear_only || g->gcn ? NULL : get_radv_pixel_program(r, ps_addr, gpu_reg(g, mmSPI_SHADER_USER_DATA_PS_0 + 3));
+    bool ps_cached = !clear_only && !guest_ps; /* a program of get_program's (prefetch_note) */
     if (!clear_only && !guest_ps) guest_ps = get_program(r, ps_addr);
     /* Storage/atomic instructions are observable even without color exports.
      * Keep such a PS; DB metadata alone must not erase its memory effects. */
@@ -10662,6 +11826,13 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
         uint32_t ps_user = ((ps_rsrc2 >> 1) & 0x1F) | ((ps_rsrc2 >> 22) & 0x20);
         init_sgprs(&vs->eval, g, 8, mmSPI_SHADER_USER_DATA_GS_0, vs_user);
         vs->gcn = ps->gcn = g_gcn = g->gcn;
+        if (g->gcn && r->image_limit < VK_MAX_IMAGES && !getenv("PS5C_IMAGE_CACHE_LIMIT")) {
+            /* PS4 games keep more textures alive than 512 slots (LEGO City Undercover ~1900 entering a
+             * level): each new one evicted another, 100k images recreated, loading at 2 frames/s. Every
+             * slot; the memory budget still bounds them. PS5C_IMAGE_CACHE_LIMIT=<n> keeps its value. */
+            r->image_limit = VK_MAX_IMAGES;
+            LOG_I(GPU, "image cache: %u active slots (PS4 game)", r->image_limit);
+        }
         if (g->gcn) {
             /* a PS4 VS (hardware VS stage): user data from s0, no merged-wave SGPRs */
             uint32_t vs_rsrc2 = gpu_reg(g, GPU_GCN_RSRC2_VS);
@@ -10833,6 +12004,8 @@ void renderer_draw(renderer *r, const gpu *g, const gpu_draw *d) {
         ps->info.fp16_overflow = sh_fp16_overflow_bit(SH_STAGE_PS, gpu_reg(g, mmSPI_SHADER_PGM_RSRC1_PS));
         t_phase = stat_phase(t_phase); /* stage info */
         bool vs_ok = setup_stage(r, vs), ps_ok = vs_ok && setup_stage(r, ps);
+        if (ps_ok && ps_cached && ps->prog == guest_ps && !ps->linked_program)
+            prefetch_note(r->pipes, g->gcn ? g->gcn_ps : ps_addr, ps->prog, g->gcn);
         t_phase = stat_phase(t_phase); /* setup_stage */
         if (!ps_ok) {
             static uint32_t warned;
@@ -11095,29 +12268,48 @@ static bool dynamic_copy_read_ranges(renderer *r,const sh_program *p,sh_dynamic_
 
 /* Finite resource-table dispatches are isolated: direct writes become visible
  * before releasing the mapping pin, and no cached arena copy survives them. */
+typedef struct dynamic_dispatch_prepare {
+    renderer *r;
+    bool pinned;
+} dynamic_dispatch_prepare;
+
+static bool prepare_dynamic_dispatch(void *context) {
+    dynamic_dispatch_prepare *prepare = context;
+    renderer *r = prepare->r;
+    end_pass(r);
+    sync_batch(r);
+    vk_begin(r);
+    prepare->pinned = gmem_retain_mappings(r->mem);
+    return prepare->pinned;
+}
+
 static bool dynamic_dispatch(renderer *r,stage_state *cs,uint32_t x,uint32_t y,uint32_t z) {
     if(!r->host_import_align)return false;
     vk_pipelines *P=r->pipes;
-    bool executed=false,pinned=false,recorded=false,shapes_saved=false;
+    bool executed=false,recorded=false,shapes_saved=false;
+    dynamic_dispatch_prepare prepare={.r=r};
     static uint32_t logged,rejected;
     struct {guest_addr addr;uint32_t site,bytes,before[4];} trace[8];
     uint32_t trace_count=0;
     sh_dynamic_plan *plan=calloc(1,sizeof(*plan));
-    sh_site_shape *saved=malloc(cs->prog->site_count*sizeof(*saved));
-    vk_buffer *buffers=calloc(cs->prog->site_count+1,sizeof(*buffers));
-    vk_buffer *read_device=calloc(cs->prog->site_count,sizeof(*read_device));
+    sh_site_shape *saved=NULL;
+    vk_buffer *buffers=NULL,*read_device=NULL;
     uint64_t read_upload_bytes=0;
+    bind_list *bl=NULL,*images=NULL;
+    stage_state *image_stage=NULL;
+    if(!plan || !sh_dynamic_plan_build_with_prepare(cs->prog,&cs->eval,&cs->info,r->mem,plan,
+                                                    prepare_dynamic_dispatch,&prepare))goto done;
+    saved=malloc(cs->prog->site_count*sizeof(*saved));
+    buffers=calloc(cs->prog->site_count+1,sizeof(*buffers));
+    read_device=calloc(cs->prog->site_count,sizeof(*read_device));
+    bl=calloc(1,sizeof(*bl));
+    images=calloc(1,sizeof(*images));
+    image_stage=calloc(1,sizeof(*image_stage));
+    if(!saved || !buffers || !read_device || !bl || !images || !image_stage)goto done;
     static int read_vram=-1;
     if(read_vram<0)read_vram=getenv("PS5C_DYNAMIC_READ_VRAM") && atoi(getenv("PS5C_DYNAMIC_READ_VRAM"));
-    bind_list *bl=calloc(1,sizeof(*bl));
-    bind_list *images=calloc(1,sizeof(*images));
-    stage_state *image_stage=calloc(1,sizeof(*image_stage));
-    if(!plan || !saved || !buffers || !read_device || !bl || !images || !image_stage)goto done;
     memcpy(saved,cs->shapes,cs->prog->site_count*sizeof(*saved));
     shapes_saved=true;
-    end_pass(r);sync_batch(r);vk_begin(r);
-    if(!(pinned=gmem_retain_mappings(r->mem)))goto done;
-    if(!sh_dynamic_plan_build(cs->prog,&cs->eval,&cs->info,r->mem,plan))goto done;
     if(logged<16 && getenv("PS5C_DYNAMIC_PLAN_TRACE"))
         for(uint32_t s=0;s<cs->prog->site_count && trace_count<PS5C_ARRAY_COUNT(trace);s++) {
             const sh_dynamic_span *span=plan->spans+s;
@@ -11302,11 +12494,11 @@ done:
     }
     if(buffers)for(uint32_t s=0;s<cs->prog->site_count+1;s++)vk_buffer_destroy(r,buffers+s);
     if(read_device)for(uint32_t s=0;s<cs->prog->site_count;s++)vk_buffer_destroy(r,read_device+s);
-    if(pinned)gmem_unpin_mappings(r->mem);
+    if(prepare.pinned)gmem_unpin_mappings(r->mem);
     if(shapes_saved)memcpy(cs->shapes,saved,cs->prog->site_count*sizeof(*saved));
     if(plan)sh_dynamic_plan_free(plan);
     free(plan);free(saved);free(buffers);free(read_device);free(bl);free(images);free(image_stage);
-    if(recorded || pinned)vk_begin(r); /* completed fence; forget copies/evaluations of directly written bytes */
+    if(recorded || prepare.pinned)vk_begin(r); /* completed fence; forget copies/evaluations of directly written bytes */
     return executed;
 }
 
@@ -11532,6 +12724,7 @@ static bool do_dispatch_impl(renderer *r,stage_state *cs,uint32_t x,uint32_t y,u
     bl->missing = false;
     bool stored = false, overflow = false;
     uint32_t wb_before = P->wb_count;
+    g_direct_store_bound = false;
     bool resources_ok = stage_resources(r, cs, bl, true, &stored, &overflow);
     if(cs->footprint_count && !footprint_sources_current(r,cs)) {
         /* A mutable source changed while staging. Discard this preparation:
@@ -11588,6 +12781,12 @@ static bool do_dispatch_impl(renderer *r,stage_state *cs,uint32_t x,uint32_t y,u
         bl->written[i]->gpu_written = true;
         texture_gpu_write(r,bl->written[i]);
         bl->written[i]->written_seq = ++r->write_seq;
+    }
+    if (g_direct_store_bound) {
+        /* it writes guest memory that earlier work of the batch may still read (write after read) */
+        vkCmdPipelineBarrier(r->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
+                             0, NULL, 0, NULL);
+        g_direct_store_bound = false;
     }
     vkCmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e->pipe);
     bind_set(r, r->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e, set, bl, &bindings);
@@ -11987,6 +13186,7 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
     g_trace_flip = g_flow_flip = g->stats.flips;
     pal_mutex_lock(r->lock);
     if (!vk_guest_access_begin(r)) { pal_mutex_unlock(r->lock); return; }
+    ps4_programs(r->pipes, g);
     large_import_cache_drop(r);
     r->pipes->wave_operation++;
     uint64_t t_disp = stat_now();
@@ -12007,12 +13207,16 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
     stage_state *cs = get_dispatch_stage(r->pipes, reuse_stage);
     sh_program *wave_program = NULL;
     if (cs) cs->prog = get_program(r, gpu_reg_addr256(g, mmCOMPUTE_PGM_LO));
-    /* Experimental packet-driven wave selection. Do not modify the shared
-     * analyzed program: graphics and pipeline workers may still use it. */
+    /* In a compaction shader, a subtract with borrow into VCC_HI can be
+     * part of isolating the first active lane of a wave64. Use the dispatch
+     * mode to distinguish that operation from a Wave32 scalar temporary. */
     const char *wave_packet = getenv("PS5C_CS_WAVE_FROM_PACKET");
-    if (cs && cs->prog && wave_packet &&
-        (!strcmp(wave_packet,"1") || strtoull(wave_packet,NULL,16)==cs->prog->hash)) {
-        bool wave32 = (gpu_reg(g, mmCOMPUTE_DISPATCH_INITIATOR) & 0x8000u) != 0;
+    const uint32_t initiator = gpu_reg(g, mmCOMPUTE_DISPATCH_INITIATOR);
+    bool packet_compaction = cs && cs->prog && !g->gcn && (initiator & 1u) && cs->prog->wave_compaction;
+    /* a PS4 geometry shader pass (gpu_cp) is GCN code: wave64, its ring addressing uses lanes 0..63 */
+    if (cs && cs->prog && (g->gcn_ring_pass || (wave_packet ?
+        (!strcmp(wave_packet,"1") || strtoull(wave_packet,NULL,16)==cs->prog->hash) : packet_compaction))) {
+        bool wave32 = !g->gcn_ring_pass && (initiator & 0x8000u) != 0;
         cs->wave_locked=true;cs->wave32_expected=wave32;
         if (wave32 != cs->prog->wave32) {
             const sh_program *variant=program_with_wave(r,cs->prog,wave32,g->stats.flips,&wave_program);
@@ -12066,11 +13270,10 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
             }
             paired_count=count;memcpy(paired_values,values,sizeof(values));
         }
-        bool paired_wanted=false;
+        uint64_t threads = (uint64_t)cs->info.local_size[0] * cs->info.local_size[1] * cs->info.local_size[2];
+        bool paired_wanted = !paired && packet_compaction && cs->wave_locked && threads == 64;
         for(uint32_t i=0;i<paired_count;i++)paired_wanted|=paired_values[i]==1 || paired_values[i]==cs->prog->hash;
-        if(paired && paired_wanted &&
-           !cs->prog->wave32 && r->cs_subgroup==32) {
-            uint64_t threads=(uint64_t)cs->info.local_size[0]*cs->info.local_size[1]*cs->info.local_size[2];
+        if(paired_wanted && !cs->prog->wave32 && r->cs_subgroup==32) {
             bool safe=true;
             for(uint32_t i=0;i<cs->prog->count;i++) {
                 uint32_t op=cs->prog->ops[i];
@@ -12103,7 +13306,6 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
         }
         if(native && (native_selection==1 || native_selection==cs->prog->hash) &&
            cs->prog->wave32 && r->cs_subgroup==32) {
-            uint64_t threads=(uint64_t)cs->info.local_size[0]*cs->info.local_size[1]*cs->info.local_size[2];
             bool safe=true;
             for(uint32_t i=0;i<cs->prog->count;i++) {
                 uint32_t op=cs->prog->ops[i];
@@ -12116,6 +13318,7 @@ void renderer_dispatch(renderer *r, const gpu *g, uint32_t x, uint32_t y, uint32
         cs->info.barrier_prefix = prefix && (!strcmp(prefix,"1") || strtoull(prefix,NULL,16)==cs->prog->hash);
         const char *leaf_calls=getenv("PS5C_SHADER_LEAF_INLINE");
         cs->info.mesh_indexed=cs->info.cs_wave_mode==2 && cs->prog->function_count>1 && leaf_calls && !strcmp(leaf_calls,"1")?SH_LEAF_CALL_INLINE:0;
+        if(g->gcn_ring_pass)cs->info.mesh_indexed|=SH_GCN_SWIZZLE; /* a PS4 geometry shader pass (gpu_cp) */
         const char *join_prefix=getenv("PS5C_NGG_JOIN_PREFIX");
         if(cs->info.cs_wave_mode==2 && join_prefix && (!strcmp(join_prefix,"1") || !strcmp(join_prefix,"2"))) {
             cs->info.mesh_indexed|=SH_JOIN_PREFIX;cs->info.barrier_prefix=true;

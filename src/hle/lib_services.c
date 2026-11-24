@@ -330,11 +330,14 @@ static void np_ent_get_addcont_info(hle_call *c) {
 
 /* Np state callbacks: sceNpRegisterStateCallbackA(cb(user, state, arg), arg) returns a
  * callback id. Signed out they are never called; with [psn] conta the next
- * sceNpCheckCallback reports the signed-in state once to each (conta=2). */
+ * sceNpCheckCallback reports the signed-in state once to each (conta=2).
+ * PS4's sceNpRegisterStateCallback(cb(user, state, const SceNpId *, arg), arg): the next
+ * sceNpCheckCallback reports the user's current state once, signed out too (Tearaway
+ * Unfolded registers one); no SceNpId is given. */
 #define NP_STATE_CBS 8
 static struct {
     guest_addr fn, arg;
-    bool told;
+    bool told, ps4;
 } g_np_cbs[NP_STATE_CBS];
 static uint32_t g_np_cb_count;
 
@@ -347,9 +350,16 @@ static void np_register_state_callback(hle_call *c) {
     if (g_np_cb_count < NP_STATE_CBS) {
         g_np_cbs[g_np_cb_count].fn = fn;
         g_np_cbs[g_np_cb_count].arg = hle_arg_ptr(c, 1);
+        g_np_cbs[g_np_cb_count].ps4 = false;
         g_np_cbs[g_np_cb_count++].told = false;
     }
     hle_ret_s32(c, (int32_t)g_np_cb_count);
+}
+
+static void np_register_state_callback_ps4(hle_call *c) {
+    uint32_t before = g_np_cb_count;
+    np_register_state_callback(c);
+    if (g_np_cb_count > before) g_np_cbs[before].ps4 = true;
 }
 
 static void np_unregister_state_callback(hle_call *c) {
@@ -360,12 +370,14 @@ static void np_unregister_state_callback(hle_call *c) {
 
 /* int sceNpCheckCallback(void) */
 static void np_check_callback(hle_call *c) {
-    for (uint32_t i = 0; np_signed_in() && i < g_np_cb_count; i++) {
-        if (!g_np_cbs[i].fn || g_np_cbs[i].told) continue;
+    for (uint32_t i = 0; i < g_np_cb_count; i++) {
+        if (!g_np_cbs[i].fn || g_np_cbs[i].told || (!g_np_cbs[i].ps4 && !np_signed_in())) continue;
         g_np_cbs[i].told = true;
-        LOG_I(HLE, "Np state callback: signed in");
+        uint32_t state = np_signed_in() ? NP_STATE_SIGNED_IN : NP_STATE_SIGNED_OUT;
+        LOG_I(HLE, "Np state callback: signed %s", state == NP_STATE_SIGNED_IN ? "in" : "out");
         uint64_t rax;
-        runtime_call_nested(c->rt, g_np_cbs[i].fn, USER_ID, NP_STATE_SIGNED_IN, g_np_cbs[i].arg, &rax);
+        if (g_np_cbs[i].ps4) runtime_call_nested4(c->rt, g_np_cbs[i].fn, USER_ID, state, 0, g_np_cbs[i].arg, &rax);
+        else runtime_call_nested(c->rt, g_np_cbs[i].fn, USER_ID, state, g_np_cbs[i].arg, &rax);
     }
     hle_ret_s32(c, 0);
 }
@@ -738,6 +750,11 @@ static void pad_get_trigger_effect_state(hle_call *c) {
 }
 
 
+/* int scePadSetAngularVelocityBiasCorrectionState(int handle, bool enable): our motion data has no bias */
+static void pad_set_bias_correction(hle_call *c) {
+    hle_ret_s32(c, player_of_handle(hle_arg_s32(c, 0)) < 0 ? PAD_ERR_INVALID_HANDLE : 0);
+}
+
 /* int scePadSetMotionSensorState(int handle, bool enable) */
 static void pad_set_motion(hle_call *c) {
     int32_t player=player_of_handle(hle_arg_s32(c,0));
@@ -971,6 +988,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libScePad", "scePadReadState", pad_read_state),
     HLE_FUNC_ENTRY("libScePad", "scePadRead", pad_read),
     HLE_FUNC_ENTRY("libScePad", "scePadSetMotionSensorState", pad_set_motion),
+    HLE_FUNC_ENTRY("libScePad", "scePadSetAngularVelocityBiasCorrectionState", pad_set_bias_correction),
     HLE_FUNC_ENTRY("libScePad", "scePadSetLightBar", pad_set_light_bar),
     HLE_FUNC_ENTRY("libScePad", "scePadResetLightBar", pad_reset_light_bar),
     HLE_FUNC_ENTRY("libScePad", "scePadSetVibration", pad_set_vibration),
@@ -978,6 +996,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libScePad", "scePadSetTriggerEffect", pad_ok),
     HLE_FUNC_ENTRY("libScePad", "scePadResetOrientation", pad_ok),
     HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceGetStatus", ss_get_status),
+    HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceDisableMediaPlay", pad_ok),
+    HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceReenableMediaPlay", pad_ok),
     HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceGetDisplaySafeAreaInfo", ss_get_display_safe_area_info),
     HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceParamGetInt", ss_param_get_int),
     HLE_FUNC_ENTRY("libSceSystemService", "sceSystemServiceGetHdrToneMapLuminance", ss_get_hdr_tone_map_luminance),
@@ -996,6 +1016,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceUserServiceForNpToolkit", "sceUserServiceRegisterEventCallback", np_register_callback),
     HLE_FUNC_ENTRY("libSceNpManager", "sceNpSetNpTitleId", np_ok),
     HLE_FUNC_ENTRY("libSceNpManager", "sceNpRegisterStateCallbackA", np_register_state_callback),
+    HLE_FUNC_ENTRY("libSceNpManager", "sceNpRegisterStateCallback", np_register_state_callback_ps4),
+    HLE_FUNC_ENTRY("libSceNpManager", "sceNpUnregisterStateCallback", np_unregister_state_callback),
     HLE_FUNC_ENTRY("libSceNpManager", "sceNpUnregisterStateCallbackA", np_unregister_state_callback),
     HLE_FUNC_ENTRY("libSceNpManager", "sceNpRegisterNpReachabilityStateCallback", np_register_callback),
     HLE_FUNC_ENTRY("libSceNpManager", "sceNpUnregisterNpReachabilityStateCallback", np_ok),

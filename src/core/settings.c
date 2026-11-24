@@ -14,6 +14,11 @@
 static ini *g_global, *g_game;
 static char *g_param; /* the game's param.json text */
 
+/* SCE language codes and the corresponding param.json locales. */
+static const char *const k_locales[] = {"ja-JP", "en-US", "fr-FR", "es-ES", "de-DE", "it-IT", "nl-NL", "pt-PT",
+    "ru-RU", "ko-KR", "zh-Hant", "zh-Hans", "fi-FI", "sv-SE", "da-DK", "no-NO", "pl-PL", "pt-BR", "en-GB",
+    "tr-TR", "es-419", "ar-AE", "fr-CA", "cs-CZ", "hu-HU", "el-GR", "ro-RO", "th-TH", "vi-VN", "id-ID", "uk-UA"};
+
 static ini *read_ini(const char *path) {
     uint8_t *data;
     uint64_t size;
@@ -23,13 +28,88 @@ static ini *read_ini(const char *path) {
     return f;
 }
 
+/* Appends s to the JSON text being built, as a quoted string */
+static void json_append_string(char *out, size_t *n, const char *s, size_t len) {
+    out[(*n)++] = '"';
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch == '"' || ch == 0x5c) out[(*n)++] = 0x5c;
+        out[(*n)++] = ch < 0x20 ? ' ' : (char)ch;
+    }
+    out[(*n)++] = '"';
+    out[*n] = 0;
+}
+
+/* A PS4 game has sce_sys/param.sfo instead of param.json: its strings become the
+ * param.json fields the emulator reads (titleId, contentId, titleName, and the
+ * localizedParameters titles: TITLE_<nn> uses the same SCE language numbers). The
+ * window caption showed the executable's name (KIN.Pink.Clang.SubmissionNoEHASLR). */
+static char *param_from_sfo(const uint8_t *d, uint64_t size) {
+    if (size < 20 || memcmp(d, "\0PSF", 4)) return NULL;
+    uint32_t keys, data, count;
+    memcpy(&keys, d + 8, 4);
+    memcpy(&data, d + 12, 4);
+    memcpy(&count, d + 16, 4);
+    if (count > 4096 || 20 + (uint64_t)count * 16 > keys || keys > data || data > size) return NULL;
+    size_t cap = 65536, n = 0;
+    char *out = (char *)malloc(cap), *loc = (char *)malloc(cap);
+    size_t ln = 0;
+    if (!out || !loc) {
+        free(out);
+        free(loc);
+        return NULL;
+    }
+    n = (size_t)snprintf(out, cap, "{");
+    ln = (size_t)snprintf(loc, cap, "\"localizedParameters\": {\"defaultLanguage\": \"en-US\"");
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *e = d + 20 + (uint64_t)i * 16;
+        uint16_t key_off, fmt;
+        uint32_t len, off;
+        memcpy(&key_off, e, 2);
+        memcpy(&fmt, e + 2, 2);
+        memcpy(&len, e + 4, 4);
+        memcpy(&off, e + 12, 4);
+        if (key_off >= data - keys || (uint64_t)data + off + len > size || fmt != 0x0204 || !len) continue;
+        const char *key = (const char *)d + keys + key_off, *val = (const char *)d + data + off;
+        const char *end = memchr(val, 0, len);
+        if (!memchr(key, 0, data - keys - key_off) || !end || end == val || end - val > 4096) continue;
+        size_t text_len = (size_t)(end - val);
+        /* Account for escaping and both closing braces before appending. */
+        if (n + ln + 2 * text_len + 64 >= cap) continue;
+        const char *field = !strcmp(key, "TITLE_ID") ? "titleId" : !strcmp(key, "CONTENT_ID") ? "contentId"
+                          : !strcmp(key, "TITLE") ? "titleName" : NULL;
+        if (field) {
+            n += (size_t)snprintf(out + n, cap - n, "\"%s\": ", field);
+            json_append_string(out, &n, val, text_len);
+            n += (size_t)snprintf(out + n, cap - n, ", ");
+        }
+        int lang = -1;
+        if (!strncmp(key, "TITLE_", 6) && key[6] >= '0' && key[6] <= '9' && key[7] >= '0' && key[7] <= '9' && !key[8])
+            lang = (key[6] - '0') * 10 + (key[7] - '0');
+        if (lang >= 0 && lang < (int)PS5C_ARRAY_COUNT(k_locales)) {
+            ln += (size_t)snprintf(loc + ln, cap - ln, ", \"%s\": {\"titleName\": ", k_locales[lang]);
+            json_append_string(loc, &ln, val, text_len);
+            ln += (size_t)snprintf(loc + ln, cap - ln, "}");
+        }
+    }
+    snprintf(out + n, cap - n, "%s}}", loc);
+    free(loc);
+    return out;
+}
+
 static char *read_param(const char *game_dir) {
     char path[700];
-    snprintf(path, sizeof(path), "%s%ssce_sys/param.json", game_dir,
-             *game_dir && !strchr("/\\", game_dir[strlen(game_dir) - 1]) ? "/" : "");
+    const char *sep = *game_dir && !strchr("/\\", game_dir[strlen(game_dir) - 1]) ? "/" : "";
+    snprintf(path, sizeof(path), "%s%ssce_sys/param.json", game_dir, sep);
     uint8_t *data;
     uint64_t size;
-    if (pal_file_read_all(path, &data, &size) != PS5C_OK) return NULL;
+    if (pal_file_read_all(path, &data, &size) != PS5C_OK) {
+        snprintf(path, sizeof(path), "%s%ssce_sys/param.sfo", game_dir, sep);
+        if (pal_file_read_all(path, &data, &size) != PS5C_OK) return NULL;
+        char *json = param_from_sfo(data, size);
+        free(data);
+        return json;
+    }
     char *text = (char *)realloc(data, size + 1);
     if (!text) {
         free(data);
@@ -112,19 +192,19 @@ static bool localized_title(const char *lang, char *out, size_t cap) {
     const char *lp = g_param ? strstr(g_param, "\"localizedParameters\"") : NULL;
     char quoted[24];
     snprintf(quoted, sizeof(quoted), "\"%s\"", lang);
-    const char *at = lp ? strstr(lp, quoted) : NULL;
-    if (!at) return false;
-    at = strchr(at + strlen(quoted), ':');
-    while (at && (*at == ':' || *at == ' ' || *at == 9 || *at == 10 || *at == 13)) at++;
-    return at && *at == '{' && string_in_object(at + 1, "titleName", out, cap);
+    size_t length = strlen(quoted);
+    while (lp && (lp = strstr(lp, quoted))) {
+        lp += length;
+        const char *at = lp + strspn(lp, " \t\r\n");
+        /* A locale can also appear as the value of defaultLanguage. */
+        if (*at++ != ':') continue;
+        at += strspn(at, " \t\r\n");
+        if (*at == '{') return string_in_object(at + 1, "titleName", out, cap);
+    }
+    return false;
 }
 
 bool settings_param_title(int32_t language, char *out, size_t cap) {
-    /* SCE language codes and the locales of param.json */
-    static const char *const k_locales[] = {"ja-JP", "en-US", "fr-FR", "es-ES", "de-DE", "it-IT", "nl-NL", "pt-PT",
-                                            "ru-RU", "ko-KR", "zh-Hant", "zh-Hans", "fi-FI", "sv-SE", "da-DK", "no-NO",
-                                            "pl-PL", "pt-BR", "en-GB", "tr-TR", "es-419", "ar-AE", "fr-CA", "cs-CZ",
-                                            "hu-HU", "el-GR", "ro-RO", "th-TH", "vi-VN", "id-ID", "uk-UA"};
     char def[24] = "";
     const char *lp = g_param ? strstr(g_param, "\"localizedParameters\"") : NULL;
     if (lp) string_in_object(lp, "defaultLanguage", def, sizeof(def));

@@ -156,6 +156,121 @@ static void gesture_no_events(hle_call *c, uint32_t count_arg) {
 static void gesture_get_touch_events(hle_call *c) { gesture_no_events(c, 4); }
 static void gesture_get_primitive_touch_events(hle_call *c) { gesture_no_events(c, 3); }
 
+/* int sceGameLiveStreamingGetProgramInfo(info *): 0x134C bytes, all zero (no broadcast
+ * program); size and error code as in AnyPS5 */
+static void live_streaming_program_info(hle_call *c) {
+    hle_ret_s32(c, clear_arg(c, 0, 0x134C) ? 0 : (int32_t)0x80A00002);
+}
+
+/* ---- libSceLoginDialog: offline, the PSN sign-in ends at once as cancelled (AnyPS5) ---- */
+
+#define LOGIN_ERR_NOT_INITIALIZED ((int32_t)0x81340001)
+#define LOGIN_ERR_ALREADY_INITIALIZED ((int32_t)0x81340002)
+#define LOGIN_ERR_INVALID_ARGUMENT ((int32_t)0x81340003)
+#define LOGIN_ERR_BUSY ((int32_t)0x81340005)
+#define LOGIN_ERR_INVALID_USER ((int32_t)0x81340007)
+enum { CD_STATUS_NONE, CD_STATUS_INITIALIZED, CD_STATUS_RUNNING, CD_STATUS_FINISHED };
+static volatile int32_t g_login_status;
+
+static void login_initialize(hle_call *c) {
+    int32_t was = __atomic_exchange_n(&g_login_status, CD_STATUS_INITIALIZED, __ATOMIC_ACQ_REL);
+    if (was != CD_STATUS_NONE) __atomic_store_n(&g_login_status, was, __ATOMIC_RELEASE);
+    hle_ret_s32(c, was == CD_STATUS_NONE ? 0 : LOGIN_ERR_ALREADY_INITIALIZED);
+}
+static void login_terminate(hle_call *c) {
+    int32_t was = __atomic_exchange_n(&g_login_status, CD_STATUS_NONE, __ATOMIC_ACQ_REL);
+    hle_ret_s32(c, was == CD_STATUS_NONE ? LOGIN_ERR_NOT_INITIALIZED : 0);
+}
+/* int sceLoginDialogOpen(const param *) */
+static void login_open(hle_call *c) {
+    int32_t s = __atomic_load_n(&g_login_status, __ATOMIC_ACQUIRE);
+    if (!hle_arg_ptr(c, 0)) { hle_ret_s32(c, LOGIN_ERR_INVALID_ARGUMENT); return; }
+    if (s == CD_STATUS_NONE) { hle_ret_s32(c, LOGIN_ERR_NOT_INITIALIZED); return; }
+    if (s == CD_STATUS_RUNNING) { hle_ret_s32(c, LOGIN_ERR_BUSY); return; }
+    __atomic_store_n(&g_login_status, CD_STATUS_FINISHED, __ATOMIC_RELEASE);
+    hle_ret_s32(c, 0);
+}
+static void login_status(hle_call *c) { hle_ret_s32(c, __atomic_load_n(&g_login_status, __ATOMIC_ACQUIRE)); }
+/* int sceLoginDialogGetResult({int result; int errorCode; ...} *) */
+static void login_get_result(hle_call *c) {
+    int32_t *r = hle_arg_ptr(c, 0) ? (int32_t *)hle_mem(c, hle_arg_ptr(c, 0), 8) : NULL;
+    int32_t s = __atomic_load_n(&g_login_status, __ATOMIC_ACQUIRE);
+    if (!r) { hle_ret_s32(c, LOGIN_ERR_INVALID_ARGUMENT); return; }
+    if (s == CD_STATUS_NONE) { hle_ret_s32(c, LOGIN_ERR_NOT_INITIALIZED); return; }
+    r[0] = 1; /* SCE_COMMON_DIALOG_RESULT_USER_CANCELED */
+    r[1] = LOGIN_ERR_INVALID_USER;
+    hle_ret_s32(c, s == CD_STATUS_FINISHED ? 0 : LOGIN_ERR_BUSY);
+}
+static void login_close(hle_call *c) {
+    if (__atomic_load_n(&g_login_status, __ATOMIC_ACQUIRE) == CD_STATUS_NONE) {
+        hle_ret_s32(c, LOGIN_ERR_NOT_INITIALIZED);
+        return;
+    }
+    __atomic_store_n(&g_login_status, CD_STATUS_FINISHED, __ATOMIC_RELEASE);
+    hle_ret_s32(c, 0);
+}
+
+/* ---- libSceContentExport: export sessions (ids 0..), as in AnyPS5 ---- */
+
+static volatile uint32_t g_export_sessions; /* bit per session id */
+/* int sceContentExportStart(void): a session id */
+static void content_export_start(hle_call *c) {
+    for (int id = 0; id < 4; id++) {
+        uint32_t bit = 1u << id;
+        if (!(__atomic_fetch_or(&g_export_sessions, bit, __ATOMIC_ACQ_REL) & bit)) {
+            hle_ret_s32(c, id);
+            return;
+        }
+    }
+    hle_ret_s32(c, (int32_t)0x809D3007); /* execution max */
+}
+/* int sceContentExportFinish(int id) */
+static void content_export_finish(hle_call *c) {
+    int32_t id = hle_arg_s32(c, 0);
+    if (id >= 0 && id < 4) __atomic_fetch_and(&g_export_sessions, ~(1u << id), __ATOMIC_ACQ_REL);
+    hle_ret_s32(c, 0);
+}
+
+/* ---- libSceConvertKeycode: the user's keyboard is the US layout (IME keyboard type 1) ---- */
+
+#define KEYCODE_ERR_INVALID_ADDRESS ((int32_t)0x80BC0031)
+#define KEYCODE_ERR_INVALID_KEYBOARD_TYPE ((int32_t)0x80BC0032)
+/* USB HID usage -> virtual key of the base (US) layout (table as in AnyPS5) */
+static const uint8_t k_virtual_keys[256] = {
+    255, 255, 255, 255, 65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,
+    83,  84,  85,  86,  87,  88,  89,  90,  49,  50,  51,  52,  53,  54,  55,  56,  57,  48,  13,  27,  8,   9,
+    32,  187, 219, 221, 186, 191, 191, 192, 222, 220, 188, 190, 189, 20,  112, 113, 114, 115, 116, 117, 118, 119,
+    120, 121, 122, 123, 44,  145, 19,  45,  36,  33,  46,  35,  34,  39,  37,  40,  38,  144, 111, 106, 109, 107,
+    13,  97,  98,  99,  100, 101, 102, 103, 104, 105, 96,  110, 226, 93,  [0xD8] = 12, [0xE0] = 162, 160, 164, 91, 163, 161, 165, 92};
+/* int sceConvertKeycodeGetImeKeyboardType(int userId, u32 *type) */
+static void keycode_ime_keyboard_type(hle_call *c) {
+    uint32_t *t = hle_arg_ptr(c, 1) ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 1), 4) : NULL;
+    if (!t) { hle_ret_s32(c, KEYCODE_ERR_INVALID_ADDRESS); return; }
+    *t = 1;
+    hle_ret_s32(c, 0);
+}
+/* int sceConvertKeycodeGetVirtualKeycode(u16 keycode, u32 keyboardType, u16 *vk) */
+static void keycode_virtual(hle_call *c) {
+    uint16_t *vk = hle_arg_ptr(c, 2) ? (uint16_t *)hle_mem(c, hle_arg_ptr(c, 2), 2) : NULL;
+    uint32_t code = hle_arg_u32(c, 0) & 0xFFFF, type = hle_arg_u32(c, 1);
+    if (!vk) { hle_ret_s32(c, KEYCODE_ERR_INVALID_ADDRESS); return; }
+    if (type == 0 || type > 39) { hle_ret_s32(c, KEYCODE_ERR_INVALID_KEYBOARD_TYPE); return; }
+    uint8_t v = code < 256 ? k_virtual_keys[code] : 255;
+    *vk = v ? v : 255;
+    hle_ret_s32(c, 0);
+}
+
+/* int sceSystemGestureGetTouchEventByIndex(handle, recognizer, u32 index, event *): there are none */
+static void gesture_event_by_index(hle_call *c) {
+    if (hle_arg_s32(c, 0) != GESTURE_HANDLE) { hle_ret_s32(c, GESTURE_ERR_INVALID_HANDLE); return; }
+    hle_ret_s32(c, hle_arg_ptr(c, 1) ? (int32_t)0x80890004 /* index out of array */ : GESTURE_ERR_INVALID_ARGUMENT);
+}
+/* int sceSystemGestureRemoveTouchRecognizer(handle, recognizer *) */
+static void gesture_remove_recognizer(hle_call *c) {
+    if (hle_arg_s32(c, 0) != GESTURE_HANDLE) { hle_ret_s32(c, GESTURE_ERR_INVALID_HANDLE); return; }
+    hle_ret_s32(c, hle_arg_ptr(c, 1) ? 0 : GESTURE_ERR_INVALID_ARGUMENT);
+}
+
 /* ---- System IPC (libSceIpmi): libraries the game ships (NpEntitlementAccess) open a client
  * to a system service; there is none, and they stop there ---- */
 
@@ -219,6 +334,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2DeleteUserContext", ok),
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventCreateHandle", webapi_new_id),
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventDeleteHandle", ok),
+    HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventAbortHandle", ok),
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventCreateFilter", webapi_new_id),
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventDeleteFilter", ok),
     HLE_FUNC_ENTRY(NPW, "sceNpWebApi2PushEventRegisterCallback", webapi_new_id),
@@ -247,6 +363,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(SH, "sceShareSetContentParamForApplicationTitle", ok),
     HLE_FUNC_ENTRY(SH, "sceShareSetScreenshotOverlayImage", ok),
     HLE_FUNC_ENTRY(SH, "sceShareGetCurrentStatus", share_get_current_status),
+    HLE_FUNC_ENTRY(SH, "sceShareRegisterContentEventCallback", ok), /* no share events here (RE4, TMNT) */
     HLE_FUNC_ENTRY("libSceSharePlay", "sceSharePlayInitialize", ok),
     HLE_FUNC_ENTRY("libSceSharePlay", "sceSharePlayTerminate", ok),
     HLE_FUNC_ENTRY("libSceSharePlay", "sceSharePlayGetCurrentConnectionInfoA", share_play_get_connection_info),
@@ -261,16 +378,21 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(SG, "sceSystemGestureUpdatePrimitiveTouchRecognizer", ok),
     HLE_FUNC_ENTRY(SG, "sceSystemGestureGetTouchEvents", gesture_get_touch_events),
     HLE_FUNC_ENTRY(SG, "sceSystemGestureGetPrimitiveTouchEvents", gesture_get_primitive_touch_events),
+    HLE_FUNC_ENTRY(SG, "sceSystemGestureGetTouchEventByIndex", gesture_event_by_index),
+    HLE_FUNC_ENTRY(SG, "sceSystemGestureRemoveTouchRecognizer", gesture_remove_recognizer),
+    HLE_FUNC_ENTRY(SG, "sceSystemGestureFinalizePrimitiveTouchRecognizer", ok),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Initialize", ok),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Terminate", ok),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Open", tts_not_supported),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Close", ok),
+    HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2GetSystemStatus", tts_not_supported),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2GetSpeechStatus", tts_not_supported),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Speak", tts_silent),
     HLE_FUNC_ENTRY("libSceTextToSpeech2", "sceTextToSpeech2Cancel", tts_silent),
     HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingInitialize", ok),
     HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingTerminate", ok),
     HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingGetCurrentStatus2", live_streaming_status2),
+    HLE_FUNC_ENTRY("libSceGameLiveStreaming", "sceGameLiveStreamingGetProgramInfo", live_streaming_program_info),
     HLE_FUNC_ENTRY("libSceGameUpdate", "sceGameUpdateInitialize", ok),
     HLE_FUNC_ENTRY("libSceGameUpdate", "sceGameUpdateTerminate", ok),
     HLE_FUNC_ENTRY("libSceCoredump", "sceCoredumpRegisterCoredumpHandler", ok),
@@ -281,10 +403,20 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceNpGameIntent", "sceNpGameIntentTerminate", ok),
     HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingInitialize", ok),
     HLE_FUNC_ENTRY("libSceNpSessionSignaling", "sceNpSessionSignalingTerminate", ok),
-    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogInitialize", ok),
-    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogTerminate", ok),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogInitialize", login_initialize),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogTerminate", login_terminate),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogOpen", login_open),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogUpdateStatus", login_status),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogGetStatus", login_status),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogGetResult", login_get_result),
+    HLE_FUNC_ENTRY("libSceLoginDialog", "sceLoginDialogClose", login_close),
+    HLE_FUNC_ENTRY("libScePlayerSelectionDialog", "scePlayerSelectionDialogTerminate", ok),
+    HLE_FUNC_ENTRY("libSceConvertKeycode", "sceConvertKeycodeGetImeKeyboardType", keycode_ime_keyboard_type),
+    HLE_FUNC_ENTRY("libSceConvertKeycode", "sceConvertKeycodeGetVirtualKeycode", keycode_virtual),
     HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportInit2", ok),
     HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportTerm", ok),
+    HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportStart", content_export_start),
+    HLE_FUNC_ENTRY("libSceContentExport", "sceContentExportFinish", content_export_finish),
     HLE_FUNC_ENTRY("libSceVoiceQoS", "sceVoiceQoSInit", ok),
     HLE_FUNC_ENTRY("libSceVoiceQoS", "sceVoiceQoSEnd", ok),
     HLE_FUNC_ENTRY("libSceIpmi", "_ZN4IPMI6Client6ConfigC1Ev", ok),

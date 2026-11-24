@@ -64,6 +64,17 @@ static const uint32_t cases[][16] = {
 };
 static const uint32_t lengths[] = {7, 7, 8, 8, 6, 10, 11, 10, 9, 9, 11};
 
+/* Reserve once per wave, broadcast the count, then add the compacted rank.
+ * Subtraction through VCC_HI is part of a 64-bit mask operation. */
+static const uint32_t compaction[] = {
+    0x80ea7e80, 0x82eb7f80, /* s_sub, s_subb: vcc = -exec */
+    0xbe8a246a,             /* s_and_saveexec_b64 s[10:11], vcc */
+    0xbeea100a, 0x7e02026a, /* count the saved mask into v1 in the first lane */
+    0xbefe040a, 0x7ed40501, /* restore exec, broadcast v1 with v_readfirstlane */
+    0xd7660002, 0x0001000b, 0xd7650002, 0x0002040a, /* rank in both halves */
+    0x4a60046a, 0xe0702000, 0x80033000, 0xbf810000 /* store count + rank */
+};
+
 static int pseudoflag_gpu_test(void) {
     CHECK(getenv("PS5C_CS_WAVE_FROM_PACKET"));
     CHECK(pal_init()==PS5C_OK);gmem m;gmem_config cfg=gmem_default_config();cfg.identity=false;
@@ -140,6 +151,23 @@ static int gpu_test(void) {
             CHECK(output[lane] == expected);
         }
     }
+    guest_addr pc = a + 0xf00;
+    CHECK(gmem_write(&m, pc, compaction, sizeof(compaction)));
+    g.regs[mmCOMPUTE_PGM_LO] = (uint32_t)(pc >> 8);
+    g.regs[mmCOMPUTE_PGM_HI] = (uint32_t)(pc >> 40);
+    g.regs[mmCOMPUTE_PGM_RSRC2] = 16u << 1;
+    g.regs[mmCOMPUTE_NUM_THREAD_X] = 64;
+    g.regs[mmCOMPUTE_NUM_THREAD_Z] = 1;
+    g.regs[mmCOMPUTE_DISPATCH_INITIATOR] = 1; /* packet selects wave64 */
+    memset(output, 0, 64 * 4);
+    renderer_submit_begin(r);
+    renderer_dispatch(r, &g, 1, 1, 1);
+    renderer_sync_mem(r, a + 0x1000, 64 * 4);
+    for (unsigned lane = 0; lane < 64; lane++) {
+        if (output[lane] != 64 + lane)
+            fprintf(stderr, "compaction lane %u: %u expected %u\n", lane, output[lane], 64 + lane);
+        CHECK(output[lane] == 64 + lane);
+    }
     renderer_destroy(r); free(g.regs); pal_mutex_destroy(g.lock);
     pal_window_destroy(window); gmem_free(&m); pal_shutdown();
     puts("GPU masks: comparison/carry reuse and scalar masks, including 32x1x6");
@@ -157,6 +185,8 @@ int main(void) {
         uint32_t *spv = NULL; size_t words = 0;
         CHECK(sh_translate(p, &info, &shape, 0, &spv, &words)); free(spv);
     }
+    CHECK(sh_analyze(compaction, PS5C_ARRAY_COUNT(compaction), 0x100000, p));
+    CHECK(p->wave_compaction);
     free(p);
     if (getenv("PS5C_TEST_GPU")) CHECK(gpu_test() == 0);
     puts("shader masks: ok"); return 0;

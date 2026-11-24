@@ -1,8 +1,8 @@
 Atualização e recuperação
 
 Canal estável Windows x86-64: zeraps5/ZeraPS5-Releases no GitHub.
-Os fontes públicos estão em zeraps5/ZeraPS5 no GitHub.
-A distribuição usa o repositório público separado já existente; publicar uma
+Os fontes públicos estão em zeraps5/ZeraPS5-Releases no GitHub.
+A distribuição usa o repositório público do projeto; publicar uma
 nova release estável continua sendo uma etapa manual autorizada pelo usuário.
 O launcher consulta releases/latest/download/latest.json por HTTPS, sem token,
 nome do computador ou identificador da instalação. Não utiliza a API REST.

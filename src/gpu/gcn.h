@@ -28,6 +28,11 @@ uint32_t gcn_fetch_size(const uint32_t *code, uint32_t avail);
 uint32_t gcn_to_rdna2(const uint32_t *code, uint32_t avail, const uint32_t *fetch, uint32_t fetch_words,
                       uint32_t *out, uint32_t cap, gcn_error *err);
 
+/* gcn_to_rdna2 for the compute pass of a geometry shader: each s_sendmsg GS emit (or emit-cut)
+ * becomes emit[0..emit_words), RDNA2 code (it counts and records the vertex). */
+uint32_t gcn_to_rdna2_gs(const uint32_t *code, uint32_t avail, const uint32_t *fetch, uint32_t fetch_words,
+                         const uint32_t *emit, uint32_t emit_words, uint32_t *out, uint32_t cap, gcn_error *err);
+
 /* A GFX7 buffer descriptor (V#) rewritten as a GFX10 one: the unified format, OOB_SELECT. */
 void gcn_buffer_desc_to_rdna2(uint32_t v[4]);
 

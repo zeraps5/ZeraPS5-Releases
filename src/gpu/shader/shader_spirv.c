@@ -59,7 +59,8 @@ bool sh_compute_auto_wave64(const sh_program *p, const sh_stage_info *info) {
      * broadcast its result, leaving work-stealing loops divergent. Exactly
      * one guest wave makes workgroup rendezvous safe, including EXEC-off
      * invocations. LDS-only shaders retain the explicit diagnostic selection. */
-    return (read || (sh_translation_wave64_lds(p->hash) && lds && !p->wave32)) && wide_exec && !unsafe;
+    bool compaction = p->wave_compaction && !p->wave32;
+    return (read || compaction || (sh_translation_wave64_lds(p->hash) && lds && !p->wave32)) && wide_exec && !unsafe;
 }
 
 static bool g_vs_layer; /* sh_set_vs_layer */
@@ -120,7 +121,8 @@ typedef struct tr {
     uint32_t t_void, t_bool, t_u32, t_i32, t_f32, t_u64, t_v2f, t_v2i, t_v3u, t_v4f, t_v4u, t_v4i;
     uint32_t p_fn_u32, p_fn_bool, p_sb_u32, p_sb_u64;
     uint32_t sgpr[SH_SGPRS], vgpr[256 + 16], scc, pc; /* 256..: temporaries (VTMP) */
-    uint32_t movrel_tmp; /* the value a v_movrels read picks */
+    uint32_t vgpr_array; /* per-invocation indexed bank for shaders with many relative accesses */
+    uint32_t movrel_tmp; /* the value a v_movrels read picks in the branch-based path */
     uint32_t lanes[256]; /* per-lane copies of a VGPR written by v_writelane (spilled SGPRs) */
     uint32_t t_ssbo, u_var;
     uint32_t site_var[SH_MAX_SITES], site_sampled_type[SH_MAX_SITES], site_image_type[SH_MAX_SITES];
@@ -232,7 +234,12 @@ static uint32_t sreg(tr *t, uint32_t n) {
 #define VTMP 512 /* register numbers of the translator's own temporaries (vgpr[256..]) */
 static uint32_t vreg(tr *t, uint32_t n) {
     n = n >= VTMP && n < VTMP + 16 ? 256 + (n - VTMP) : n & 0xFF;
-    if (!t->vgpr[n]) t->vgpr[n] = spv_local_var(&t->b, t->p_fn_u32);
+    if (!t->vgpr[n]) {
+        if (t->vgpr_array && n < 256)
+            t->vgpr[n] = spv_prologue_op(&t->b, SpvOpAccessChain, t->p_fn_u32,
+                                         (uint32_t[]){t->vgpr_array, cu(t, n)}, 2);
+        else t->vgpr[n] = spv_local_var(&t->b, t->p_fn_u32);
+    }
     return t->vgpr[n];
 }
 static uint32_t get_s(tr *t, uint32_t n) { return ld(t, t->t_u32, sreg(t, n & 0x7F)); }
@@ -1969,10 +1976,27 @@ static void valu(tr *t, const rdna2_inst *in, uint32_t op) {
         set_s(t,(in->dst-RDNA2_OP_VGPR)&0x7f,value);break;
     }
     case SH_OP_V_MOVRELS_B32: case SH_OP_V_MOVRELD_B32: case SH_OP_V_MOVRELSD_B32: {
-        /* VGPR indexing by M0 (register arrays): VGPRs are separate host
-         * variables, so branch to the register the index picks (movrel_tree) */
         uint32_t m0 = get_s(t, RDNA2_OP_M0), sbase = (in->src[0] - RDNA2_OP_VGPR) & 0xFF;
-        uint32_t dbase = (in->dst - RDNA2_OP_VGPR) & 0xFF, v = UA();
+        uint32_t dbase = (in->dst - RDNA2_OP_VGPR) & 0xFF;
+        if (t->vgpr_array) {
+            uint32_t v;
+            if (op == SH_OP_V_MOVRELD_B32) v = UA();
+            else {
+                uint32_t valid = op2(t, SpvOpULessThan, B, m0, cu(t, 256 - sbase));
+                uint32_t index = op2(t, SpvOpIAdd, U, cu(t, sbase), sel(t, U, valid, m0, cu(t, 0)));
+                v = ld(t, U, op2(t, SpvOpAccessChain, t->p_fn_u32, t->vgpr_array, index));
+            }
+            if (op == SH_OP_V_MOVRELS_B32) set_v(t, dbase, v);
+            else {
+                uint32_t valid = op2(t, SpvOpULessThan, B, m0, cu(t, 256 - dbase));
+                uint32_t merge = begin_if(t, op2(t, SpvOpLogicalAnd, B, active(t), valid));
+                uint32_t index = op2(t, SpvOpIAdd, U, cu(t, dbase), m0);
+                st(t, op2(t, SpvOpAccessChain, t->p_fn_u32, t->vgpr_array, index), v);
+                end_if(t, merge);
+            }
+            break;
+        }
+        uint32_t v = UA();
         if (op != SH_OP_V_MOVRELD_B32) {
             if (!t->movrel_tmp) t->movrel_tmp = spv_local_var(&t->b, t->p_fn_u32);
             st(t, t->movrel_tmp, get_v(t, sbase)); /* an index past the registers reads the first */
@@ -2857,6 +2881,11 @@ static void smem(tr *t, const rdna2_inst *in, uint32_t op, int site) {
                             op1(t, SpvOpUConvert, t->t_u64,
                                  sel(t, t->t_u32, op2(t, SpvOpINotEqual, t->t_bool, stride, cu(t, 0)), stride, cu(t, 1))));
         uint32_t dw = op2(t, SpvOpShiftRightLogical, t->t_u32, off, cu(t, 2));
+        /* SH_BUFFER_SHIFTED: the binding starts SH_U_SITE bytes before the descriptor base
+         * (direct memory reads bind from an aligned offset below it) */
+        uint32_t shift_dw = 0;
+        if (t->shapes[site].buffer_length == SH_BUFFER_SHIFTED && !t->shapes[site].address_map)
+            shift_dw = op2(t, SpvOpShiftRightLogical, t->t_u32, sb_load(t, t->u_var, cu(t, SH_U_SITE + (uint32_t)site)), cu(t, 2));
         for (uint32_t k = 0; k < n; k++) {
             uint32_t end = op2(t, SpvOpIAdd, t->t_u64, op1(t, SpvOpUConvert, t->t_u64, off), op1(t, SpvOpUConvert, t->t_u64, cu(t, (k + 1) * 4)));
             uint32_t in_range = op2(t, SpvOpULessThanEqual, t->t_bool, end, limit);
@@ -2870,6 +2899,7 @@ static void smem(tr *t, const rdna2_inst *in, uint32_t op, int site) {
                 index = op2(t, SpvOpShiftRightLogical, t->t_u32, relative, cu(t, 2));
                 in_range = op2(t, SpvOpLogicalAnd, t->t_bool, in_range, valid);
             }
+            if (shift_dw) index = op2(t, SpvOpIAdd, t->t_u32, index, shift_dw);
             uint32_t v = buf_word(t, t->site_var[site], index);
             set_s(t, in->dst + k, sel(t, t->t_u32, in_range, v, cu(t, 0)));
         }
@@ -2915,6 +2945,31 @@ static uint32_t buffer_offset(tr *t, const rdna2_inst *in, int site, const sh_si
         if (sh->address_map && in->idxen)
             *in_range = sel(t, B, op2(t, SpvOpINotEqual, B, stride, cu(t, 0)),
                             op2(t, SpvOpULessThan, B, idx, records), *in_range);
+    }
+    if (t->info->mesh_indexed & SH_GCN_SWIZZLE) {
+        /* GCN V# (raw words in the SGPRs): ADD_TID_ENABLE word3 [23] adds the lane to the
+         * index; SWIZZLE_ENABLE word1 [31] interleaves ELEMENT_SIZE [20:19] (2 << n bytes)
+         * elements of INDEX_STRIDE [22:21] (8 << n) lanes:
+         * soffset + (index / is) * stride * is + (offset / es) * es * is + (index % is) * es + offset % es */
+        uint32_t w1 = get_s(t, in->srsrc + 1), w3 = get_s(t, in->srsrc + 3);
+        uint32_t tid = op2(t, SpvOpIEqual, B, op2(t, SpvOpBitwiseAnd, U, w3, cu(t, 1u << 23)), cu(t, 1u << 23));
+        uint32_t swz = op2(t, SpvOpIEqual, B, op2(t, SpvOpBitwiseAnd, U, w1, cu(t, 0x80000000u)), cu(t, 0x80000000u));
+        uint32_t index = op2(t, SpvOpIAdd, U, idx, sel(t, U, tid, wave_lane(t), cu(t, 0)));
+        uint32_t within = op2(t, SpvOpIAdd, U, voff, cu(t, (uint32_t)in->offset));
+        uint32_t es = op2(t, SpvOpShiftLeftLogical, U, cu(t, 2), op3(t, SpvOpBitFieldUExtract, U, w3, cu(t, 19), cu(t, 2)));
+        uint32_t is = op2(t, SpvOpShiftLeftLogical, U, cu(t, 8), op3(t, SpvOpBitFieldUExtract, U, w3, cu(t, 21), cu(t, 2)));
+        uint32_t rstride = op3(t, SpvOpBitFieldUExtract, U, w1, cu(t, 16), cu(t, 14));
+        uint32_t swizzled = op2(t, SpvOpIMul, U, op2(t, SpvOpIMul, U, op2(t, SpvOpUDiv, U, index, is), rstride), is);
+        swizzled = op2(t, SpvOpIAdd, U, swizzled, op2(t, SpvOpIMul, U, op2(t, SpvOpIMul, U, op2(t, SpvOpUDiv, U, within, es), es), is));
+        swizzled = op2(t, SpvOpIAdd, U, swizzled, op2(t, SpvOpIMul, U, op2(t, SpvOpUMod, U, index, is), es));
+        swizzled = op2(t, SpvOpIAdd, U, swizzled, op2(t, SpvOpUMod, U, within, es));
+        uint32_t linear = op2(t, SpvOpIAdd, U, op2(t, SpvOpIMul, U, index, rstride), within);
+        uint32_t ring = op2(t, SpvOpIAdd, U, soff, sel(t, U, swz, swizzled, linear));
+        uint32_t special = op2(t, SpvOpLogicalOr, B, tid, swz);
+        off = sel(t, U, special, ring, off);
+        *in_range = sel(t, B, special, op2(t, SpvOpULessThanEqual, B, op2(t, SpvOpIAdd, U, ring, cu(t, bytes)),
+                                                op2(t, SpvOpShiftLeftLogical, U, buffer_dwords(t, t->site_var[site]), cu(t, 2))),
+                        *in_range);
     }
     /* SH_BUFFER_SHIFTED: the binding starts before the descriptor base (interleaved vertex
      * attributes share one copy of their buffer); SH_U_SITE holds the byte distance */
@@ -3669,7 +3724,7 @@ static uint32_t sample_coord(tr *t, int site, const rdna2_inst *in, uint32_t x, 
     y = fbits(t, y);
     if (site_3d(t, site))
         return spv_op(&t->b, SpvOpCompositeConstruct, spv_type_vector(&t->b, t->t_f32, 3),
-                      (uint32_t[]){x, y, dim_coords(in) == 3 ? fbits(t, z) : cf(t, 0)}, 3);
+                      (uint32_t[]){x, y, dim_coords(in) == 3 || (in->dim == 1 && z) ? fbits(t, z) : cf(t, 0)}, 3); /* z: GCN 2D form */
     if (!site_arrayed(t, site)) return op2(t, SpvOpCompositeConstruct, t->t_v2f, x, y);
     z = dim_coords(in) == 3 ? fbits(t, z) : cf(t, 0);
     if (in->dim == 3) {
@@ -3977,7 +4032,10 @@ static void image_op(tr *t, const rdna2_inst *in, uint32_t op, int site) {
         sh_image_mip_source(t->p, t->info, (uint32_t)site, &mip_source, &mip_literal);
     for (uint32_t k = 0; k < 4; k++) addr[k] = in->nsa_count && k ? in->nsa_addr[k - 1] : in->vaddr + k;
     if (in->a16) a16_unpack(t, in, op, addr);
-    uint32_t nc = dim_coords(in); /* coordinate registers */
+    /* coordinate registers. A PS4 (GCN) image instruction has no dimension of its own, the resource
+     * gives it (gcn.c emits 2D): on a 3D resource it addresses x, y, z (LEGO City Undercover's color
+     * grading LUT read only its first slice, a yellow picture). */
+    uint32_t nc = in->dim == 1 && site_3d(t, site) ? 3 : dim_coords(in);
     uint32_t ctype = site_arrayed(t, site) || site_3d(t, site) ? spv_type_vector(&t->b, t->t_f32, 3) : t->t_v2f;
     if (op == SH_OP_IMAGE_ATOMIC) {
         image_atomic(t, in, site, addr);
@@ -4302,6 +4360,19 @@ static void image_op(tr *t, const rdna2_inst *in, uint32_t op, int site) {
     uint32_t elem = kind == 1 ? t->t_u32 : kind == 2 ? t->t_i32 : t->t_f32;
     uint32_t c[4], vals[4], n = 0;
     for (uint32_t k = 0; k < 4; k++) c[k] = op2(t, SpvOpCompositeExtract, elem, res, k);
+    if (sh->dst_sel[0] == SH_DST_SEL_DYNAMIC) { /* the selects of this draw's T# */
+        uint32_t meta = sb_load(t, t->u_var, cu(t, SH_U_SITE + (uint32_t)site)), bits[4];
+        for (uint32_t m = 0; m < 4; m++) bits[m] = kind == 1 ? c[m] : ubits(t, c[m]);
+        for (uint32_t k = 0; k < 4; k++) {
+            if (!((in->dmask >> k) & 1)) continue;
+            uint32_t s = bfe_u(t, meta, cu(t, 3 * k), cu(t, 3));
+            uint32_t v = sel(t, t->t_u32, op2(t, SpvOpIEqual, t->t_bool, s, cu(t, 1)), cu(t, kind ? 1u : 0x3F800000u), cu(t, 0));
+            for (uint32_t m = 0; m < 4; m++) v = sel(t, t->t_u32, op2(t, SpvOpIEqual, t->t_bool, s, cu(t, 4 + m)), bits[m], v);
+            vals[n++] = v;
+        }
+        write_texels(t, in, vals, n, kind);
+        return;
+    }
     for (uint32_t k = 0; k < 4; k++) {
         if (!((in->dmask >> k) & 1)) continue;
         uint32_t s = sh->dst_sel[k];
@@ -4458,15 +4529,24 @@ static void export_op(tr *t, const rdna2_inst *in) {
          * float (or unpacking it as half) destroys IDs, masks and packed data. */
         uint32_t c[4], type = kind == 2 ? t->t_i32 : t->t_u32;
         uint32_t format = (t->info->ps_col_format >> (4 * tgt)) & 15u;
-        if (in->exp_compr && format != 7 && format != 8) {
-            fail(t, "compressed integer export requires UINT16 or SINT16 format");
+        if (in->exp_compr && (format < 4 || format > 8)) {
+            fail(t, "unsupported compressed color export format");
             return;
         }
         for (uint32_t k = 0; k < 4; k++) {
             uint32_t value = cu(t, k == 3 ? 1 : 0);
             if (in->exp_compr) {
                 uint32_t pair = get_v(t, in->exp_src[k / 2]);
-                value = format == 8 ? ubits(t, op3(t, SpvOpBitFieldSExtract, t->t_i32, ibits(t, pair),
+                if (format >= 4 && format <= 6) {
+                    /* The export encoding and attachment kind are independent.
+                     * Decode FP16/normalized data first, then preserve its F32
+                     * register bits for integer attachments (as with 32-bit
+                     * exports). Numeric float-to-int conversion loses them. */
+                    uint32_t unpack = format == 5 ? GLSLstd450UnpackUnorm2x16 :
+                                      format == 6 ? GLSLstd450UnpackSnorm2x16 : GLSLstd450UnpackHalf2x16;
+                    uint32_t decoded = ext1(t, t->t_v2f, unpack, pair);
+                    value = ubits(t, op2(t, SpvOpCompositeExtract, F, decoded, k & 1u));
+                } else value = format == 8 ? ubits(t, op3(t, SpvOpBitFieldSExtract, t->t_i32, ibits(t, pair),
                                                  cu(t, (k & 1u) * 16), cu(t, 16))) :
                                       op3(t, SpvOpBitFieldUExtract, t->t_u32, pair,
                                           cu(t, (k & 1u) * 16), cu(t, 16));
@@ -6111,8 +6191,13 @@ bool sh_translate(const sh_program *p, const sh_stage_info *info, const sh_site_
     t->ok = true;
     t->flat_apertures=sh_flat_apertures(p);
     t->barrier_exec = true;
+    uint32_t relative_slots = 0;
     for(uint32_t i=0;i<p->count;i++) {
         const rdna2_inst *q=&p->insts[i];
+        if (p->ops[i] == SH_OP_V_MOVRELS_B32 || p->ops[i] == SH_OP_V_MOVRELSD_B32)
+            relative_slots += 256 - ((q->src[0] - RDNA2_OP_VGPR) & 0xFF);
+        if (p->ops[i] == SH_OP_V_MOVRELD_B32 || p->ops[i] == SH_OP_V_MOVRELSD_B32)
+            relative_slots += 256 - ((q->dst - RDNA2_OP_VGPR) & 0xFF);
         bool alu=q->enc==RDNA2_ENC_SOP1 || q->enc==RDNA2_ENC_SOP2 || q->enc==RDNA2_ENC_SOPC ||
             q->enc==RDNA2_ENC_VOP1 || q->enc==RDNA2_ENC_VOP2 || q->enc==RDNA2_ENC_VOPC ||
             q->enc==RDNA2_ENC_VOP3 || q->enc==RDNA2_ENC_VOP3P;
@@ -6388,6 +6473,19 @@ bool sh_translate(const sh_program *p, const sh_stage_info *info, const sh_site_
     uint32_t fn = spv_id(b);
     spv_begin_function(b, t->t_void, fn_type, fn);
     label(t);
+    /* Large branch trees can exhaust the host compiler. An indexed bank keeps
+     * the translation linear for these shaders, while small relative accesses
+     * retain independent register variables and their lower execution cost. */
+    if (relative_slots >= 4096 && info->stage != SH_STAGE_MESH) {
+        uint32_t type = spv_type_array(b, t->t_u32, cu(t, 256));
+        t->vgpr_array = spv_local_var(b, spv_type_pointer(b, SpvStorageClassFunction, type));
+        uint32_t zero = spv_id(b);
+        spv_emit(b, SPV_SEC_GLOBAL, SpvOpConstantNull, (uint32_t[]){type, zero}, 2);
+        spv_prologue_void(b, SpvOpStore, (uint32_t[]){t->vgpr_array, zero}, 2);
+        /* Relative reads can access every input register, even if the shader
+         * never uses its corresponding constant index in the body. */
+        for (uint32_t n = 0; n < 256; n++) vreg(t, n);
+    }
     if(t->wave_groups)t->wave_generation=spv_local_var(b,t->p_fn_u32);
     t->scc = spv_local_var(b, t->p_fn_bool);
     if(info->stage==SH_STAGE_MESH) {

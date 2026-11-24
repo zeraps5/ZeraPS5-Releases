@@ -263,9 +263,12 @@ static void sce_detach(hle_call *c) { RET_SCE(runtime_detach_thread(c->rt, hle_a
 static void px_detach(hle_call *c) { RET_POSIX(runtime_detach_thread(c->rt, hle_arg(c, 0))); }
 static void thread_exit(hle_call *c) { runtime_exit_current_thread(c->rt, hle_arg(c, 0)); }
 
+/* A thread that has exited (joinable, not yet joined) no longer has a priority: ESRCH, as
+ * libthr's lookup without dead threads. Tearaway Unfolded polls scePthreadGetprio on its
+ * loading thread to learn that it finished. */
 static void get_prio(hle_call *c) {
     guest_thread *t = thread_arg(c, 0);
-    if (!t) {
+    if (!t || t->finished) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_ESRCH);
         return;
     }
@@ -274,7 +277,7 @@ static void get_prio(hle_call *c) {
 
 static void set_prio(hle_call *c) {
     guest_thread *t = thread_arg(c, 0);
-    if (!t) {
+    if (!t || t->finished) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_ESRCH);
         return;
     }

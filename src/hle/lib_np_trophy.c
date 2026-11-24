@@ -32,6 +32,13 @@ static void create_id(hle_call *c) {
 
 static void np_ok(hle_call *c) { hle_ret_s32(c, 0); }
 
+/* int sceNpUniversalDataSystemGetStorageStat(int ctx, stat *): 7 size_t counters, all 0 */
+static void uds_storage_stat(hle_call *c) {
+    void *s = hle_arg_ptr(c, 1) ? hle_mem(c, hle_arg_ptr(c, 1), 56) : NULL;
+    if (s) memset(s, 0, 56);
+    hle_ret_s32(c, s ? 0 : (int32_t)0x80553103); /* invalid argument */
+}
+
 /* Trophy2 structures have no size field (Trophy v1's do): GameDetails 152 bytes
  * {u32 groups, trophies, platinum, gold, silver, bronze; char title[128]}, GameData 24,
  * GroupDetails 152 and GroupData 32 (both start with the group id), TrophyDetails 1312 and
@@ -338,6 +345,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(T, "sceNpTrophy2GetGroupInfo", trophy_get_group_info),
     HLE_FUNC_ENTRY(T, "sceNpTrophy2RegisterUnlockCallback", np_ok),
     HLE_FUNC_ENTRY(U, "sceNpUniversalDataSystemInitialize", np_ok),
+    HLE_FUNC_ENTRY(U, "sceNpUniversalDataSystemGetStorageStat", uds_storage_stat),
     HLE_FUNC_ENTRY(U, "sceNpUniversalDataSystemTerminate", np_ok),
     HLE_FUNC_ENTRY(U, "sceNpUniversalDataSystemCreateContext", create_id),
     HLE_FUNC_ENTRY(U, "sceNpUniversalDataSystemCreateHandle", create_id),

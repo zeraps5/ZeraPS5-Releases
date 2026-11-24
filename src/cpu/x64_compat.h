@@ -16,7 +16,7 @@
  *
  * PS5C_CPU_COMPAT=ivb treats the host as an Ivy Bridge (3rd generation Core:
  * SSE4.2, AVX, F16C), so the replacements can be tried on a newer CPU;
- * PS5C_CPU_COMPAT=off turns the scan off. */
+ * PS5C_CPU_COMPAT=off disables host ISA compatibility patching. */
 #ifndef PS5C_X64_COMPAT_H
 #define PS5C_X64_COMPAT_H
 
@@ -31,10 +31,16 @@ enum {
     X64_SET_MOVBE = 1u << 3,
     X64_SET_FMA = 1u << 4,
     X64_SET_AVX2 = 1u << 5,
+    X64_SET_TSC = 1u << 6,
 };
 
 /* The sets to replace on this host (once, from CPUID and PS5C_CPU_COMPAT). */
 uint32_t x64_compat_missing(void);
+
+/* PS5C_GUEST_TSC=1 makes inline reads and HLE timestamps use the same guest clock. */
+#define X64_GUEST_TSC_HZ 1600000000ull
+bool x64_guest_tsc_enabled(void);
+uint64_t x64_guest_tsc_read(void);
 
 /* Scans [code, code + size) of a module and replaces what the host lacks.
  * Stubs are placed in new guest memory near the code. */

@@ -92,8 +92,8 @@ static int source_test(renderer *r,guest_addr a){
     r->pipes->epoch++;REQUIRE(eval_lookup(r,st,key)==c);
     r->pipes->epoch++;r->pipes->wb_count=1;r->pipes->wb[0].addr=a;r->pipes->wb[0].size=4;
     REQUIRE(eval_lookup(r,st,key)==NULL);r->pipes->wb_count=0;
-    r->pipes->held_count=1;r->pipes->held[0].rel.addr=a;r->pipes->held[0].rel.data_sel=1;
-    REQUIRE(eval_lookup(r,st,key)==NULL);r->pipes->held_count=0;
+    r->pipes->held_count=1;r->pipes->held[0].rel.addr=a;r->pipes->held[0].rel.data_sel=1;held_sorted_rebuild(r->pipes);
+    REQUIRE(eval_lookup(r,st,key)==NULL);r->pipes->held_count=0;held_sorted_rebuild(r->pipes);
     r->pipes->copy_count=1;r->pipes->copies[0].addr=a;r->pipes->copies[0].size=4;
     uint32_t changed=0x22334455;REQUIRE(gmem_write(r->mem,a,&changed,4));
     REQUIRE(eval_lookup(r,st,key)==NULL && !c->key && !r->pipes->copy_count);

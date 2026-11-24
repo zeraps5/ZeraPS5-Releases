@@ -223,6 +223,7 @@ static bool pick_device(renderer *r) {
                 best_score = score;
                 r->phys = devs[i];
                 r->queue_family = q;
+                r->queue_timestamp_bits = qf[q].timestampValidBits;
                 r->props = p;
             }
             break;
@@ -2164,6 +2165,7 @@ bool vk_work_slot_done(renderer *r, uint32_t slot) { return vk_work_wait_slot(r,
 
 void vk_flush(renderer *r) {
     if (!r->recording) return;
+    vk_copy_pool_drain(); /* the arena bytes helper threads still copy go with this submit */
     vk_work_end(r);
     vk_work_profile_end(r);
     vk_check_work(r, vkEndCommandBuffer(r->cmd), "vkEndCommandBuffer (work)");

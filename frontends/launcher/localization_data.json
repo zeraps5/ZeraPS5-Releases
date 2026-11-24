@@ -159,5 +159,10 @@
   "%ls\\%ls.lnk",
   "--jogar",
   "ZeraPS5Patches",
-  "%ls — %hs | %ls %hs"
+  "%ls — %hs | %ls %hs",
+  "\"%ls\" %ls",
+  "--list-gpus",
+  "--list-cameras",
+  "ZeraPS5Accessories",
+  "%ls\\user\\ps4_camera_firmware.bin"
 ]

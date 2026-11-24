@@ -5,6 +5,7 @@
 /* ---- AES-128 ---- */
 
 static uint8_t g_sbox[256], g_inv[256];
+static uint8_t g_m9[256], g_m11[256], g_m13[256], g_m14[256]; /* InvMixColumns products */
 static bool g_tables;
 
 static uint8_t xt(uint8_t v) { return (uint8_t)(v << 1 ^ (v & 0x80 ? 0x1b : 0)); }
@@ -32,6 +33,10 @@ static void tables(void) {
         s ^= 0x63;
         g_sbox[i] = s;
         g_inv[s] = (uint8_t)i;
+        g_m9[i] = gmul((uint8_t)i, 9);
+        g_m11[i] = gmul((uint8_t)i, 11);
+        g_m13[i] = gmul((uint8_t)i, 13);
+        g_m14[i] = gmul((uint8_t)i, 14);
     }
     g_tables = true;
 }
@@ -39,10 +44,10 @@ static void tables(void) {
 static void inv_mix(uint8_t *s) {
     for (int c = 0; c < 4; c++) {
         uint8_t *p = s + 4 * c, a0 = p[0], a1 = p[1], a2 = p[2], a3 = p[3];
-        p[0] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
-        p[1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
-        p[2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
-        p[3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+        p[0] = g_m14[a0] ^ g_m11[a1] ^ g_m13[a2] ^ g_m9[a3];
+        p[1] = g_m9[a0] ^ g_m14[a1] ^ g_m11[a2] ^ g_m13[a3];
+        p[2] = g_m13[a0] ^ g_m9[a1] ^ g_m14[a2] ^ g_m11[a3];
+        p[3] = g_m11[a0] ^ g_m13[a1] ^ g_m9[a2] ^ g_m14[a3];
     }
 }
 
@@ -103,7 +108,49 @@ void aes_xts_init(aes_xts *x, const uint8_t data_key[16], const uint8_t tweak_ke
     aes128_init(&x->tweak, tweak_key);
 }
 
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(PS5C_NO_AESNI)
+#include <immintrin.h>
+#define XTS_NI 1
+/* The same XTS with the CPU's AES instructions (every x86-64 CPU this runs on since 2010 has
+ * them; the C path stays for the rest): ~100x faster, which PS4 packages read through. */
+__attribute__((target("aes,sse2"))) static void xts_ni(const aes_xts *x, uint8_t *buf, size_t size, uint64_t unit,
+                                                        bool enc) {
+    __m128i k[11], tk[11];
+    for (int r = 0; r <= 10; r++) {
+        k[r] = _mm_loadu_si128((const __m128i *)((enc ? x->data.enc : x->data.dec) + 16 * r));
+        tk[r] = _mm_loadu_si128((const __m128i *)(x->tweak.enc + 16 * r));
+    }
+    __m128i t = _mm_xor_si128(_mm_set_epi64x(0, (long long)unit), tk[0]);
+    for (int r = 1; r < 10; r++) t = _mm_aesenc_si128(t, tk[r]);
+    t = _mm_aesenclast_si128(t, tk[10]);
+    const __m128i poly = _mm_set_epi32(1, 1, 1, 0x87);
+    for (size_t off = 0; off + 16 <= size; off += 16) {
+        __m128i b = _mm_xor_si128(_mm_loadu_si128((const __m128i *)(buf + off)), t);
+        b = _mm_xor_si128(b, k[0]);
+        if (enc) {
+            for (int r = 1; r < 10; r++) b = _mm_aesenc_si128(b, k[r]);
+            b = _mm_aesenclast_si128(b, k[10]);
+        } else {
+            for (int r = 1; r < 10; r++) b = _mm_aesdec_si128(b, k[r]);
+            b = _mm_aesdeclast_si128(b, k[10]);
+        }
+        _mm_storeu_si128((__m128i *)(buf + off), _mm_xor_si128(b, t));
+        /* t *= x in GF(2^128): shift left by one, the carries of each 32-bit lane moved up */
+        __m128i hi = _mm_srai_epi32(_mm_shuffle_epi32(t, 0x93), 31);
+        t = _mm_xor_si128(_mm_slli_epi32(t, 1), _mm_and_si128(hi, poly));
+    }
+}
+#endif
+
 static void xts(const aes_xts *x, uint8_t *buf, size_t size, uint64_t unit, bool enc) {
+#ifdef XTS_NI
+    static int ni = -1;
+    if (ni < 0) ni = __builtin_cpu_supports("aes");
+    if (ni) {
+        xts_ni(x, buf, size, unit, enc);
+        return;
+    }
+#endif
     uint8_t t[16] = {0}, b[16];
     for (int i = 0; i < 8; i++) t[i] = (uint8_t)(unit >> (8 * i));
     aes128_encrypt(&x->tweak, t, t);
