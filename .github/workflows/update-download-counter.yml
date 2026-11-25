@@ -37,11 +37,11 @@ jobs:
           if os.environ.get('GH_TOKEN'):
               headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
 
-          def api(path, data=None, optional=False):
+          def api(path, data=None, method='GET', optional=False):
               url = 'https://api.github.com/repos/' + repo + path
               req = urllib.request.Request(url, headers=headers,
                   data=None if data is None else json.dumps(data).encode('utf-8'),
-                  method='GET' if data is None else 'PUT')
+                  method=method)
               try:
                   with urllib.request.urlopen(req, timeout=45) as response:
                       return json.load(response)
@@ -76,17 +76,31 @@ jobs:
           if os.environ.get('COUNTER_DRY_RUN') == '1':
               print(svg, end='')
           else:
-              current = api('/contents/docs/downloads.svg?ref=main', optional=True)
-              if current and base64.b64decode(current['content']).decode('utf-8') == svg:
-                  print('Counter unchanged; no commit needed')
-              else:
-                  update = {'message': 'docs: refresh Windows download counter',
-                            'content': base64.b64encode(svg.encode('utf-8')).decode('ascii'),
-                            'branch': 'main',
-                            'committer': {'name': 'github-actions[bot]',
-                              'email': '41898282+github-actions[bot]@users.noreply.github.com'}}
-                  if current:
-                      update['sha'] = current['sha']
-                  api('/contents/docs/downloads.svg', update)
+              branch = '/git/ref/heads/main'
+              bot = {'name': 'github-actions[bot]',
+                     'email': '41898282+github-actions[bot]@users.noreply.github.com'}
+              for attempt in range(3):
+                  head = api(branch)['object']['sha']
+                  current = api('/contents/docs/downloads.svg?ref=' + head, optional=True)
+                  if current and base64.b64decode(current['content']).decode('utf-8') == svg:
+                      print('Counter unchanged; no commit needed')
+                      break
+                  parent = api('/git/commits/' + head)
+                  tree = api('/git/trees', {'base_tree': parent['tree']['sha'], 'tree': [{
+                      'path': 'docs/downloads.svg', 'mode': '100644', 'type': 'blob', 'content': svg,
+                  }]}, method='POST')
+                  commit = api('/git/commits', {
+                      'message': 'docs: refresh Windows download counter', 'tree': tree['sha'],
+                      'parents': [head], 'author': bot, 'committer': bot,
+                  }, method='POST')
+                  try:
+                      api('/git/refs/heads/main', {'sha': commit['sha'], 'force': False}, method='PATCH')
+                  except urllib.error.HTTPError as error:
+                      if error.code in (409, 422) and api(branch)['object']['sha'] != head:
+                          continue
+                      raise
                   print('Counter updated for ' + tag + ': ' + str(count))
+                  break
+              else:
+                  raise RuntimeError('main changed during three counter update attempts')
           PY
