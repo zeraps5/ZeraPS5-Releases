@@ -106,13 +106,16 @@ int WINAPI GdipDisposeImage(void *image);
 
 /* ---- State ---- */
 
+typedef enum game_source {
+    GAME_FOLDER, GAME_IMAGE, GAME_MOUNTED_PKG, GAME_PKG_METADATA
+} game_source;
+
 typedef struct game {
     wchar_t dir[MAX_PATH];  /* the folder holding eboot.bin */
     wchar_t title[256];
     wchar_t id[32];         /* title ID, or the folder name without one */
     wchar_t version[32];
-    bool is_exfat;
-    bool is_pkg;            /* dir is a .pkg file: listed from its metadata, not runnable yet */
+    game_source source;    /* metadata-only packages store the file path rather than a game directory */
     bool pkg_retail;
     bool pro;               /* param.json attribute3 bit 0x400000: PS5 Pro Enhanced */
     bool ps4;               /* a PS4 game: sce_sys/param.sfo, or a CUSA folder */
@@ -765,7 +768,7 @@ static void configure_patches(int gi, HWND owner) {
         if (!strcmp(p->title_id, id)) g_patch_rows[g_patch_count++] = p;
     }
     param_info effective = {0};
-    bool have_content = !g->is_pkg && patch_content(g, file, sizeof(file), &effective);
+    bool have_content = g->source != GAME_PKG_METADATA && patch_content(g, file, sizeof(file), &effective);
     uint8_t *data = NULL;
     uint64_t size = 0;
     bool need_hash = false;
@@ -1670,14 +1673,12 @@ static bool is_update_folder(const wchar_t *name) {
     return (n > 6 && !_wcsicmp(name + n - 6, L"-patch")) || (n > 7 && !_wcsicmp(name + n - 7, L"-patch0"));
 }
 
-static void add_game(const wchar_t *dir, const wchar_t *folder, HIMAGELIST il) {
+static void add_game(const wchar_t *dir, const wchar_t *folder, game_source source, HIMAGELIST il) {
     if (g_count == MAX_GAMES) return;
     game *g = &g_games[g_count];
     memset(g, 0, sizeof(*g));
     wcsncpy(g->dir, dir, MAX_PATH - 1);
-    char source[4 * MAX_PATH];
-    wide_to_utf8(dir, source, sizeof(source));
-    g->is_exfat = exfat_path(source);
+    g->source = source;
     wchar_t path[MAX_PATH];
     param_info p;
     swprintf(path, MAX_PATH, L"%ls\\sce_sys\\param.json", dir);
@@ -1710,17 +1711,20 @@ static void add_game(const wchar_t *dir, const wchar_t *folder, HIMAGELIST il) {
     g_count++;
 }
 
-static void add_exfat_game(const wchar_t *image, const wchar_t *name, HIMAGELIST il) {
+/* An image with a valid virtual eboot supplies the playable catalog entry.
+ * A PKG that cannot be mounted can still be listed from its metadata. */
+static bool add_image_game(const wchar_t *image, const wchar_t *name, HIMAGELIST il) {
+    if (g_count == MAX_GAMES) return false;
     char path[4 * MAX_PATH], eboot[4 * MAX_PATH];
     wide_to_utf8(image, path, sizeof(path));
-    if (!exfat_image_path(path)) return;
-    ps5c_err err = exfat_game_path(path, eboot, sizeof(eboot));
-    if (err != PS5C_OK) return;
+    if (!exfat_image_path(path) || exfat_game_path(path, eboot, sizeof(eboot)) != PS5C_OK) return false;
     char *slash = strrchr(eboot, '/');
-    if (!slash) return;
+    if (!slash) return false;
     *slash = 0;
     wchar_t dir[MAX_PATH]; utf8_to_wide(eboot, dir, MAX_PATH);
-    if (dir[0]) add_game(dir, name, il);
+    if (!dir[0]) return false;
+    add_game(dir, name, pkg_path(path) ? GAME_MOUNTED_PKG : GAME_IMAGE, il);
+    return true;
 }
 
 /* A .pkg: title, version and icon from the package's metadata entries. */
@@ -1734,7 +1738,7 @@ static void add_pkg_game(const wchar_t *file, const wchar_t *name, HIMAGELIST il
     game *g = &g_games[g_count];
     memset(g, 0, sizeof(*g));
     wcsncpy(g->dir, file, MAX_PATH - 1);
-    g->is_pkg = true;
+    g->source = GAME_PKG_METADATA;
     g->pkg_retail = info.retail;
     g->ps4 = info.kind == PKG_PS4;
     uint8_t *data;
@@ -1788,15 +1792,14 @@ static void scan_games(const wchar_t *root, HIMAGELIST il) {
         if (fd.cFileName[0] == L'.') continue;
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
             wchar_t image[MAX_PATH]; swprintf(image, MAX_PATH, L"%ls\\%ls", root, fd.cFileName);
-            add_exfat_game(image, fd.cFileName, il);
-            add_pkg_game(image, fd.cFileName, il);
+            if (!add_image_game(image, fd.cFileName, il)) add_pkg_game(image, fd.cFileName, il);
             continue;
         }
         wchar_t dir[MAX_PATH], eboot[MAX_PATH];
         swprintf(dir, MAX_PATH, L"%ls\\%ls", root, fd.cFileName);
         swprintf(eboot, MAX_PATH, L"%ls\\eboot.bin", dir);
         if (file_exists(eboot)) {
-            if (!is_update_folder(fd.cFileName)) add_game(dir, fd.cFileName, il);
+            if (!is_update_folder(fd.cFileName)) add_game(dir, fd.cFileName, GAME_FOLDER, il);
             continue;
         }
         wchar_t pattern[MAX_PATH];
@@ -1815,7 +1818,8 @@ static void scan_games(const wchar_t *root, HIMAGELIST il) {
             swprintf(eboot, MAX_PATH, L"%ls\\eboot.bin", inner);
             /* every game of the folder (a PS5 package can hold its PS4 version beside it); updates
              * (-patch0) are laid over their game when it runs */
-            if (file_exists(eboot) && !is_update_folder(sub.cFileName)) add_game(inner, fd.cFileName, il);
+            if (file_exists(eboot) && !is_update_folder(sub.cFileName))
+                add_game(inner, fd.cFileName, GAME_FOLDER, il);
         } while (FindNextFileW(hs, &sub));
         FindClose(hs);
     } while (FindNextFileW(h, &fd));
@@ -1824,6 +1828,15 @@ static void scan_games(const wchar_t *root, HIMAGELIST il) {
 
 static int compare_games(const void *a, const void *b) {
     return _wcsicmp(((const game *)a)->title, ((const game *)b)->title);
+}
+
+static const wchar_t *game_type(const game *g) {
+    switch (g->source) {
+    case GAME_MOUNTED_PKG: return L"PKG";
+    case GAME_PKG_METADATA: return g->pkg_retail ? ui_string(L"PKG (loja)") : L"PKG";
+    case GAME_IMAGE: return L"exFAT";
+    default: return ui_string(L"Pasta");
+    }
 }
 
 static int count_modules(void) {
@@ -1875,8 +1888,7 @@ static void fill_list(void) {
         it.lParam = i;
         it.iImage = g_games[i].image;
         ListView_InsertItem(g_list, &it);
-        ListView_SetItemText(g_list, i, 1, (wchar_t *)(g_games[i].is_pkg ? (g_games[i].pkg_retail ? ui_string(L"PKG (loja)") : L"PKG")
-                                                        : g_games[i].is_exfat ? L"exFAT" : ui_string(L"Pasta")));
+        ListView_SetItemText(g_list, i, 1, (wchar_t *)game_type(&g_games[i]));
         ListView_SetItemText(g_list, i, 2, g_games[i].id);
         ListView_SetItemText(g_list, i, 3, g_games[i].version);
         ListView_SetItemText(g_list, i, 4, g_games[i].ps4 ? L"PS4" : g_games[i].pro ? L"PS5 Pro" : L"PS5");
@@ -1888,7 +1900,7 @@ static void fill_list(void) {
         wchar_t location[MAX_PATH];
         wcsncpy(location, g_games[i].dir, MAX_PATH - 1);
         location[MAX_PATH - 1] = 0;
-        if (g_games[i].is_exfat) {
+        if (g_games[i].source == GAME_IMAGE || g_games[i].source == GAME_MOUNTED_PKG) {
             wchar_t *view = wcsstr(location, L"/@game");
             if (!view) view = wcsstr(location, L"\\@game");
             if (view) *view = 0;
@@ -2235,7 +2247,7 @@ static bool session_finish_observed(bool known,DWORD code) {
 
 static void run_game(int gi) {
     const game *g = &g_games[gi];
-    if (g->is_pkg && (g->pkg_retail || g->ps4)) {
+    if (g->source == GAME_PKG_METADATA && (g->pkg_retail || g->ps4)) {
         MessageBoxW(g_main, g->pkg_retail
             ? ui_string(L"PKG de loja: os arquivos do jogo são criptografados com as chaves do console. Instale o pacote num PS5 e faça o dump do jogo.")
             : ui_string(L"Rodar direto de PKG de PS4 ainda não está pronto: extraia o pacote numa pasta."),
@@ -2278,7 +2290,7 @@ static void run_game(int gi) {
     swprintf(exe, MAX_PATH, L"%ls\\ps5c.exe", g_base);
     system_folder(modules);
     /* a fake PS5 package runs in place: its files are read from inside it */
-    swprintf(cmd, 4 * MAX_PATH, g->is_pkg ? L"\"%ls\" run \"%ls/@game/eboot.bin\" --modules \"%ls\""
+    swprintf(cmd, 4 * MAX_PATH, g->source == GAME_PKG_METADATA ? L"\"%ls\" run \"%ls/@game/eboot.bin\" --modules \"%ls\""
                                           : L"\"%ls\" run \"%ls\\eboot.bin\" --modules \"%ls\"",
              exe, g->dir, modules);
     STARTUPINFOW si = {0};

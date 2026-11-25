@@ -1,5 +1,10 @@
 # Release changelog
 
+## v0.1.1-b1192 - 25 November 2026
+
+- Fixed duplicate PKG and exFAT listings for the same file. Mounted .pkg files appear once as PKG. Game copies in separate folders remain visible.
+
+
 ## v0.1.1-b1191 — 25 November 2026
 
 - Vulkan presentation can locate the rendered image when it was registered through another mapping of the same memory.
