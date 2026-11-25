@@ -1,10 +1,10 @@
 # Game compatibility and tested builds
 
-**Current public release [b1191](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191) · Game records reviewed 25 November 2026.**
+**Current public release [b1192](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1192) · Game records reviewed 25 November 2026.**
 
 **Thirteen Intel Iris Xe development records were added on 25 November.** They document startup, title screens or menus in the observed sessions.
 
-The [b1191 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191) describe code and automated validation. Game sessions retain their original scopes and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
+The [b1192 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1192) describe code and automated validation. Game sessions retain their original scopes and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
 
 [Gameplay](#gameplay-records) · [Scenes](#scene-progress) · [Menus](#menus-and-title-screens) · [Startup](#opening-and-startup-records) · [PS4](#experimental-ps4-records) · [28-session RTX follow-up](#latest-rtx-startup-survey) · [Report a result](CONTRIBUTING.md#compatibility-reports)
 
