@@ -201,7 +201,7 @@ static void init_overlays(void) {
         safe = (*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '_' || *q == '-';
     mod_scan m = {0};
     /* [geral] escala_unreal: a generated mod sets the scene size of Unreal games (core/ue_scale.h) */
-    if (safe && !getenv("PS5C_NO_MODS") && !exfat_path(g_app_dir)) ue_scale_prepare(g_app_dir, id);
+    if (safe && !getenv("PS5C_NO_MODS")) ue_scale_prepare(g_app_dir, id);
     if (safe && !getenv("PS5C_NO_MODS")) {
         snprintf(dir, sizeof(dir), "user/mods/%s", id);
         pal_dir_list(dir, mod_entry, &m);

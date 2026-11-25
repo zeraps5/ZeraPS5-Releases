@@ -1513,15 +1513,193 @@ int32_t kernel_amm_give_direct(uint64_t start, uint64_t end, uint64_t size, uint
     return dmem_allocate(start, end, size, align ? align : 0x200000, 0, out);
 }
 
+/* What each 16 KiB page of the AMM window (lib_ampr.c's sceAmprAmmGetVirtualAddressRanges) shows,
+ * for the remap commands: direct memory (its offset), memory of its own, or nothing; and whether it
+ * is in a PRT range. An entry: offset | prot << 4 | AMMP_* flags. One table of 64 Ki entries per
+ * GiB, made on first use. g_amm_lock: commands normally run on libkernel's APR worker, but a
+ * submission runs in the caller's thread when the queue is full. */
+#define AMM_WINDOW_START 0x0000008000000000ull
+#define AMM_WINDOW_END 0x000000C000000000ull
+#define AMM_GIB_PAGES (1u << 16)
+enum { AMMP_MAPPED = 1, AMMP_DIRECT = 2, AMMP_PRT = 4 };
+#define AMMP_PROT(e) ((uint32_t)((e) >> 4) & 0xFFu)
+#define AMMP_OFFSET(e) ((e) & ~(GUEST_PAGE_SIZE - 1))
+static uint64_t *g_amm_pages[(AMM_WINDOW_END - AMM_WINDOW_START) >> 30];
+static pal_mutex *g_amm_lock;
+
+static bool amm_window(guest_addr va, uint64_t size) {
+    return size && !(va % GUEST_PAGE_SIZE) && !(size % GUEST_PAGE_SIZE) && va >= AMM_WINDOW_START &&
+           va < AMM_WINDOW_END && size <= AMM_WINDOW_END - va;
+}
+
+static uint64_t amm_get(guest_addr va) {
+    uint64_t i = (va - AMM_WINDOW_START) / GUEST_PAGE_SIZE;
+    const uint64_t *t = g_amm_pages[i / AMM_GIB_PAGES];
+    return t ? t[i % AMM_GIB_PAGES] : 0;
+}
+
+/* flags 0 forgets the pages; with AMMP_DIRECT, offset advances with them */
+static bool amm_set(guest_addr va, uint64_t size, uint64_t offset, uint32_t prot, uint32_t flags) {
+    for (uint64_t p = 0; p < size; p += GUEST_PAGE_SIZE) {
+        uint64_t i = (va + p - AMM_WINDOW_START) / GUEST_PAGE_SIZE;
+        uint64_t **t = &g_amm_pages[i / AMM_GIB_PAGES];
+        if (!*t && !flags) continue;
+        if (!*t && !(*t = (uint64_t *)calloc(AMM_GIB_PAGES, sizeof(uint64_t)))) return false;
+        (*t)[i % AMM_GIB_PAGES] =
+            flags ? ((flags & AMMP_DIRECT) ? offset + p : 0) | (uint64_t)(prot & 0xFF) << 4 | flags : 0;
+    }
+    return true;
+}
+
 /* An AMM map command: memory of its own (automatic) or the direct memory at phys, at a fixed address */
-int32_t kernel_amm_map(hle_call *c, guest_addr va, uint64_t size, uint32_t prot, bool direct, uint64_t phys) {
+static int32_t amm_map_locked(hle_call *c, guest_addr va, uint64_t size, uint32_t prot, bool direct, uint64_t phys,
+                              uint32_t extra) {
     guest_addr a = va;
-    return direct ? map_direct_at(c, &a, size, prot, MAP_FIXED, phys, 0, "amm direct")
-                  : map_memory(c, &a, size, prot, MAP_FIXED, 0, "amm", false,false);
+    int32_t e = direct ? map_direct_at(c, &a, size, prot, MAP_FIXED, phys, 0, "amm direct")
+                       : map_memory(c, &a, size, prot, MAP_FIXED, 0, "amm", false,false);
+    if (!e && amm_window(va, size)) amm_set(va, size, phys, prot, AMMP_MAPPED | (direct ? AMMP_DIRECT : 0) | extra);
+    return e;
+}
+
+int32_t kernel_amm_map(hle_call *c, guest_addr va, uint64_t size, uint32_t prot, bool direct, uint64_t phys) {
+    pal_mutex_lock(g_amm_lock);
+    int32_t e = amm_map_locked(c, va, size, prot, direct, phys, 0);
+    pal_mutex_unlock(g_amm_lock);
+    return e;
 }
 
 int32_t kernel_amm_unmap(hle_call *c, guest_addr va, uint64_t size) {
-    return do_munmap(c, va, size);
+    pal_mutex_lock(g_amm_lock);
+    int32_t e = do_munmap(c, va, size);
+    if (!e && amm_window(va, size)) amm_set(va, size, 0, 0, 0);
+    pal_mutex_unlock(g_amm_lock);
+    return e;
+}
+
+/* Unbacked pages of a PRT range: address space only (32 GiB ranges are usual, more than the host
+ * could commit); AllocatePaForPrt backs pages with memory of their own */
+static int32_t amm_prt_unback(hle_call *c, guest_addr va, uint64_t size) {
+    for (uint64_t p = 0; p < size; p += GUEST_PAGE_SIZE)
+        if (amm_get(va + p) & AMMP_MAPPED) {
+            do_munmap(c, va, size);
+            break;
+        }
+    guest_addr out = 0;
+    if (gmem_map_aligned(c->mem, va, size, GUEST_PAGE_SIZE, GPROT_NONE, GMAP_RESERVE | GMAP_FIXED | GMAP_REPLACE,
+                         "amm prt", &out) != PS5C_OK)
+        return SCE_KERNEL_ERROR_ENOMEM;
+    amm_set(va, size, 0, 0, AMMP_PRT);
+    return 0;
+}
+
+static bool amm_all(guest_addr va, uint64_t size, uint32_t flag) {
+    for (uint64_t p = 0; p < size; p += GUEST_PAGE_SIZE)
+        if (!(amm_get(va + p) & flag)) return false;
+    return true;
+}
+
+/* Direct memory pages map again at dst (the same physical pages: a MultiMap shares them); memory of
+ * its own has no physical pages to share, so its bytes are copied (a MultiMap of it does not stay
+ * in step: logged). The source of a move is unmapped first, so the ranges may overlap. */
+int32_t kernel_amm_remap(hle_call *c, guest_addr dst, guest_addr src, uint64_t size, uint32_t prot, uint32_t kind) {
+    if (!amm_window(dst, size) || !amm_window(src, size) || kind > AMM_REMAP_INTO_PRT ||
+        (kind != AMM_REMAP_MOVE && dst < src + size && src < dst + size))
+        return SCE_KERNEL_ERROR_EINVAL;
+    uint64_t n = size / GUEST_PAGE_SIZE;
+    uint64_t *pages = (uint64_t *)malloc(n * sizeof(uint64_t));
+    if (!pages) return SCE_KERNEL_ERROR_ENOMEM;
+    pal_mutex_lock(g_amm_lock);
+    int32_t e = 0;
+    uint64_t own = 0;
+    for (uint64_t i = 0; i < n && !e; i++) {
+        pages[i] = amm_get(src + i * GUEST_PAGE_SIZE);
+        if (!(pages[i] & AMMP_MAPPED)) e = SCE_KERNEL_ERROR_EINVAL;
+        else if (!(pages[i] & AMMP_DIRECT)) own++;
+    }
+    if (!e && kind == AMM_REMAP_INTO_PRT && !amm_all(dst, size, AMMP_PRT)) e = SCE_KERNEL_ERROR_EINVAL;
+    uint8_t *bytes = !e && own ? (uint8_t *)malloc(size) : NULL;
+    if (!e && own && (!bytes || !gmem_read(c->mem, src, bytes, size))) e = SCE_KERNEL_ERROR_ENOMEM;
+    if (!e && own && kind == AMM_REMAP_ALIAS) {
+        static int warned;
+        if (!warned++) LOG_W(KERNEL, "amm: multimap of memory of its own at 0x%llx: copied, not shared",
+                             (unsigned long long)src);
+    }
+    if (!e && kind != AMM_REMAP_ALIAS) {
+        e = do_munmap(c, src, size);
+        if (!e) amm_set(src, size, 0, 0, 0);
+    }
+    uint32_t extra = kind == AMM_REMAP_INTO_PRT ? AMMP_PRT : 0;
+    for (uint64_t i = 0; i < n && !e;) {
+        bool direct = (pages[i] & AMMP_DIRECT) != 0;
+        uint64_t j = i + 1;
+        while (j < n && ((pages[j] & AMMP_DIRECT) != 0) == direct &&
+               (!direct || AMMP_OFFSET(pages[j]) == AMMP_OFFSET(pages[i]) + (j - i) * GUEST_PAGE_SIZE))
+            j++;
+        guest_addr at = dst + i * GUEST_PAGE_SIZE;
+        uint64_t len = (j - i) * GUEST_PAGE_SIZE;
+        if (direct) {
+            e = amm_map_locked(c, at, len, prot, true, AMMP_OFFSET(pages[i]), extra);
+        } else {
+            e = amm_map_locked(c, at, len, prot | SCE_PROT_CPU_READ | SCE_PROT_CPU_WRITE, false, 0, extra);
+            if (!e && !gmem_write(c->mem, at, bytes + i * GUEST_PAGE_SIZE, len)) e = SCE_KERNEL_ERROR_EINVAL;
+            if (!e && to_gprot(prot) != to_gprot(prot | SCE_PROT_CPU_READ | SCE_PROT_CPU_WRITE) &&
+                gmem_protect(c->mem, at, len, to_gprot(prot)) != PS5C_OK)
+                e = SCE_KERNEL_ERROR_EINVAL;
+            if (!e) amm_set(at, len, 0, prot, AMMP_MAPPED | extra);
+        }
+        i = j;
+    }
+    pal_mutex_unlock(g_amm_lock);
+    free(bytes);
+    free(pages);
+    return e;
+}
+
+int32_t kernel_amm_protect(hle_call *c, guest_addr va, uint64_t size, uint32_t prot, uint32_t mask) {
+    if (!amm_window(va, size)) return SCE_KERNEL_ERROR_EINVAL;
+    pal_mutex_lock(g_amm_lock);
+    int32_t e = amm_all(va, size, AMMP_MAPPED) ? 0 : SCE_KERNEL_ERROR_EINVAL;
+    for (uint64_t p = 0; p < size && !e;) {
+        uint64_t first = amm_get(va + p);
+        uint32_t want = (AMMP_PROT(first) & ~mask) | (prot & mask);
+        uint64_t q = p + GUEST_PAGE_SIZE;
+        while (q < size && ((AMMP_PROT(amm_get(va + q)) & ~mask) | (prot & mask)) == want) q += GUEST_PAGE_SIZE;
+        if (gmem_protect(c->mem, va + p, q - p, to_gprot(want)) != PS5C_OK) e = SCE_KERNEL_ERROR_EINVAL;
+        for (; !e && p < q; p += GUEST_PAGE_SIZE) {
+            uint64_t old = amm_get(va + p);
+            amm_set(va + p, GUEST_PAGE_SIZE, AMMP_OFFSET(old), want, (uint32_t)old & 7u);
+        }
+    }
+    pal_mutex_unlock(g_amm_lock);
+    return e;
+}
+
+int32_t kernel_amm_prt(hle_call *c, guest_addr va, uint64_t size, uint32_t kind, uint32_t prot) {
+    if (!amm_window(va, size) || kind > AMM_PRT_ALLOCATE) return SCE_KERNEL_ERROR_EINVAL;
+    pal_mutex_lock(g_amm_lock);
+    int32_t e = 0;
+    if (kind != AMM_PRT_MAP && !amm_all(va, size, AMMP_PRT)) e = SCE_KERNEL_ERROR_EINVAL;
+    else if (kind != AMM_PRT_ALLOCATE) e = amm_prt_unback(c, va, size);
+    else
+        /* runs of unbacked pages get memory (zero); backed ones (remapped into the range) their prot */
+        for (uint64_t p = 0; p < size && !e;) {
+            bool backed = (amm_get(va + p) & AMMP_MAPPED) != 0;
+            uint64_t q = p + GUEST_PAGE_SIZE;
+            while (q < size && ((amm_get(va + q) & AMMP_MAPPED) != 0) == backed) q += GUEST_PAGE_SIZE;
+            if (!backed) {
+                e = amm_map_locked(c, va + p, q - p, prot, false, 0, AMMP_PRT);
+            } else if (gmem_protect(c->mem, va + p, q - p, to_gprot(prot)) != PS5C_OK) {
+                e = SCE_KERNEL_ERROR_EINVAL;
+            } else {
+                for (uint64_t r = p; r < q; r += GUEST_PAGE_SIZE) {
+                    uint64_t old = amm_get(va + r);
+                    amm_set(va + r, GUEST_PAGE_SIZE, AMMP_OFFSET(old), prot, (uint32_t)old & 7u);
+                }
+            }
+            p = q;
+        }
+    pal_mutex_unlock(g_amm_lock);
+    return e;
 }
 
 static const hle_export k_exports[] = {
@@ -1570,7 +1748,8 @@ static const hle_export k_exports[] = {
 };
 
 void hle_register_libkernel_memory(void) {
-    if (!g_lock && pal_mutex_create(&g_lock) != PS5C_OK) {
+    if ((!g_lock && pal_mutex_create(&g_lock) != PS5C_OK) ||
+        (!g_amm_lock && pal_mutex_create(&g_amm_lock) != PS5C_OK)) {
         LOG_E(KERNEL, "cannot create the memory lock");
         return;
     }

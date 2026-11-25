@@ -21,9 +21,7 @@ Put these files, already extracted and decrypted from YOUR OWN PS5, in system\mo
 (on the console, they are in /system/common/lib/):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 Some games require these libraries; the launcher lists any that are missing.
 They NEVER come with the emulator and should not be shared with others

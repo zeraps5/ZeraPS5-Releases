@@ -311,8 +311,66 @@ static void write_address(hle_call *c) {
 static void write_address_time(hle_call *c) {
     put_write(c, hle_arg_ptr(c, 1), 0, AMPR_WRITE_TIME);
 }
+/* (cb, address, counter[, at start]): counter's 32 bits, or the pair's 64 (counter even) */
 static void write_address_counter(hle_call *c) {
-    put_write(c, hle_arg_ptr(c, 1), 0, AMPR_WRITE_ZERO);
+    if (hle_arg_u32(c, 2) >= 128) {
+        ret(c, E_INVAL);
+        return;
+    }
+    put_write(c, hle_arg_ptr(c, 1), hle_arg_u32(c, 2) & 0xFF, AMPR_WRITE_COUNTER);
+}
+static void write_address_counter_pair(hle_call *c) {
+    if (hle_arg_u32(c, 2) & 0x81) {
+        ret(c, E_INVAL);
+        return;
+    }
+    put_write(c, hle_arg_ptr(c, 1), hle_arg_u32(c, 2) & 0xFF, AMPR_WRITE_COUNTER_PAIR);
+}
+
+/* The counters (lib_kernel_apr.c): their 0xF1/0xF2 records, as AnyPS5's libSceAmpr checks them */
+static void counter_record(hle_call *c, uint8_t op, uint8_t counter, uint8_t access, uint8_t b3, uint64_t q1,
+                           uint64_t q2) {
+    uint8_t rec[0x20] = {op, counter, access, b3};
+    memcpy(rec + 8, &q1, 8), memcpy(rec + 16, &q2, 8);
+    ret(c, append(c, hle_arg_ptr(c, 0), rec, sizeof(rec)));
+}
+/* (cb, counter, value): stores 32 bits */
+static void write_counter(hle_call *c) {
+    uint32_t n = hle_arg_u32(c, 1) & 0xFF;
+    if (n >= 128) {
+        ret(c, E_INVAL);
+        return;
+    }
+    counter_record(c, AMPR_OP_COUNTER_WRITE, (uint8_t)n, 1, 0, hle_arg_u32(c, 2), 0);
+}
+/* (cb, counter, access, value, operation, at start) */
+static void write_counter_04_00(hle_call *c) {
+    uint32_t n = hle_arg_u32(c, 1) & 0xFF, access = hle_arg_u32(c, 2) & 0xFF, op = hle_arg_u32(c, 4) & 0xFF;
+    if ((n & 0x80) || access >= 8 || op >= 5) {
+        ret(c, E_INVAL);
+        return;
+    }
+    counter_record(c, AMPR_OP_COUNTER_WRITE, (uint8_t)n, (uint8_t)access, (uint8_t)op, hle_arg(c, 3), 0);
+}
+/* (cb, counter, reference, compare, flush): 32 bits */
+static void wait_on_counter(hle_call *c) {
+    uint32_t n = hle_arg_u32(c, 1) & 0xFF, cmp = hle_arg_u32(c, 3) & 0xFF;
+    if (n >= 128 || cmp >= 4 || (hle_arg_u32(c, 4) & 0xFF) >= 2) {
+        ret(c, E_INVAL);
+        return;
+    }
+    counter_record(c, AMPR_OP_COUNTER_WAIT, (uint8_t)n, 1, (uint8_t)cmp, hle_arg_u32(c, 2), ~0ull);
+}
+/* (cb, counter, access, reference, compare, mask operation, mask, flush) */
+static void wait_on_counter_04_00(hle_call *c) {
+    uint32_t n = hle_arg_u32(c, 1) & 0xFF, access = hle_arg_u32(c, 2) & 0xFF, cmp = hle_arg_u32(c, 4) & 0xFF;
+    uint32_t mask_op = hle_arg_u32(c, 5) & 0xFF;
+    if (access >= 8 || cmp > 6 || mask_op >= 2 || (hle_arg_u32(c, 7) & 0xFF) >= 2) {
+        ret(c, E_INVAL);
+        return;
+    }
+    counter_record(c, AMPR_OP_COUNTER_WAIT, (uint8_t)n, (uint8_t)access, (uint8_t)cmp, hle_arg(c, 3),
+                   mask_op ? hle_arg(c, 6) : ~0ull);
 }
 
 /* (cb, address, value, compare, flags) */
@@ -330,10 +388,7 @@ static void wait_on_address(hle_call *c) {
     ret(c, append(c, hle_arg_ptr(c, 0), rec, sizeof(rec)));
 }
 
-/* Commands without effect here: counters, markers, nops, the map brackets */
-static void skip_0x20(hle_call *c) {
-    ret(c, append_skip(c, hle_arg_ptr(c, 0), 0x20));
-}
+/* Commands without effect here: markers, nops, the map brackets */
 static void nop(hle_call *c) {
     uint32_t n = hle_arg_u32(c, 1);
     if (!n || n > 16) {
@@ -517,6 +572,90 @@ static void measure_0x30(hle_call *c) {
     hle_ret_u64(c, 0x30);
 }
 
+/* The remap and PRT records (ampr_records.h); 0 or the error code */
+static int32_t remap_record(uint8_t rec[0x30], uint64_t va, uint64_t src, uint64_t size, uint32_t prot, uint32_t kind) {
+    if (!amm_range_ok(va, size) || !amm_range_ok(src, size)) return E_INVAL;
+    memset(rec, 0, 0x30);
+    uint32_t w0 = AMPR_OP_AMM_REMAP | (amm_prot(prot) & 0xFFFF) << 8;
+    memcpy(rec, &w0, 4), memcpy(rec + 4, &kind, 4), memcpy(rec + 8, &va, 8), memcpy(rec + 16, &size, 8);
+    memcpy(rec + 24, &src, 8);
+    return 0;
+}
+static int32_t small_record(uint8_t rec[0x20], uint8_t op, uint64_t va, uint64_t size, uint32_t prot, uint32_t dw1) {
+    if (!amm_range_ok(va, size)) return E_INVAL;
+    memset(rec, 0, 0x20);
+    uint32_t w0 = op | (prot & 0xFFFF) << 8;
+    memcpy(rec, &w0, 4), memcpy(rec + 4, &dw1, 4), memcpy(rec + 8, &va, 8), memcpy(rec + 16, &size, 8);
+    return 0;
+}
+static void append_or_fail(hle_call *c, int32_t e, const uint8_t *rec, uint32_t bytes) {
+    ret(c, e ? e : append(c, hle_arg_ptr(c, 0), rec, bytes));
+}
+
+/* Remap / MultiMap (cb, va, source, size, prot[, gpu mask id]); RemapIntoPrt (cb, va, source, size,
+ * prot, opcode) */
+static void amm_remap_kind(hle_call *c, uint32_t kind) {
+    uint8_t rec[0x30];
+    append_or_fail(c, remap_record(rec, hle_arg(c, 1), hle_arg(c, 2), hle_arg(c, 3), hle_arg_u32(c, 4), kind), rec,
+                   sizeof(rec));
+}
+static void amm_remap(hle_call *c) { amm_remap_kind(c, AMM_REMAP_MOVE); }
+static void amm_multimap(hle_call *c) { amm_remap_kind(c, AMM_REMAP_ALIAS); }
+static void amm_remap_into_prt(hle_call *c) { amm_remap_kind(c, AMM_REMAP_INTO_PRT); }
+
+/* ModifyProtect (cb, va, size, prot, mask[, gpu mask id]); ModifyMtypeProtect (cb, va, size, type,
+ * prot, mask[, gpu mask id]) */
+static void amm_modify_protect(hle_call *c) {
+    uint8_t rec[0x20];
+    append_or_fail(c, small_record(rec, AMPR_OP_AMM_PROTECT, hle_arg(c, 1), hle_arg(c, 2), amm_prot(hle_arg_u32(c, 3)),
+                                   amm_prot(hle_arg_u32(c, 4))),
+                   rec, sizeof(rec));
+}
+static void amm_modify_mtype_protect(hle_call *c) {
+    uint8_t rec[0x20];
+    append_or_fail(c, small_record(rec, AMPR_OP_AMM_PROTECT, hle_arg(c, 1), hle_arg(c, 2), amm_prot(hle_arg_u32(c, 4)),
+                                   amm_prot(hle_arg_u32(c, 5))),
+                   rec, sizeof(rec));
+}
+
+/* MapAsPrt / UnmapToPrt (cb, va, size); AllocatePaForPrt (cb, va, size, type, prot) */
+static void amm_prt_kind(hle_call *c, uint32_t kind, uint32_t prot) {
+    uint8_t rec[0x20];
+    append_or_fail(c, small_record(rec, AMPR_OP_AMM_PRT, hle_arg(c, 1), hle_arg(c, 2), prot, kind), rec, sizeof(rec));
+}
+static void amm_map_as_prt(hle_call *c) { amm_prt_kind(c, AMM_PRT_MAP, 0); }
+static void amm_unmap_to_prt(hle_call *c) { amm_prt_kind(c, AMM_PRT_UNMAP, 0); }
+static void amm_allocate_pa_for_prt(hle_call *c) { amm_prt_kind(c, AMM_PRT_ALLOCATE, amm_prot(hle_arg_u32(c, 4))); }
+
+static void measure_remap(hle_call *c) { /* (va, source, size, prot) */
+    hle_ret_u64(c, amm_range_ok(hle_arg(c, 0), hle_arg(c, 2)) && amm_range_ok(hle_arg(c, 1), hle_arg(c, 2))
+                       ? 0x30
+                       : (uint32_t)E_INVAL);
+}
+static void measure_amm_0x20(hle_call *c) { /* (va, size, ...) */
+    hle_ret_u64(c, amm_range_ok(hle_arg(c, 0), hle_arg(c, 1)) ? 0x20 : (uint32_t)E_INVAL);
+}
+
+/* libkernel's command writers: the record into dst (when given), its size into *size.
+ * sceKernelWriteModifyMtypeProtectCommand(dst, va, size, type, prot, mask, uint64_t *bytes) and
+ * sceKernelWriteRemapIntoPrtCommand(dst, va, source, size, prot, opcode, uint64_t *bytes) */
+static void write_command(hle_call *c, int32_t e, const uint8_t *rec, uint32_t bytes) {
+    if (!e && hle_arg_ptr(c, 0) && !gmem_write(c->mem, hle_arg_ptr(c, 0), rec, bytes)) e = E_FAULT;
+    if (!e && hle_arg_ptr(c, 6)) wr64(c, hle_arg_ptr(c, 6), bytes);
+    ret(c, e);
+}
+static void kernel_write_mtype_protect(hle_call *c) {
+    uint8_t rec[0x20];
+    write_command(c, small_record(rec, AMPR_OP_AMM_PROTECT, hle_arg(c, 1), hle_arg(c, 2), amm_prot(hle_arg_u32(c, 4)),
+                                  amm_prot(hle_arg_u32(c, 5))),
+                  rec, sizeof(rec));
+}
+static void kernel_write_remap_into_prt(hle_call *c) {
+    uint8_t rec[0x30];
+    write_command(c, remap_record(rec, hle_arg(c, 1), hle_arg(c, 2), hle_arg(c, 3), hle_arg_u32(c, 4), AMM_REMAP_INTO_PRT),
+                  rec, sizeof(rec));
+}
+
 /* (search start, search end, size, align, usage, int64 *dmem offset) */
 static void amm_give_direct_memory(hle_call *c) {
     uint64_t size = hle_arg(c, 2), align = hle_arg(c, 3), out = 0;
@@ -552,8 +691,9 @@ static void amm_get_usage_stats(hle_call *c) {
     ret(c, gmem_write(c->mem, p, st, (size_t)want) ? 0 : E_FAULT);
 }
 
-/* (cb, bytes, priority[, ...]): Submit2 adds uint32 *id, Submit3 result * and uint32 *id
- * (as KytyPS5 has them: AndGetId, AndGetResult) */
+/* (cb, bytes, priority[, ...]): Submit2 adds result * and uint32 *id (AndGetResult), Submit3
+ * uint32 *id (AndGetId). Planet Zoo 2 calls Submit2 as submitCommandBufferAndGetResult and checks
+ * the result; AnyPS5 and rps5e have them this way too. */
 static bool amm_submit_ok(hle_call *c) {
     return hle_arg_ptr(c, 0) && hle_arg_u32(c, 1) && hle_arg_u32(c, 2) <= 2;
 }
@@ -596,6 +736,32 @@ static const hle_export k_exports[] = {
     F("sceAmprAmmCommandBufferMapDirect", amm_map_direct),
     F("sceAmprAmmCommandBufferMapDirectWithGpuMaskId", amm_map_direct),
     F("sceAmprAmmCommandBufferUnmap", amm_unmap),
+    F("sceAmprAmmCommandBufferRemap", amm_remap),
+    F("sceAmprAmmCommandBufferRemapWithGpuMaskId", amm_remap),
+    F("sceAmprAmmCommandBufferMultiMap", amm_multimap),
+    F("sceAmprAmmCommandBufferMultiMapWithGpuMaskId", amm_multimap),
+    F("sceAmprAmmCommandBufferModifyProtect", amm_modify_protect),
+    F("sceAmprAmmCommandBufferModifyProtectWithGpuMaskId", amm_modify_protect),
+    F("sceAmprAmmCommandBufferModifyMtypeProtect", amm_modify_mtype_protect),
+    F("sceAmprAmmCommandBufferModifyMtypeProtectWithGpuMaskId", amm_modify_mtype_protect),
+    F("sceAmprAmmCommandBufferMapAsPrt", amm_map_as_prt),
+    F("sceAmprAmmCommandBufferUnmapToPrt", amm_unmap_to_prt),
+    F("sceAmprAmmCommandBufferAllocatePaForPrt", amm_allocate_pa_for_prt),
+    F("sceAmprAmmCommandBufferRemapIntoPrt", amm_remap_into_prt),
+    F("sceAmprAmmMeasureAmmCommandSizeRemap", measure_remap),
+    F("sceAmprAmmMeasureAmmCommandSizeRemapWithGpuMaskId", measure_remap),
+    F("sceAmprAmmMeasureAmmCommandSizeMultiMap", measure_remap),
+    F("sceAmprAmmMeasureAmmCommandSizeMultiMapWithGpuMaskId", measure_remap),
+    F("sceAmprAmmMeasureAmmCommandSizeModifyProtect", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeModifyProtectWithGpuMaskId", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeModifyMtypeProtect", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeModifyMtypeProtectWithGpuMaskId", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeMapAsPrt", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeUnmapToPrt", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeAllocatePaForPrt", measure_amm_0x20),
+    F("sceAmprAmmMeasureAmmCommandSizeRemapIntoPrt", measure_remap),
+    HLE_FUNC_ENTRY("libkernel", "sceKernelWriteModifyMtypeProtectCommand", kernel_write_mtype_protect),
+    HLE_FUNC_ENTRY("libkernel", "sceKernelWriteRemapIntoPrtCommand", kernel_write_remap_into_prt),
     F("sceAmprAmmMeasureAmmCommandSizeMap", measure_0x20),
     F("sceAmprAmmMeasureAmmCommandSizeMapWithGpuMaskId", measure_0x20),
     F("sceAmprAmmMeasureAmmCommandSizeMapDirect", measure_0x30),
@@ -606,8 +772,8 @@ static const hle_export k_exports[] = {
     F("sceAmprAmmGetUsageStatsData", amm_get_usage_stats),
     F("sceAmprAmmSetPageTablePoolOccupancyNotificationThreshold", ok),
     F("sceAmprAmmSubmitCommandBuffer", amm_submit),
-    F("sceAmprAmmSubmitCommandBuffer2", amm_submit_and_get_id),
-    F("sceAmprAmmSubmitCommandBuffer3", amm_submit_and_get_result),
+    F("sceAmprAmmSubmitCommandBuffer2", amm_submit_and_get_result),
+    F("sceAmprAmmSubmitCommandBuffer3", amm_submit_and_get_id),
     F("sceAmprAmmWaitCommandBufferCompletion", amm_wait_completion),
     F("sceAmprCommandBufferConstructor", cb_constructor),
     F("sceAmprCommandBufferDestructor", ok),
@@ -639,14 +805,14 @@ static const hle_export k_exports[] = {
     F("sceAmprCommandBufferWriteAddressFromTimeCounterOnCompletion", write_address_time),
     F("sceAmprCommandBufferWriteAddressFromCounter_04_00", write_address_counter),
     F("sceAmprCommandBufferWriteAddressFromCounterOnCompletion", write_address_counter),
-    F("sceAmprCommandBufferWriteAddressFromCounterPair_04_00", write_address_counter),
-    F("sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", write_address_counter),
-    F("sceAmprCommandBufferWriteCounter_04_00", skip_0x20),
-    F("sceAmprCommandBufferWriteCounterOnCompletion", skip_0x20),
+    F("sceAmprCommandBufferWriteAddressFromCounterPair_04_00", write_address_counter_pair),
+    F("sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", write_address_counter_pair),
+    F("sceAmprCommandBufferWriteCounter_04_00", write_counter_04_00),
+    F("sceAmprCommandBufferWriteCounterOnCompletion", write_counter),
     F("sceAmprCommandBufferWaitOnAddress", wait_on_address),
     F("sceAmprCommandBufferWaitOnAddress_04_00", wait_on_address),
-    F("sceAmprCommandBufferWaitOnCounter", skip_0x20),
-    F("sceAmprCommandBufferWaitOnCounter_04_00", skip_0x20),
+    F("sceAmprCommandBufferWaitOnCounter", wait_on_counter),
+    F("sceAmprCommandBufferWaitOnCounter_04_00", wait_on_counter_04_00),
     F("sceAmprCommandBufferNop", nop),
     F("sceAmprCommandBufferNopWithData", nop_with_data),
     F("sceAmprCommandBufferConstructNop", construct_nop),

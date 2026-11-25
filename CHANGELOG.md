@@ -1,5 +1,14 @@
 # Release changelog
 
+## v0.1.1-b1191 — 25 November 2026
+
+- Vulkan presentation can locate the rendered image when it was registered through another mapping of the same memory.
+- Compute batches flush a full writeback list before recording new stores. CPU writeback baselines come from the exact GPU upload snapshot.
+- Compute pipelines require 32-lane subgroups only when their shaders depend on subgroup width. Supported Unreal profiles can be read from PKG and exFAT applications.
+- Added PlayStation semaphore and Audio3D handling, extended AMM/AMPR memory and file handling, and added a PSML fallback outside PS5 Pro PSSR.
+- The launcher displays the game and system library counts even when no system libraries are installed. It identifies required console modules when a game reports them missing.
+- The Windows package includes source, licenses and relinkable objects. Console firmware and shaders extracted from it are excluded.
+
 ## v0.1.1-b1152 — 24 November 2026 UTC
 
 - **System libraries (HLE).** Added **125 function exports** across the emulated libraries, counted by library and symbol ID. This includes full or partial implementations and compatibility stubs. Highlights include **5 zlib exports** for decompression and result handling, **4 JPEG encoding exports**, **5 JSON2 exports**, and **5 AJM exports** for MP3 frame parsing and batched audio jobs. The kernel paths also gained flexible-memory release and page-table statistics.

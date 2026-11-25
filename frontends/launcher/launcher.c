@@ -1901,10 +1901,8 @@ static void fill_list(void) {
     wchar_t text[512];
     if (!nf) {
         swprintf(text, 512, ui_string(L"Nenhuma pasta de jogos: adicione uma em Configurações."));
-    } else if (modules) {
-        swprintf(text, 512, ui_string(L"%d jogo(s) em %d pasta(s)    /    bibliotecas de sistema: %d"), g_count, nf, modules);
     } else {
-        swprintf(text,512,L"%ls",ui_string(L"Adicione em system/modules as bibliotecas extraídas do seu próprio console."));
+        swprintf(text, 512, ui_string(L"%d jogo(s) em %d pasta(s)    /    bibliotecas de sistema: %d"), g_count, nf, modules);
     }
     SetWindowTextW(g_banner, text);
 }

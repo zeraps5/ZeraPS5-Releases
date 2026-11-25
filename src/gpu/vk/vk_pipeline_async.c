@@ -44,6 +44,7 @@ typedef struct job {
     bool listed; /* in pipelines-list.bin */
     bool late;   /* asked for by a draw: its SPIR-V travels with it, a failure is final */
     bool over;   /* past the wait budget: draws are skipped until it is built */
+    bool over_compute; /* past compute_budget: dispatches are skipped too */
     bool prewarm; /* counted once in the initial queue, even when a draw promotes it */
     uint32_t *words[2];
     size_t n[2];
@@ -70,6 +71,7 @@ static struct {
     pal_thread *workers[MAX_WORKERS];
     uint32_t nworkers, running, busy, busy_late;
     uint64_t wait_budget;
+    uint64_t compute_budget; /* a dispatch's wait (0: until done) */
     pal_file *list;
     uint64_t list_end;
     uint64_t list_limit, recipe_budget, source_budget;
@@ -372,6 +374,13 @@ void vk_pipeline_async_start(renderer *r) {
     if (!n) n = 1; /* draws' builds need one */
     const char *wait = getenv("PS5C_PIPELINE_WAIT_MS");
     g.wait_budget = (wait ? (uint64_t)atoll(wait) : 2000) * 1000000ull;
+    /* A dispatch waits for its pipeline (its side effects may be seen only once), but not
+     * without end: Intel's compiler did not finish Darwin's Paradox's 12k-instruction f16
+     * compute (3 MB of SPIR-V) in minutes, and the game stopped behind it. Past this wait
+     * the dispatches of that pipeline are skipped while the build goes on.
+     * PS5C_COMPUTE_PIPELINE_WAIT_MS=0: wait until done, as before. */
+    const char *cwait = getenv("PS5C_COMPUTE_PIPELINE_WAIT_MS");
+    g.compute_budget = (cwait ? (uint64_t)atoll(cwait) : 30000) * 1000000ull;
     g.pre_start = pal_time_ns();
     /* workers start by taking the lock: each is counted before any can finish */
     pal_mutex_lock(g.lock);
@@ -453,8 +462,9 @@ bool vk_pipeline_async_get(renderer *r, const void *recipe, const uint32_t *cons
     }
     uint64_t at = 0;
     job *j = hmap64_get(&g.index, key, &at) ? g.jobs[at] : NULL;
-    if (!must_complete && j && j->over && (j->state == J_QUEUED || j->state == J_RUNNING)) {
-        /* already over its budget once: skipped again without waiting */
+    if (j && (must_complete ? j->over_compute : j->over) && (j->state == J_QUEUED || j->state == J_RUNNING)) {
+        /* already over its budget once: skipped again without waiting (a dispatch
+         * only once a dispatch waited out compute_budget, not a draw's budget) */
         pal_mutex_unlock(g.lock);
         *pending = true;
         return false;
@@ -475,14 +485,16 @@ retry_build:
         }
         handed = true;
     }
-    uint64_t budget = must_complete ? 0 : g.wait_budget;
+    uint64_t budget = must_complete ? g.compute_budget : g.wait_budget;
     while (j->state == J_QUEUED || j->state == J_RUNNING) {
         uint64_t spent = pal_time_ns() - t0;
         if (budget && spent >= budget) {
             static uint32_t told;
             if (told++ < 16)
-                LOG_W(GPU, "pipeline build over %.0f ms: its draws are skipped until it is done", (double)g.wait_budget / 1e6);
+                LOG_W(GPU, "pipeline build over %.0f ms: its %s skipped until it is done", (double)budget / 1e6,
+                      must_complete ? "dispatches are" : "draws are");
             j->over = true; /* the next draws do not wait for it */
+            if (must_complete) j->over_compute = true;
             pal_mutex_unlock(g.lock);
             vk_pipeline_async_note_wait(spent, handed);
             *pending = true;

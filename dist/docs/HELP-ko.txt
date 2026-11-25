@@ -21,9 +21,7 @@ dist/LEIA-ME-system.txt
 (콘솔의 /system/common/lib/에 있습니다):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 일부 게임에는 이 라이브러리가 필요합니다. 런처가 누락된 라이브러리를 표시합니다.
 그들은 절대 에뮬레이터와 함께 오지 않으며 다른 사람들과 공유해서는 안됩니다.

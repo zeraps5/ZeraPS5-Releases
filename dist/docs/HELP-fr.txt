@@ -21,9 +21,7 @@ Placez dans system\modules\ ces fichiers déjà extraits et déchiffrés depuis 
 (ils se trouvent dans /system/common/lib/ sur la console) :
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 Certains jeux nécessitent ces bibliothèques ; le lanceur indique celles qui manquent.
 Ils ne viennent jamais avec l'émulateur et ne doivent pas être partagés avec d'autres

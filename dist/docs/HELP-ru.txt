@@ -21,9 +21,7 @@ dist/LEIA-ME-system.txt
 (на консоли они находятся в /system/common/lib/):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 Некоторым играм нужны эти библиотеки; программа запуска указывает, каких не хватает.
 Они никогда не приходят с эмулатором и не должны быть совместными с другими

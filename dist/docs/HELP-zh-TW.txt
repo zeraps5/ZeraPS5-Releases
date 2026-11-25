@@ -21,9 +21,7 @@ dist/LEIA-ME-system.txt
 （在主機上位於 /system/common/lib/）：
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 部分遊戲需要這些程式庫；啟動器會列出缺少的程式庫。
 他們從來沒有與模擬器一起來,也不應該與其他人分享。

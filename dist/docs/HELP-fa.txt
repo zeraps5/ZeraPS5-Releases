@@ -21,9 +21,7 @@ dist/LEIA-ME-system.txt
 (این فایل‌ها در کنسول در /system/common/lib/ قرار دارند):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 بعضی بازی‌ها به این کتابخانه‌ها نیاز دارند؛ راه‌انداز کتابخانه‌های موجودنبودن را نشان می‌دهد.
 آنها هرگز با امولار نمی آیند و نباید با دیگران به اشتراک گذاشته شوند

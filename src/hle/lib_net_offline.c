@@ -737,6 +737,20 @@ static void in6addr_loopback_init(struct ps5_runtime *rt, void *slot, size_t siz
     memcpy(slot, a, size < 16 ? size : 16);
 }
 
+/* int sceHttpInit(int libnetMemId, int libsslCtxId, size_t poolSize): its pool size, for
+ * sceHttpGetMemoryPoolStats(int ctx, SceHttpMemoryPoolStats *): pool size, peak and current use
+ * (nothing is allocated from it here), a reserved word */
+static uint64_t g_http_pool_size;
+static void http_init(hle_call *c) {
+    g_http_pool_size = hle_arg(c, 2);
+    new_id(c);
+}
+static void http_get_memory_pool_stats(hle_call *c) {
+    uint64_t stats[4] = {g_http_pool_size, 0, 0, 0};
+    guest_addr p = hle_arg_ptr(c, 1);
+    hle_ret_s32(c, !p ? HTTP_ERROR_INVALID_VALUE : gmem_write(c->mem, p, stats, sizeof(stats)) ? 0 : HTTP_ERROR_INVALID_VALUE);
+}
+
 #define H "libSceHttp"
 #define H2 "libSceHttp2"
 
@@ -902,7 +916,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY("libSceSsl", "sceSslGetCaCerts", ssl_get_ca_certs),
     HLE_FUNC_ENTRY("libSceSsl", "sceSslFreeCaCerts", ok),
     HLE_FUNC_ENTRY(H, "sceHttpUriEscape", http_uri_escape),
-    HLE_FUNC_ENTRY(H, "sceHttpInit", new_id),
+    HLE_FUNC_ENTRY(H, "sceHttpInit", http_init),
+    HLE_FUNC_ENTRY(H, "sceHttpGetMemoryPoolStats", http_get_memory_pool_stats),
     HLE_FUNC_ENTRY(H, "sceHttpTerm", ok),
     HLE_FUNC_ENTRY(H, "sceHttpCreateTemplate", new_id),
     HLE_FUNC_ENTRY(H, "sceHttpDeleteTemplate", ok),

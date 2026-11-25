@@ -7,6 +7,7 @@
  * Command buffer header (built by libSceAmpr, read here):
  *   +0x00 u32 type/flags   +0x04 u32 write offset   +0x08 u32 command count
  *   +0x0c u32 buffer size  +0x10 u64 record buffer address */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -440,6 +441,48 @@ static bool wait_satisfied(uint64_t v, uint64_t want, uint8_t cmp) {
     }
 }
 
+/* The AMPR counters: 256 32-bit words, shared by every queue (an AMM buffer may write one that an
+ * APR buffer waits on). Accesses: 0 = 64 bits (n and n + 1), 1 = 32, 2..3 = 16-bit halves, 4..7 bytes. */
+static _Atomic uint32_t g_counters[256];
+static atomic_flag g_counter_writing = ATOMIC_FLAG_INIT;
+
+static void counter_field(uint8_t access, uint32_t *bits, uint32_t *shift) {
+    *bits = access == 0 ? 64 : access == 1 ? 32 : access < 4 ? 16 : 8;
+    *shift = access < 2 ? 0 : access < 4 ? (access - 2u) * 16u : (access - 4u) * 8u;
+}
+static uint64_t field_mask(uint32_t bits) { return bits == 64 ? ~0ull : (1ull << bits) - 1u; }
+
+static uint64_t counter_read(uint8_t n, uint8_t access) {
+    uint32_t bits, shift;
+    counter_field(access, &bits, &shift);
+    uint64_t lo = atomic_load(&g_counters[n]);
+    if (bits == 64) return lo | (uint64_t)atomic_load(&g_counters[(uint8_t)(n + 1)]) << 32;
+    return (lo >> shift) & field_mask(bits);
+}
+
+static void counter_write(uint8_t n, uint8_t access, uint8_t op, uint64_t value) {
+    uint32_t bits, shift;
+    counter_field(access, &bits, &shift);
+    while (atomic_flag_test_and_set(&g_counter_writing)) {}
+    uint64_t cur = counter_read(n, access), next;
+    switch (op) {
+    case 1: next = cur | value; break;
+    case 2: next = cur & ~value; break;
+    case 3: next = cur ^ value; break;
+    case 4: next = cur + value; break;
+    default: next = value; break;
+    }
+    next &= field_mask(bits);
+    if (bits == 64) {
+        atomic_store(&g_counters[(uint8_t)(n + 1)], (uint32_t)(next >> 32));
+        atomic_store(&g_counters[n], (uint32_t)next);
+    } else {
+        uint32_t m = (uint32_t)(field_mask(bits) << shift);
+        atomic_store(&g_counters[n], (atomic_load(&g_counters[n]) & ~m) | (uint32_t)(next << shift));
+    }
+    atomic_flag_clear(&g_counter_writing);
+}
+
 /* One of libSceAmpr's records (ampr_records.h); false with *exec set on a failure. */
 static bool execute_ampr(hle_call *c, guest_addr cb, const uint8_t *r, int32_t *exec) {
     uint32_t w[5] = {0};
@@ -448,8 +491,8 @@ static bool execute_ampr(hle_call *c, guest_addr cb, const uint8_t *r, int32_t *
            : r[0] == AMPR_OP_GATHER_SCATTER   ? 16
                                               : 12);
     uint64_t q1 = 0, q2 = 0;
-    if (r[0] == AMPR_OP_EVENT || r[0] == AMPR_OP_WRITE || r[0] == AMPR_OP_WAIT || r[0] == AMPR_OP_AMM_MAP ||
-        r[0] == AMPR_OP_AMM_MAP_DIRECT || r[0] == AMPR_OP_AMM_UNMAP)
+    if (r[0] == AMPR_OP_EVENT || r[0] == AMPR_OP_WRITE || r[0] == AMPR_OP_WAIT ||
+        (r[0] >= AMPR_OP_AMM_MAP && r[0] != AMPR_OP_SKIP))
         memcpy(&q1, r + 8, 8), memcpy(&q2, r + 16, 8);
     gs_state gs = {cb, 0, 0, 0};
     uint64_t dest = 0, off = 0, size = (uint64_t)w[1] + 1;
@@ -478,9 +521,11 @@ static bool execute_ampr(hle_call *c, guest_addr cb, const uint8_t *r, int32_t *
                   (unsigned long long)q1);
         return true;
     case AMPR_OP_WRITE: {
-        uint64_t v = r[1] == AMPR_WRITE_TIME   ? ampr_time_counter()
-                     : r[1] == AMPR_WRITE_ZERO ? 0
-                                               : q2;
+        uint64_t v = r[1] == AMPR_WRITE_TIME           ? ampr_time_counter()
+                     : r[1] == AMPR_WRITE_ZERO         ? 0
+                     : r[1] == AMPR_WRITE_COUNTER      ? counter_read((uint8_t)q2, 1)
+                     : r[1] == AMPR_WRITE_COUNTER_PAIR ? counter_read((uint8_t)q2, 0)
+                                                       : q2;
         if (!gmem_write_u64(c->mem, q1, v)) {
             *exec = (int32_t)(0x80020000u | E_FAULT);
             return false;
@@ -515,6 +560,54 @@ static bool execute_ampr(hle_call *c, guest_addr cb, const uint8_t *r, int32_t *
             LOG_I(KERNEL, "amm: %s 0x%llx +0x%llx prot 0x%x%s -> 0x%x", r[0] == AMPR_OP_AMM_UNMAP ? "unmap" : "map",
                   (unsigned long long)q1, (unsigned long long)q2, (w[0] >> 8) & 0xFFFF,
                   r[0] == AMPR_OP_AMM_MAP_DIRECT ? " (direct)" : "", (uint32_t)e);
+        if (e) {
+            *exec = e;
+            return false;
+        }
+        return true;
+    }
+    case AMPR_OP_COUNTER_WRITE: counter_write(r[1], r[2], r[3], q1); return true;
+    case AMPR_OP_COUNTER_WAIT: {
+        /* narrow fields compare in the top bits, so the signed compares see their sign */
+        uint32_t bits, shift;
+        counter_field(r[2], &bits, &shift);
+        uint32_t up = 64 - bits;
+        uint64_t want = (q1 & q2) << up, t0 = pal_time_ns();
+        bool warned = false;
+        while (!wait_satisfied((counter_read(r[1], r[2]) & q2) << up, want, r[3])) {
+            pal_sleep_ns(50000);
+            if (!warned && pal_time_ns() - t0 > 5000000000ull) {
+                warned = true;
+                LOG_W(KERNEL, "apr: waiting 5 s on counter %u (0x%llx, want 0x%llx compare %u)", r[1],
+                      (unsigned long long)counter_read(r[1], r[2]), (unsigned long long)q1, r[3]);
+            }
+        }
+        if (warned) LOG_I(KERNEL, "apr: the wait on counter %u ended after %.1f s", r[1], (pal_time_ns() - t0) / 1e9);
+        return true;
+    }
+    case AMPR_OP_AMM_REMAP:
+    case AMPR_OP_AMM_PROTECT:
+    case AMPR_OP_AMM_PRT: {
+        uint32_t prot = (w[0] >> 8) & 0xFFFF;
+        uint64_t src = 0;
+        int32_t e;
+        const char *what;
+        if (r[0] == AMPR_OP_AMM_REMAP) {
+            memcpy(&src, r + 24, 8);
+            e = kernel_amm_remap(c, q1, src, q2, prot, w[1]);
+            what = w[1] == AMM_REMAP_ALIAS ? "multimap" : w[1] == AMM_REMAP_INTO_PRT ? "remap into prt" : "remap";
+        } else if (r[0] == AMPR_OP_AMM_PROTECT) {
+            e = kernel_amm_protect(c, q1, q2, prot, w[1]);
+            what = "protect";
+        } else {
+            e = kernel_amm_prt(c, q1, q2, w[1], prot);
+            what = w[1] == AMM_PRT_MAP ? "map as prt" : w[1] == AMM_PRT_UNMAP ? "unmap to prt" : "allocate for prt";
+        }
+        static int logging = -1;
+        if (logging < 0) logging = getenv("PS5C_LOG_AMM") != NULL;
+        if (logging || e)
+            LOG_I(KERNEL, "amm: %s 0x%llx +0x%llx prot 0x%x from 0x%llx -> 0x%x", what, (unsigned long long)q1,
+                  (unsigned long long)q2, prot, (unsigned long long)src, (uint32_t)e);
         if (e) {
             *exec = e;
             return false;

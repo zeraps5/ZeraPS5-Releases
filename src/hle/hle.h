@@ -144,6 +144,11 @@ void hle_register_audio_out2(void);
 void hle_register_fiber(void);
 void hle_register_ult(void);
 void hle_register_platform(void);
+void hle_register_psml(void);
+/* sceKernelIsTrinityMode(): the game runs in PS5 Pro mode (lib_kernel.c) */
+bool hle_kernel_trinity_mode(void);
+/* The executable's SDK version (procparam), as sceKernelGetCompiledSdkVersion reports it */
+uint32_t hle_kernel_compiled_sdk_version(hle_call *c);
 void hle_register_json2(void);
 void hle_register_rtc(void);
 void hle_register_net_offline(void);
@@ -162,6 +167,7 @@ void hle_register_jpeg_dec(void);
 void hle_register_audiodec(void);
 void hle_register_compat_stubs(void);
 void hle_register_zlib(void);
+void hle_register_audio3d(void);
 void hle_register_jpeg_enc(void);
 void hle_register_camera(void);
 void hle_register_ajm(void);

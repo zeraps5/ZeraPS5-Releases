@@ -192,6 +192,7 @@ add_library(ps5c_core STATIC
     src/hle/lib_audiodec.c
     src/hle/lib_compat_stubs.c
     src/hle/lib_zlib.c
+    src/hle/lib_audio3d.c
     src/hle/lib_jpeg_enc.c
     src/hle/png_decode.c
     src/hle/lib_ajm.c
@@ -207,6 +208,7 @@ add_library(ps5c_core STATIC
     src/hle/lib_net_offline.c
     src/hle/lib_ult.c
     src/hle/lib_platform.c
+    src/hle/lib_psml.c
     src/hle/lib_json2.c
     src/hle/lib_rtc.c
     src/hle/addcont.c

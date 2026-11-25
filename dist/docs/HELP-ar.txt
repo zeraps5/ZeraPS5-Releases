@@ -21,9 +21,7 @@ dist/LEIA-ME-system.txt
 (توجد في /system/common/lib/ على الجهاز):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 تحتاج بعض الألعاب إلى هذه المكتبات؛ ويعرض المشغل المكتبات المفقودة.
 لا يأتيون أبدا مع الماسح الضوئي ولا ينبغي أن تشارك مع الآخرين

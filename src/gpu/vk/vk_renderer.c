@@ -3398,14 +3398,18 @@ static void panel_draw(renderer *r, VkCommandBuffer cmd, VkImage sc, uint32_t fr
 }
 
 /* The surface the GPU wrote last at the display buffer: its size, else (no such image) one a few rows
- * taller, as a PS4 color target's tile-padded height (1080 rows in a 1088-row target). */
+ * taller, as a PS4 color target's tile-padded height (1080 rows in a 1088-row target). The buffer may
+ * be another view of memory whose image was made through an earlier address (The Messenger and
+ * Goodnight Universe map their framebuffer memory again and register it anew; their draws reuse the
+ * image of the first mapping, which an address-only match never found: black screen). */
 static vk_image *displayed_image(renderer *r, const renderer_surface *s) {
     vk_image *last = NULL;
+    uint64_t phys = vk_phys_of(r, s->addr);
     for (int pass = 0; pass < 2 && !last; pass++) {
         for (uint32_t i = 0; i < r->image_count; i++) {
             vk_image *img = &r->images[i];
             bool size = pass ? img->height > s->height && img->height <= s->height + 64 : img->height == s->height;
-            if (img->addr != s->addr || img->width != s->width || !size || !img->gpu_written) continue;
+            if (!at(img, s->addr, phys) || img->width != s->width || !size || !img->gpu_written) continue;
             if (!last || img->written_seq > last->written_seq) last = img; /* the most recent frame */
         }
     }

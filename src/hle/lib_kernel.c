@@ -337,7 +337,7 @@ static void debug_out_text(hle_call *c) {
 
 /* The SDK version the executable was built with: its SceProcParam's (u32 at +0x10, e.g.
  * 0x04508001), 5.00 without one */
-static uint32_t compiled_sdk_version(hle_call *c) {
+uint32_t hle_kernel_compiled_sdk_version(hle_call *c) {
     const loaded_module *m = module_set_main(c->rt->ms);
     uint32_t v = 0;
     if (m && m->mapped && m->img.procparam_vaddr && m->img.procparam_size >= 0x14)
@@ -356,7 +356,7 @@ static void get_compiled_sdk_version(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    *out = compiled_sdk_version(c);
+    *out = hle_kernel_compiled_sdk_version(c);
     hle_ret_s32(c, 0);
 }
 
@@ -369,7 +369,7 @@ static void get_prospero_system_sw_version(hle_call *c) {
         hle_ret_s32(c, 0);
         return;
     }
-    uint32_t v = compiled_sdk_version(c);
+    uint32_t v = hle_kernel_compiled_sdk_version(c);
     char text[0x1C] = {0};
     snprintf(text, sizeof(text), "%02x.%03x.%03x", v >> 24, (v >> 12) & 0xFFFu, v & 0xFFFu);
     bool ok = gmem_write(c->mem, info + 8, text, sizeof(text)) && gmem_write(c->mem, info + 0x24, &v, 4);
@@ -846,7 +846,7 @@ static void kernel_ok(hle_call *c) { hle_ret_s32(c, 0); }
 /* int sceKernelIsTrinityMode(void): the game runs in PS5 Pro mode. Only when the settings ask
  * for a PS5 Pro ([geral] console=1) and the game supports it (param.json attribute3 0x400000);
  * else a PS5, as before. */
-static bool trinity_mode(void) {
+bool hle_kernel_trinity_mode(void) {
     static int pro = -1;
     if (pro < 0) {
         int64_t attr3 = 0;
@@ -856,11 +856,14 @@ static bool trinity_mode(void) {
     }
     return pro;
 }
-static void kernel_is_trinity_mode(hle_call *c) { hle_ret_s32(c, trinity_mode()); }
+static void kernel_is_trinity_mode(hle_call *c) { hle_ret_s32(c, hle_kernel_trinity_mode()); }
+/* int sceKernelHasTrinityMode(void): the console can run games in PS5 Pro mode ([geral] console=1),
+ * whether or not this game supports it */
+static void kernel_has_trinity_mode(hle_call *c) { hle_ret_s32(c, settings_get_int("geral", "console", 0) == 1); }
 
 /* int sceKernelGetOperationMode(int *mode, int *submode): 2 = PS5, 3 = PS5 Pro mode; no submode */
 static void kernel_get_operation_mode(hle_call *c) {
-    int32_t mode = trinity_mode() ? 3 : 2, submode = 0;
+    int32_t mode = hle_kernel_trinity_mode() ? 3 : 2, submode = 0;
     if (hle_arg_ptr(c, 0)) gmem_write(c->mem, hle_arg_ptr(c, 0), &mode, 4);
     if (hle_arg_ptr(c, 1)) gmem_write(c->mem, hle_arg_ptr(c, 1), &submode, 4);
     hle_ret_s32(c, 0);
@@ -1029,6 +1032,7 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "physhm_open", shm_unsupported),
     HLE_FUNC_ENTRY(LIB, "physhm_unlink", shm_unsupported),
     HLE_FUNC_ENTRY(LIB, "sceKernelIsTrinityMode", kernel_is_trinity_mode),
+    HLE_FUNC_ENTRY(LIB, "sceKernelHasTrinityMode", kernel_has_trinity_mode),
     HLE_FUNC_ENTRY(LIB, "sceKernelGetOperationMode", kernel_get_operation_mode),
     HLE_FUNC_ENTRY(LIB, "sceKernelGetOpenPsId", get_open_ps_id),
     HLE_FUNC_ENTRY("libSceOpenPsId", "sceKernelGetOpenPsId", get_open_ps_id),

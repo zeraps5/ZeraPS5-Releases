@@ -9,6 +9,7 @@
 #include "base/sha1.h"
 #include "core/settings.h"
 #include "pal/pal.h"
+#include "pal/pal_exfat.h"
 
 #define PAK_MAGIC 0x5A6F12E1u
 #define PAK_FOOTER_V10 221u /* key GUID, encrypted flag, magic, version, index offset/size/hash, 5 x 32 names */
@@ -82,10 +83,35 @@ static void cstr(cursor *c, char *out, size_t cap) {
     out[w] = 0;
 }
 
-static bool read_at(pal_file *f, uint64_t offset, uint64_t size, uint8_t **out) {
+/* A pak on the host or inside a game image (.pkg / exFAT: /app0 is virtual there) */
+typedef struct pak_file {
+    pal_file *host;
+    exfat_file *image;
+} pak_file;
+
+static bool pak_open(const char *path, pak_file *f) {
+    *f = (pak_file){NULL, NULL};
+    if (exfat_path(path)) return exfat_open(path, PAL_FILE_READ, &f->image) == PS5C_OK;
+    return pal_file_open(path, PAL_FILE_READ, &f->host) == PS5C_OK;
+}
+static bool pak_size(pak_file *f, uint64_t *size) {
+    if (f->image) { *size = exfat_size(f->image); return true; }
+    return pal_file_size(f->host, size) == PS5C_OK;
+}
+static void pak_close(pak_file *f) {
+    if (f->image) exfat_close(f->image);
+    if (f->host) pal_file_close(f->host);
+}
+static ps5c_err list_dir(const char *path, pal_dir_fn fn, void *user) {
+    return exfat_path(path) ? exfat_list(path, fn, user) : pal_dir_list(path, fn, user);
+}
+
+static bool read_at(pak_file *f, uint64_t offset, uint64_t size, uint8_t **out) {
     *out = (uint8_t *)malloc(size ? size : 1);
     uint64_t got = 0;
-    if (*out && pal_file_pread(f, *out, size, offset, &got) == PS5C_OK && got == size) return true;
+    ps5c_err e = !*out ? PS5C_ERR_NOMEM
+               : f->image ? exfat_read(f->image, *out, size, offset, &got) : pal_file_pread(f->host, *out, size, offset, &got);
+    if (e == PS5C_OK && got == size) return true;
     free(*out);
     *out = NULL;
     return false;
@@ -98,12 +124,12 @@ static bool is_profile(const char *path) {
 
 /* The PS5 device profile of the game's project in one pak: its path and contents */
 static bool pak_profile(const char *pak, char *name, size_t name_cap, uint8_t **data, size_t *size) {
-    pal_file *f = NULL;
-    if (pal_file_open(pak, PAL_FILE_READ, &f) != PS5C_OK) return false;
+    pak_file pak_handle, *f = &pak_handle;
+    if (!pak_open(pak, f)) return false;
     bool ok = false;
     uint64_t total = 0;
     uint8_t *foot = NULL, *index = NULL, *fdi = NULL;
-    if (pal_file_size(f, &total) != PS5C_OK || total < PAK_FOOTER_V10 ||
+    if (!pak_size(f, &total) || total < PAK_FOOTER_V10 ||
         !read_at(f, total - PAK_FOOTER_V10, PAK_FOOTER_V10, &foot))
         goto done;
     uint32_t version = rd32(foot + 21);
@@ -155,7 +181,7 @@ done:
     free(foot);
     free(index);
     free(fdi);
-    pal_file_close(f);
+    pak_close(f);
     return ok;
 }
 
@@ -315,7 +341,7 @@ void ue_scale_prepare(const char *app_dir, const char *title_id) {
 
     /* the project folders beside engine/, with their paks in <project>/content/paks */
     scan projects = {NULL, {{0}}, 0};
-    if (pal_dir_list(app_dir, scan_entry, &projects) != PS5C_OK) return;
+    if (list_dir(app_dir, scan_entry, &projects) != PS5C_OK) return;
     qsort(projects.found, projects.count, sizeof(projects.found[0]), cmp_names);
     char profile_name[512] = {0}, path[900];
     uint8_t *profile = NULL;
@@ -326,7 +352,7 @@ void ue_scale_prepare(const char *app_dir, const char *title_id) {
         char paks_dir[600];
         snprintf(paks_dir, sizeof(paks_dir), "%s/%s/content/paks", app_dir, projects.found[i]);
         scan paks = {paks_dir, {{0}}, 0};
-        if (pal_dir_list(paks_dir, scan_entry, &paks) != PS5C_OK) continue;
+        if (list_dir(paks_dir, scan_entry, &paks) != PS5C_OK) continue;
         qsort(paks.found, paks.count, sizeof(paks.found[0]), cmp_names);
         for (uint32_t k = 0; k < paks.count && !profile; k++) {
             snprintf(path, sizeof(path), "%s/%s", paks_dir, paks.found[k]);

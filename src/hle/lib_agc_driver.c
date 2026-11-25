@@ -652,25 +652,15 @@ static void submit_dcb(hle_call *c) {
  * transient resources until all work ahead of this ordered suspension has
  * been executed (renderer_suspend_point: the host GPU too when its results
  * are owed to guest memory). */
-static void submit_suspend_point(hle_call *c) {
-    guest_addr addr;
-    uint32_t dwords;
-    if (!read_packet(c, hle_arg_ptr(c, 0), &addr, &dwords)) {
-        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-        return;
-    }
-    uint32_t *status = hle_arg_ptr(c, 1) ? (uint32_t *)hle_mem(c, hle_arg_ptr(c, 1), 4) : NULL;
-    if (hle_arg_ptr(c, 1) && !status) {
-        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-        return;
-    }
+static int32_t hle_agc_driver_suspend_point(hle_call *c, guest_addr addr, uint32_t dwords, guest_addr status_addr) {
+    uint32_t *status = status_addr ? (uint32_t *)hle_mem(c, status_addr, 4) : NULL;
+    if (status_addr && !status) return SCE_KERNEL_ERROR_EINVAL;
     /* A/B diagnostic for the former asynchronous return. */
     static int off = -1;
     if (off < 0) off = getenv("PS5C_WAIT_SUSPEND_POINT") && !atoi(getenv("PS5C_WAIT_SUSPEND_POINT"));
     if (off) {
         if (dwords) submit(c, addr, dwords, 0);
-        hle_ret_s32(c, 0);
-        return;
+        return 0;
     }
     uint64_t ticket = enqueue(c, addr, dwords, 0, true);
     pal_mutex_lock(g_drv.q_lock);
@@ -696,10 +686,26 @@ static void submit_suspend_point(hle_call *c) {
     }
     pal_mutex_unlock(g_drv.q_lock);
     if (status) *status = 0;
-    hle_ret_s32(c, 0);
+    return 0;
+}
+
+static void submit_suspend_point(hle_call *c) {
+    guest_addr addr;
+    uint32_t dwords;
+    if (!read_packet(c, hle_arg_ptr(c, 0), &addr, &dwords)) {
+        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
+        return;
+    }
+    hle_ret_s32(c, hle_agc_driver_suspend_point(c, addr, dwords, hle_arg_ptr(c, 1)));
 }
 
 /* int sceAgcDriverSubmitAcb(uint32_t queue, const packet *p) */
+static int32_t hle_agc_driver_submit_acb(hle_call *c, uint32_t queue, guest_addr addr, uint32_t dwords) {
+    /* compute queues are numbered from COMPUTE_QUEUE_EVENT_BASE; the queue number is its event id */
+    submit(c, addr, dwords, queue >= COMPUTE_QUEUE_EVENT_BASE ? (int32_t)queue : COMPUTE_QUEUE_EVENT_BASE + (int32_t)queue);
+    return 0;
+}
+
 static void submit_acb(hle_call *c) {
     guest_addr addr;
     uint32_t dwords;
@@ -707,10 +713,7 @@ static void submit_acb(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    /* compute queues are numbered from COMPUTE_QUEUE_EVENT_BASE; the queue number is its event id */
-    uint32_t queue = hle_arg_u32(c, 0);
-    submit(c, addr, dwords, queue >= COMPUTE_QUEUE_EVENT_BASE ? (int32_t)queue : COMPUTE_QUEUE_EVENT_BASE + (int32_t)queue);
-    hle_ret_s32(c, 0);
+    hle_ret_s32(c, hle_agc_driver_submit_acb(c, hle_arg_u32(c, 0), addr, dwords));
 }
 
 /* int sceAgcDriverSubmitMultiDcbs(uint32_t *const *addrs, const uint32_t *dwords, uint32_t count) */
@@ -868,57 +871,70 @@ static void get_eq_event_type(hle_call *c) {
  * Calls look like f(uint32_t **cursor, uint32_t dwords, uint32_t, ...): we write
  * `dwords` dwords at *cursor and advance it. */
 
-static uint32_t *packet_cursor(hle_call *c, uint32_t dwords, guest_addr *cursor_addr) {
-    *cursor_addr = hle_arg_ptr(c, 0);
+static uint32_t *packet_cursor(hle_call *c, uint32_t dwords, guest_addr cursor_addr) {
     uint64_t cursor = 0;
-    if (!gmem_read_u64(c->mem, *cursor_addr, &cursor)) return NULL;
+    if (!gmem_read_u64(c->mem, cursor_addr, &cursor)) return NULL;
     uint32_t *dst = (uint32_t *)hle_mem(c, cursor, (uint64_t)dwords * 4);
-    if (dst) gmem_write_u64(c->mem, *cursor_addr, cursor + (uint64_t)dwords * 4);
+    if (dst) gmem_write_u64(c->mem, cursor_addr, cursor + (uint64_t)dwords * 4);
     return dst;
 }
 
 static void set_flip_packet_size(hle_call *c) { hle_ret_u32(c, GPU_FLIP_PACKET_DWORDS); }
 
-/* int sceAgcDriverSetFlip(uint32_t **cursor, uint32_t dwords, uint32_t, int handle, int index, int mode,
- *                         int64_t arg) */
-static void set_flip(hle_call *c) {
-    uint32_t dwords = hle_arg_u32(c, 1);
-    guest_addr cursor;
-    uint32_t *dst = dwords >= GPU_FLIP_PACKET_DWORDS ? packet_cursor(c, dwords, &cursor) : NULL;
-    if (!dst) {
-        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-        return;
-    }
-    uint64_t arg = hle_arg(c, 6);
-    uint32_t payload[6] = {GPU_DRIVER_FLIP, hle_arg_u32(c, 3), hle_arg_u32(c, 4), hle_arg_u32(c, 5), (uint32_t)arg,
-                           (uint32_t)(arg >> 32)};
+static int32_t hle_agc_driver_set_flip(hle_call *c, guest_addr cursor_addr, uint32_t dwords, uint32_t handle, uint32_t index,
+                                uint32_t mode, uint64_t arg) {
+    uint32_t *dst = dwords >= GPU_FLIP_PACKET_DWORDS ? packet_cursor(c, dwords, cursor_addr) : NULL;
+    if (!dst) return SCE_KERNEL_ERROR_EINVAL;
+    uint32_t payload[6] = {GPU_DRIVER_FLIP, handle, index, mode, (uint32_t)arg, (uint32_t)(arg >> 32)};
     gpu_write_driver_packet(dst, dwords, payload, 6);
     get_gpu(c);
     pal_mutex_lock(g_drv.q_lock);
     g_drv.flips_recorded++;
     pal_mutex_unlock(g_drv.q_lock);
-    hle_ret_s32(c, 0);
+    return 0;
+}
+
+/* int sceAgcDriverSetFlip(uint32_t **cursor, uint32_t dwords, uint32_t, int handle, int index, int mode,
+ *                         int64_t arg) */
+static void set_flip(hle_call *c) {
+    hle_ret_s32(c, hle_agc_driver_set_flip(c, hle_arg_ptr(c, 0), hle_arg_u32(c, 1), hle_arg_u32(c, 3),
+                                           hle_arg_u32(c, 4), hle_arg_u32(c, 5), hle_arg(c, 6)));
 }
 
 static void wait_rendering_packet_size(hle_call *c) { hle_ret_u32(c, GPU_WAIT_DISPLAY_PACKET_DWORDS); }
 
+static int32_t hle_agc_driver_wait_until_safe_for_rendering(hle_call *c, guest_addr cursor_addr, uint32_t dwords,
+                                                     uint32_t handle, uint32_t index) {
+    uint32_t *dst = dwords >= GPU_WAIT_DISPLAY_PACKET_DWORDS ? packet_cursor(c, dwords, cursor_addr) : NULL;
+    if (!dst) return SCE_KERNEL_ERROR_EINVAL;
+    uint32_t payload[3] = {GPU_DRIVER_WAIT_DISPLAY, handle, index};
+    gpu_write_driver_packet(dst, dwords, payload, 3);
+    return 0;
+}
+
 /* int sceAgcDriverWaitUntilSafeForRendering(uint32_t **cursor, uint32_t dwords, uint32_t, int handle, int index) */
 static void wait_until_safe_for_rendering(hle_call *c) {
-    uint32_t dwords = hle_arg_u32(c, 1);
-    guest_addr cursor;
-    uint32_t *dst = dwords >= GPU_WAIT_DISPLAY_PACKET_DWORDS ? packet_cursor(c, dwords, &cursor) : NULL;
-    if (!dst) {
-        hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
-        return;
-    }
-    uint32_t payload[3] = {GPU_DRIVER_WAIT_DISPLAY, hle_arg_u32(c, 3), hle_arg_u32(c, 4)};
-    gpu_write_driver_packet(dst, dwords, payload, 3);
-    hle_ret_s32(c, 0);
+    hle_ret_s32(c, hle_agc_driver_wait_until_safe_for_rendering(c, hle_arg_ptr(c, 0), hle_arg_u32(c, 1),
+                                                                hle_arg_u32(c, 3), hle_arg_u32(c, 4)));
 }
 
 /* ---- Private services to libSceAgc ---- */
 
 /* int sceAgcDriverGetReservedDmemForAgc(void **addr, uint32_t *size) */
+static int32_t hle_agc_driver_reserved_dmem(hle_call *c, guest_addr *addr, uint32_t *size) {
+    if (!gmem_is_mapped(c->mem, AGC_RESERVED_ADDR, AGC_RESERVED_SIZE)) {
+        guest_addr at = 0;
+        if (gmem_map(c->mem, AGC_RESERVED_ADDR, AGC_RESERVED_SIZE, GPROT_RW, GMAP_FIXED, "agc reserved", &at) !=
+            PS5C_OK) {
+            LOG_E(GPU, "cannot map the Agc reserved area at 0x%llx", (unsigned long long)AGC_RESERVED_ADDR);
+            return SCE_KERNEL_ERROR_ENOMEM;
+        }
+    }
+    *addr = AGC_RESERVED_ADDR;
+    *size = AGC_RESERVED_SIZE;
+    return 0;
+}
+
 static void get_reserved_dmem_for_agc(hle_call *c) {
     uint64_t *addr_out = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 0), 8);
     uint32_t *size_out = (uint32_t *)hle_mem(c, hle_arg_ptr(c, 1), 4);
@@ -926,18 +942,14 @@ static void get_reserved_dmem_for_agc(hle_call *c) {
         hle_ret_s32(c, SCE_KERNEL_ERROR_EINVAL);
         return;
     }
-    if (!gmem_is_mapped(c->mem, AGC_RESERVED_ADDR, AGC_RESERVED_SIZE)) {
-        guest_addr at = 0;
-        if (gmem_map(c->mem, AGC_RESERVED_ADDR, AGC_RESERVED_SIZE, GPROT_RW, GMAP_FIXED, "agc reserved", &at) !=
-            PS5C_OK) {
-            LOG_E(GPU, "cannot map the Agc reserved area at 0x%llx", (unsigned long long)AGC_RESERVED_ADDR);
-            hle_ret_s32(c, SCE_KERNEL_ERROR_ENOMEM);
-            return;
-        }
+    guest_addr a = 0;
+    uint32_t n = 0;
+    int32_t r = hle_agc_driver_reserved_dmem(c, &a, &n);
+    if (r == 0) {
+        *addr_out = a;
+        *size_out = n;
     }
-    *addr_out = AGC_RESERVED_ADDR;
-    *size_out = AGC_RESERVED_SIZE;
-    hle_ret_s32(c, 0);
+    hle_ret_s32(c, r);
 }
 
 /* Configuration, debug and tooling hooks with nothing to do on our GPU.

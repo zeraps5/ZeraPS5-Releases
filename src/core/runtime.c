@@ -1088,13 +1088,20 @@ ps5c_err runtime_link(ps5_runtime *rt) {
     LOG_I(HLE, "%u import stubs, %u implemented in HLE (%u functions registered)", (unsigned)rt->stubs.len,
           implemented, hle_registry_count());
     /* PS5C_LIST_UNIMPLEMENTED=<file>: the imports without an HLE implementation, one
-     * "library<TAB>name" line each, then the process ends (a static audit of a game's
-     * missing functions; tools/missing_imports.py merges the lists of many games) */
+     * "library<TAB>name" line each ("library<TAB>?NID" when the name is unknown), then the
+     * process ends (a static audit of a game's missing functions; tools/missing_imports.py
+     * merges the lists of many games) */
     const char *missing_list = getenv("PS5C_LIST_UNIMPLEMENTED");
     if (missing_list && *missing_list) {
         FILE *f = fopen(missing_list, "w");
-        for (size_t i = 0; f && i < rt->stubs.len; i++)
-            if (!rt->stubs.data[i].exp) fprintf(f, "%s\t%s\n", rt->stubs.data[i].library, rt->stubs.data[i].name);
+        for (size_t i = 0; f && i < rt->stubs.len; i++) {
+            const hle_stub_info *si = &rt->stubs.data[i];
+            if (si->exp) continue;
+            char nid[NID_STR_LEN + 1];
+            nid_to_str(si->nid, nid);
+            if (si->name) fprintf(f, "%s\t%s\n", si->library, si->name);
+            else fprintf(f, "%s\t?%s\n", si->library, nid);
+        }
         if (f) fclose(f);
         LOG_I(HLE, "unimplemented imports written to %s", missing_list);
         exit(0);

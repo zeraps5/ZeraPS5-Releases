@@ -79,6 +79,7 @@ ps5c_err hle_registry_init(void) {
     hle_register_fiber();
     hle_register_ult();
     hle_register_platform();
+    hle_register_psml();
     hle_register_json2();
     hle_register_rtc();
     hle_register_net_offline();
@@ -96,6 +97,7 @@ ps5c_err hle_registry_init(void) {
     hle_register_audiodec();
     hle_register_compat_stubs();
     hle_register_zlib();
+    hle_register_audio3d();
     hle_register_jpeg_enc();
     hle_register_ajm();
     hle_register_acm();

@@ -1261,9 +1261,9 @@ static int cmd_spirv(const char *path, const char *stage) {
     return rc;
 }
 
-/* Console libraries the emulator runs as they are (LLE): a game that needs
- * one cannot start without its file in the system folder. */
-static const char *const k_required_system_libs[] = {"libSceAgc", "libSceAmpr", "libScePsml"};
+/* Some games require the user-supplied libSceAgc module. libScePsml has
+ * a fallback outside PS5 Pro PSSR. libSceAmpr uses HLE by default. */
+static const char *const k_required_system_libs[] = {"libSceAgc", "libSceAmpr"};
 #define EXIT_MISSING_SYSTEM_LIB 3
 
 /* Logs "missing system library: <name>.sprx" for each one the game needs and

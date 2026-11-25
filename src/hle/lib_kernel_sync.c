@@ -735,17 +735,25 @@ static void posix_fail(hle_call *c, int e) {
     hle_ret_s32(c, -1);
 }
 
+/* The scePthreadSem* calls share the sem_* code and return 0x80020000 | errno
+ * instead of -1 with errno set. */
+static void sem_fail(hle_call *c, int e, bool sce) {
+    if (sce) hle_ret_s32(c, SCE_ERR(e));
+    else posix_fail(c, e);
+}
+
 static sema_obj *psem_get(hle_call *c) {
     const uint64_t *slot = (const uint64_t *)hle_mem(c, hle_arg_ptr(c, 0), 8);
     return slot ? (sema_obj *)kobj_check(*slot, OBJ_SEMA) : NULL;
 }
 
-/* int sem_init(sem_t *sem, int pshared, unsigned value) */
-static void psem_init(hle_call *c) {
+/* int sem_init(sem_t *sem, int pshared, unsigned value);
+ * int scePthreadSemInit(ScePthreadSem *sem, int flag, unsigned value, const char *name) */
+static void sem_init_common(hle_call *c, bool sce) {
     uint64_t *slot = (uint64_t *)hle_mem(c, hle_arg_ptr(c, 0), 8);
     uint32_t value = hle_arg_u32(c, 2);
     if (!slot || value > 0x7FFFFFFFu) {
-        posix_fail(c, G_EINVAL);
+        sem_fail(c, G_EINVAL, sce);
         return;
     }
     sema_obj *s = (sema_obj *)kobj_new(OBJ_SEMA, sizeof(sema_obj));
@@ -754,20 +762,23 @@ static void psem_init(hle_call *c) {
             if (s->lock) pal_mutex_destroy(s->lock);
             kobj_delete(s);
         }
-        posix_fail(c, G_ENOMEM);
+        sem_fail(c, G_ENOMEM, sce);
         return;
     }
     s->count = (int32_t)value;
     s->max = 0x7FFFFFFF;
-    snprintf(s->name, sizeof(s->name), "sem_t");
+    if (!sce || !hle_arg_ptr(c, 3) || !hle_read_str(c, hle_arg_ptr(c, 3), s->name, sizeof(s->name)))
+        snprintf(s->name, sizeof(s->name), "sem_t");
     *slot = (uint64_t)(uintptr_t)s;
     hle_ret_s32(c, 0);
 }
+static void psem_init(hle_call *c) { sem_init_common(c, false); }
+static void sce_sem_init(hle_call *c) { sem_init_common(c, true); }
 
-static void psem_destroy(hle_call *c) {
+static void sem_destroy_common(hle_call *c, bool sce) {
     sema_obj *s = psem_get(c);
     if (!s) {
-        posix_fail(c, G_EINVAL);
+        sem_fail(c, G_EINVAL, sce);
         return;
     }
     pal_cond_destroy(s->cv);
@@ -775,12 +786,14 @@ static void psem_destroy(hle_call *c) {
     kobj_delete(s);
     hle_ret_s32(c, 0);
 }
+static void psem_destroy(hle_call *c) { sem_destroy_common(c, false); }
+static void sce_sem_destroy(hle_call *c) { sem_destroy_common(c, true); }
 
 /* wait for one unit: ns = NO_TIMEOUT blocks, 0 polls */
-static void psem_take(hle_call *c, uint64_t ns) {
+static void psem_take(hle_call *c, uint64_t ns, bool sce) {
     sema_obj *s = psem_get(c);
     if (!s) {
-        posix_fail(c, G_EINVAL);
+        sem_fail(c, G_EINVAL, sce);
         return;
     }
     uint64_t deadline = ns == NO_TIMEOUT ? 0 : pal_time_ns() + ns;
@@ -802,25 +815,32 @@ static void psem_take(hle_call *c, uint64_t ns) {
     if (!err) s->count--;
     s->waiters--;
     pal_mutex_unlock(s->lock);
-    if (err) posix_fail(c, err);
+    if (err) sem_fail(c, err, sce);
     else hle_ret_s32(c, 0);
 }
 
-static void psem_wait(hle_call *c) { psem_take(c, NO_TIMEOUT); }
-static void psem_trywait(hle_call *c) { psem_take(c, 0); }
+static void psem_wait(hle_call *c) { psem_take(c, NO_TIMEOUT, false); }
+static void psem_trywait(hle_call *c) { psem_take(c, 0, false); }
+static void sce_sem_wait(hle_call *c) { psem_take(c, NO_TIMEOUT, true); }
+static void sce_sem_trywait(hle_call *c) { psem_take(c, 0, true); }
+/* int scePthreadSemTimedwait(ScePthreadSem *sem, SceKernelUseconds usec): relative */
+static void sce_sem_timedwait(hle_call *c) {
+    uint64_t us = hle_arg_u32(c, 1);
+    psem_take(c, us ? us * 1000u : 1, true);
+}
 static void psem_timedwait(hle_call *c) {
     uint64_t ns;
     if (!abs_timespec_to_ns(c, hle_arg_ptr(c, 1), &ns)) {
         posix_fail(c, G_EINVAL);
         return;
     }
-    psem_take(c, ns ? ns : 1);
+    psem_take(c, ns ? ns : 1, false);
 }
 
-static void psem_post(hle_call *c) {
+static void sem_post_common(hle_call *c, bool sce) {
     sema_obj *s = psem_get(c);
     if (!s) {
-        posix_fail(c, G_EINVAL);
+        sem_fail(c, G_EINVAL, sce);
         return;
     }
     pal_mutex_lock(s->lock);
@@ -829,6 +849,8 @@ static void psem_post(hle_call *c) {
     pal_mutex_unlock(s->lock);
     hle_ret_s32(c, 0);
 }
+static void psem_post(hle_call *c) { sem_post_common(c, false); }
+static void sce_sem_post(hle_call *c) { sem_post_common(c, true); }
 
 /* int sem_getvalue(sem_t *sem, int *value) */
 static void psem_getvalue(hle_call *c) {
@@ -1403,6 +1425,12 @@ static const hle_export k_exports[] = {
     POSIX_ENTRY("sem_timedwait", psem_timedwait),
     POSIX_ENTRY("sem_post", psem_post),
     POSIX_ENTRY("sem_getvalue", psem_getvalue),
+    HLE_FUNC_ENTRY(K, "scePthreadSemInit", sce_sem_init),
+    HLE_FUNC_ENTRY(K, "scePthreadSemDestroy", sce_sem_destroy),
+    HLE_FUNC_ENTRY(K, "scePthreadSemWait", sce_sem_wait),
+    HLE_FUNC_ENTRY(K, "scePthreadSemTrywait", sce_sem_trywait),
+    HLE_FUNC_ENTRY(K, "scePthreadSemTimedwait", sce_sem_timedwait),
+    HLE_FUNC_ENTRY(K, "scePthreadSemPost", sce_sem_post),
 };
 
 void hle_register_libkernel_sync(void) {

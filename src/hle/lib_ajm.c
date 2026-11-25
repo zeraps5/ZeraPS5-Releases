@@ -10,6 +10,7 @@
  * bitrate, reserved}, gapless {u32 total samples, u16 skip, u16 skipped}.
  * Instance flags: channels in bits 3-6, sample encoding (0 S16, 1 S32,
  * 2 float) in bits 7-9, codec-specific ones from bit 32. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 

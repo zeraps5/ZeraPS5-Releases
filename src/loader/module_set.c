@@ -225,8 +225,7 @@ static bool libc_named(const module_set *ms) {
 
 static lib_policy default_policy(const char *library) {
     if (strcmp(library, "libSceAgcDriver") == 0) return LIB_POLICY_HLE;
-    /* Sony's libSceAgc builds packets and register tables for us; we override
-     * what must talk to our GPU. */
+    /* A game can use its console module alongside the emulated driver. */
     if (strcmp(library, "libSceAgc") == 0) return LIB_POLICY_HYBRID;
     /* Ours (lib_ampr.c) rather than the third-party stand-in dumps for older
      * firmware ship in fakelib/ (PS5C_AMPR_LLE=1 keeps that one) */
@@ -320,6 +319,13 @@ static bool find_export(const module_set *ms, const char *library, uint64_t nid,
     r->module = m;
     r->sym = s;
     return true;
+}
+
+uint64_t module_set_lle_address(const module_set *ms, const char *library, uint64_t nid) {
+    import_resolution r;
+    memset(&r, 0, sizeof(r));
+    if (!find_export(ms, library, nid, &r) || !r.module->mapped) return 0;
+    return r.module->bias + r.sym->value;
 }
 
 import_resolution module_set_resolve(const module_set *ms, const char *library, uint64_t nid) {

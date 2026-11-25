@@ -94257,3 +94257,7 @@ ztrans_open_67
 ztrans_setFrom_67
 ztrans_setTime_67
 ztrans_setTo_67
+sceKernelGetToolMemoryRange
+sceKernelHasTrinityMode
+sceAjmDecWVorbisCreateSetupPacket
+sceAjmDecWVorbisCreateHeaderPacket

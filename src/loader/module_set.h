@@ -71,6 +71,9 @@ typedef struct import_resolution {
     bool lle_available;          /* some loaded module exports this library */
 } import_resolution;
 
+/* Guest address of `library`'s export `nid` in a loaded module, 0 if none */
+uint64_t module_set_lle_address(const module_set *ms, const char *library, uint64_t nid);
+
 void module_set_init(module_set *ms);
 void module_set_free(module_set *ms);
 

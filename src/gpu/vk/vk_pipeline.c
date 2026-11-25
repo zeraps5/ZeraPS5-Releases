@@ -4402,6 +4402,43 @@ static stage_state *get_dispatch_stage(vk_pipelines *P,bool reuse) {
     return P->dispatch_stage;
 }
 
+/* Whether a compute module's results depend on the subgroup width: a cross-lane op other than the
+ * quad ones (ballots, shuffles, reductions, elections), a subgroup-scope barrier (the LDS phases of
+ * a wave), or a subgroup builtin (lane index, size, masks). A module with none of them computes the
+ * same at any width. Requiring 32 lanes makes Intel compile SIMD32, 3-5x slower than the SIMD8 it
+ * picks itself (Darwin's Paradox: 3.9 s -> 16 s per shader), so only these modules require it
+ * (PS5C_SUBGROUP_ALWAYS=1: every compute pipeline, the old way). */
+static bool spirv_wave_sensitive(const uint32_t *code, size_t words) {
+    static int always = -1;
+    if (always < 0) always = getenv("PS5C_SUBGROUP_ALWAYS") != NULL;
+    if (always || !code || words < 5) return true;
+    enum { MAX_IDS = 1u << 22 };
+    uint32_t bound = code[3];
+    if (bound > MAX_IDS) return true;
+    uint32_t *constant = calloc(bound ? bound : 1, sizeof *constant); /* value + 1 of 32-bit OpConstant ids */
+    if (!constant) return true;
+    bool sensitive = false;
+    for (size_t at = 5; at < words && !sensitive;) {
+        uint32_t len = code[at] >> 16, op = code[at] & 0xFFFF;
+        if (!len || at + len > words) { sensitive = true; break; }
+        const uint32_t *w = code + at;
+        if (op == 43 && len == 4 && w[2] < bound) constant[w[2]] = w[3] + 1; /* OpConstant */
+        else if (op == 71 && len >= 4 && w[2] == 11) { /* OpDecorate BuiltIn */
+            uint32_t b = w[3];
+            sensitive = b == 36 || b == 37 || b == 38 || b == 40 || b == 41 || (b >= 4416 && b <= 4420);
+        } else if (op == 72 && len >= 5 && w[3] == 11) { /* OpMemberDecorate BuiltIn */
+            uint32_t b = w[4];
+            sensitive = b == 36 || b == 41 || (b >= 4416 && b <= 4420);
+        } else if (op >= 333 && op <= 364) sensitive = true; /* OpGroupNonUniform* except QuadBroadcast/Swap */
+        else if (op >= 4421 && op <= 4432) sensitive = true; /* KHR subgroup ballot/vote/shuffle */
+        else if (op == 224 && len == 4) /* OpControlBarrier: execution scope Subgroup */
+            sensitive = w[1] >= bound || !constant[w[1]] || constant[w[1]] - 1 == 3;
+        at += len;
+    }
+    free(constant);
+    return sensitive;
+}
+
 static VkShaderModule make_module(renderer *r, const uint32_t *code, size_t words) {
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = words * 4;
@@ -4976,10 +5013,15 @@ bool vk_pipeline_build(renderer *r, const void *recipe, const uint32_t *const wo
         ci.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT; /* large dispatches go in pieces (do_dispatch) */
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sg = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, .requiredSubgroupSize = r->cs_subgroup};
-        if (r->cs_subgroup) ci.stage.pNext = &sg; /* the guest's wave width (create_device) */
+        bool wave = r->cs_subgroup && spirv_wave_sensitive(code[0], cn[0]);
+        if (wave) ci.stage.pNext = &sg; /* the guest's wave width (create_device) */
         vk_shader_cache_use_begin();
         ok = vk_check_device(r, vkCreateComputePipelines(r->device, vk_shader_cache_pipelines(), 1, &ci, NULL, &out->pipe), "vkCreateComputePipelines") == VK_SUCCESS;
         vk_shader_cache_use_end();
+        uint64_t took = pal_time_ns() - t0;
+        if (took > 250000000ull)
+            LOG_I(GPU, "slow compute pipeline compile: %.0f ms, %zu SPIR-V words, %s", took / 1e6, cn[0],
+                  wave ? "32-lane subgroups (cross-lane code)" : "driver's subgroup width");
     } else if (ok) {
         const gfx_key *k = &rc->k;
         VkRenderPass rp = r->dyn_render ? VK_NULL_HANDLE : make_render_pass(r->device, k->rt_fmt, k->rt_count, k->depth_fmt, false);
@@ -5286,7 +5328,7 @@ static bool create_graphics(renderer *r, pipe_entry *e, const gfx_key *k, stage_
             ci.stage=(VkPipelineShaderStageCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"};
             VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sg={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,.requiredSubgroupSize=32};
-            if(r->cs_subgroup==32)ci.stage.pNext=&sg;
+            if(r->cs_subgroup==32 && spirv_wave_sensitive(geometry,geometry_words))ci.stage.pNext=&sg;
             ci.layout=e->layout;vk_shader_cache_use_begin();
             ok=module && vk_check_device(r,vkCreateComputePipelines(r->device,vk_shader_cache_pipelines(),1,&ci,NULL,&e->prepass),"vkCreateComputePipelines (prepass)")==VK_SUCCESS;
             vk_shader_cache_use_end();if(module)vkDestroyShaderModule(r->device,module,NULL);
@@ -12743,6 +12785,15 @@ static bool do_dispatch_impl(renderer *r,stage_state *cs,uint32_t x,uint32_t y,u
     }
     if (r->use_seq != resource_batch) {
         drop_writebacks(P, 0); /* old writebacks were applied by vk_work_begin */
+        return false;
+    }
+    if (overflow && wb_before) {
+        /* The batch's writeback list is full: stores past it would be recorded with
+         * nothing to copy their results back (Darwin's Paradox: the indirect dispatch
+         * arguments a 1x1x1 compute writes, the 65th result of a batch, stayed the
+         * CPU's stale bytes and the dispatches read garbage counts). The caller
+         * completes this batch and records the dispatch again in a new one. */
+        drop_writebacks(P, wb_before);
         return false;
     }
     shared_image_layouts(bl);

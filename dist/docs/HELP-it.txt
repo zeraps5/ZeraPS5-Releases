@@ -21,9 +21,7 @@ Inserisci in system\modules\ questi file già estratti e decifrati dalla TUA PS5
 (sulla console si trovano in /system/common/lib/):
 
   libSceAgc.sprx
-  libSceAgcDriver.sprx
-  libSceAmpr.sprx
-  libScePsml.sprx
+  libScePsml.sprx      (PS5 Pro, PSSR)
 
 Alcuni giochi richiedono queste librerie; il programma indica quelle mancanti.
 Non vengono mai con l'emulatore e non devono essere condivisi con altri

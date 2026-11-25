@@ -158,6 +158,34 @@ guest_addr game_longshot_allocator_rva(const loaded_module *m) {
     return 0;
 }
 
+/* Darwin's Paradox (PPSA28608, Unreal Engine 5). Its back buffer, the one registered with
+ * VideoOut, is the default of the read-only cvars PS5.DefaultBackBufferWidth/Height,
+ * 3840x2160 whatever the TV; its config is a prebuilt BinaryConfig.ini, so a mod's ini or
+ * the command line cannot change them. TSR and the post passes then run at 4K, ~750 ms of
+ * every ~1.1 s frame on Iris Xe. The two registration immediates (mov edx, 3840 / 2160)
+ * become the output's size, or the resolucao_interna height at 16:9. */
+static const uint8_t k_darwin_width[] = {0xba, 0x00, 0x0f, 0x00, 0x00};  /* mov edx, 3840 */
+static const uint8_t k_darwin_height[] = {0xba, 0x70, 0x08, 0x00, 0x00}; /* mov edx, 2160 */
+
+static uint32_t darwin_height(void) {
+    const int internal = settings_internal_height();
+    if (settings_output_4k() && !internal) return 0; /* 4K output: the game's own size */
+    if (internal) settings_internal_height_native();
+    return internal ? (uint32_t)internal : 1080;
+}
+static bool darwin_width(uint8_t *at) {
+    uint32_t h = darwin_height(), w = h * 16 / 9;
+    if (!h) return false;
+    memcpy(at + 1, &w, 4);
+    return true;
+}
+static bool darwin_back_height(uint8_t *at) {
+    uint32_t h = darwin_height();
+    if (!h) return false;
+    memcpy(at + 1, &h, 4);
+    return true;
+}
+
 static const game_fix k_fixes[] = {
     {"PPSA25582", "GameRebirth", "screen size of the opening screens follows the TV", 0x71ac80, k_tmnt_screen,
      sizeof(k_tmnt_screen), tmnt_screen},
@@ -167,6 +195,10 @@ static const game_fix k_fixes[] = {
      k_origins_display, sizeof(k_origins_display), origins_display},
     {"PPSA26414", "RTypeDelta", "input thread polls the user login before the save autoload", 0x4908b,
      k_rtype_input_sleep, sizeof(k_rtype_input_sleep), rtype_input_sleep},
+    {"PPSA28608", "DarwinParadox-PS5-Shipping", "back buffer width follows the output", 0x47852b, k_darwin_width,
+     sizeof(k_darwin_width), darwin_width},
+    {"PPSA28608", "DarwinParadox-PS5-Shipping", "back buffer height follows the output", 0x4785a6, k_darwin_height,
+     sizeof(k_darwin_height), darwin_back_height},
 };
 
 compat_patch_status game_compat_apply(gmem *mem, const loaded_module *m,

@@ -130,8 +130,8 @@ static struct {
     int32_t presenting; /* buffer being presented, -1 = none */
     vo_flip_status flip;
     vo_vblank_status vblank;
-    registration flip_regs[MAX_REGISTRATIONS], vblank_regs[MAX_REGISTRATIONS];
-    uint32_t flip_reg_count, vblank_reg_count;
+    registration flip_regs[MAX_REGISTRATIONS], vblank_regs[MAX_REGISTRATIONS], pre_vblank_regs[MAX_REGISTRATIONS];
+    uint32_t flip_reg_count, vblank_reg_count, pre_vblank_reg_count;
     pal_thread *thread;
     pal_window *window;
     renderer *renderer; /* NULL: software presenter */
@@ -214,6 +214,9 @@ static int32_t vblank_thread(void *arg) {
         g_vo.vblank.count++;
         g_vo.vblank.process_time = t / 1000u;
         g_vo.vblank.process_time_counter = t;
+        /* the start of the vblank, then the vblank (one tick: there is no scanout to wait for) */
+        trigger_all(g_vo.pre_vblank_regs, g_vo.pre_vblank_reg_count, VO_EVENT_PRE_VBLANK_START,
+                    (int64_t)g_vo.vblank.count);
         trigger_all(g_vo.vblank_regs, g_vo.vblank_reg_count, VO_EVENT_VBLANK, (int64_t)g_vo.vblank.count);
 
         bool do_flip = g_vo.queue_len > 0 && g_vo.vblank.count % (uint64_t)(g_vo.flip_rate + 1) == 0;
@@ -879,6 +882,12 @@ static void add_flip_event(hle_call *c) {
 static void add_vblank_event(hle_call *c) {
     hle_ret_s32(c, add_event(c, g_vo.vblank_regs, &g_vo.vblank_reg_count, VO_EVENT_VBLANK));
 }
+static void add_pre_vblank_event(hle_call *c) {
+    hle_ret_s32(c, add_event(c, g_vo.pre_vblank_regs, &g_vo.pre_vblank_reg_count, VO_EVENT_PRE_VBLANK_START));
+}
+static void delete_pre_vblank_event(hle_call *c) {
+    hle_ret_s32(c, delete_event(c, g_vo.pre_vblank_regs, &g_vo.pre_vblank_reg_count, VO_EVENT_PRE_VBLANK_START));
+}
 static void delete_flip_event(hle_call *c) {
     hle_ret_s32(c, delete_event(c, g_vo.flip_regs, &g_vo.flip_reg_count, VO_EVENT_FLIP));
 }
@@ -955,6 +964,8 @@ static const hle_export k_exports[] = {
     HLE_FUNC_ENTRY(LIB, "sceVideoOutLatencyMeasureSetStartPoint", ok_),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutAddFlipEvent", add_flip_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutAddVblankEvent", add_vblank_event),
+    HLE_FUNC_ENTRY(LIB, "sceVideoOutAddPreVblankStartEvent", add_pre_vblank_event),
+    HLE_FUNC_ENTRY(LIB, "sceVideoOutDeletePreVblankStartEvent", delete_pre_vblank_event),
     /* the output mode never changes here, so a set mode event never fires */
     HLE_FUNC_ENTRY(LIB, "sceVideoOutSysAddSetModeEvent2", accept_set_mode_event),
     HLE_FUNC_ENTRY(LIB, "sceVideoOutDeleteOutputModeEvent", accept_set_mode_event),
