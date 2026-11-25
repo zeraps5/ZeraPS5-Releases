@@ -1,10 +1,10 @@
 # Game compatibility and tested builds
 
-**Current public release [b1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) · Game records reviewed 24 November 2026.**
+**Current public release [b1191](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191) · Game records reviewed 25 November 2026.**
 
-**New records on Intel Iris Xe: Quake reached the first map, Plants vs. Zombies: Replanted reached the user agreements, and LEGO Party reached its title screen.** Each row gives the date, hardware and test scope.
+**Thirteen Intel Iris Xe development records were added on 25 November.** They document startup, title screens or menus in the observed sessions.
 
-The [b1152 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) describe the latest code and automated validation. The game sessions below keep their original test revisions and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
+The [b1191 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191) describe code and automated validation. Game sessions retain their original scopes and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
 
 [Gameplay](#gameplay-records) · [Scenes](#scene-progress) · [Menus](#menus-and-title-screens) · [Startup](#opening-and-startup-records) · [PS4](#experimental-ps4-records) · [28-session RTX follow-up](#latest-rtx-startup-survey) · [Report a result](CONTRIBUTING.md#compatibility-reports)
 
@@ -63,6 +63,15 @@ ZeraPS5 detects the host CPU features automatically. When loading game code, it 
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
 | --- | --- | --- | --- | --- |
+| The Messenger / PPSA24643 | Intel Iris Xe | 2026-11-25 development session | Title screen | Portuguese opening text and the press-cross title screen at about 50 FPS after the framebuffer alias fix. |
+| Goodnight Universe / PPSA29727 | Intel Iris Xe | 2026-11-25 development session | Main menu | About 14 FPS on a 4.xx backport PKG. Two of three runs encountered Vulkan device loss, including runs without the presentation fix. |
+| Octopath Traveler II / PPSA09809 | Intel Iris Xe | 2026-11-25 development session | Language and brightness settings | Reached the initial setup screens. No input was exercised. |
+| Harvest Days / PPSA14677 | Intel Iris Xe | 2026-11-25 development session | Main menu | Main menu with a 3D scene at about 50 FPS. |
+| Enchanted Portals / PPSA17144 | Intel Iris Xe | 2026-11-25 development session | Menu | Portuguese menu at about 4 FPS at 4K. |
+| Aeterna Noctis / PPSA04109 | Intel Iris Xe | 2026-11-25 development session | Menu | Opening logos and Portuguese menu at about 47 FPS. |
+| Asterix & Obelix XXL 3 / PPSA07498 | Intel Iris Xe | 2026-11-25 development session | Title prompt | Startup notice and press-cross title prompt over a 3D scene at about 26 FPS. |
+| Ghost Song / PPSA09232 | Intel Iris Xe | 2026-11-25 development session | Main menu | Opening credits and the main menu at about 21 FPS on the 4.xx backport. |
+| Q.U.B.E. 2 / PPSA06246 | Intel Iris Xe | 2026-11-25 development session | Menu with black output | The game log confirmed menu navigation after the welcome icon. The scene and text stayed black, and the game reported a missing Roboto-Regular font in the package. |
 | Plants vs. Zombies: Replanted / PPSA29802 | Intel Iris Xe | 2026-11-23 development session | Title and agreement screens | Readable user agreement and privacy screens at approximately 58 FPS. The session stopped at the agreements. |
 | LEGO Party / PPSA29141 | Intel Iris Xe | 2026-11-23 development session | Title screen | Reached the LET’S PARTY! title screen at approximately 7–16 FPS in the 150-second session on the 4.xx+ backport. |
 | Alone in the Dark (2024) / PPSA08240 | Core i5-1235U / Intel Iris Xe | Latest RTX startup: b837 · `913a5ec` · 2026-11-06<br>Result below: `d9d6194` · 2026-11-06 | Main menu | Continue / New Game / Options visible after an Intel shader issue. RTX b837 survey separately recorded loading. RTX startup follow-up: Loading ([survey details](#latest-rtx-startup-survey)). |
@@ -93,6 +102,10 @@ ZeraPS5 detects the host CPU features automatically. When loading game code, it 
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
 | --- | --- | --- | --- | --- |
+| What Remains of Edith Finch / PPSA06207 | Intel Iris Xe | 2026-11-25 development session | Opening logos | Publisher logos at 4K at about 8 FPS. The session logged 126 pipeline compilations in 38 seconds. |
+| Grendizer: The Feast of the Wolves / PPSA14376 | Intel Iris Xe | 2026-11-25 development session | Opening scene | The opening scene rendered at about 21 FPS. |
+| POSTAL: Brain Damaged / PPSA18144 | Intel Iris Xe | 2026-11-25 development session | Opening scene | Opening logos and 3D scenes at about 41 FPS from a 4.xx backport PKG. |
+| The Exit 8 / Platform 8 / PPSA23276 | Intel Iris Xe | 2026-11-25 development session | One frame during startup | One frame in 90 seconds on the 4.xx backport. At 4K the Unreal workload spent seconds in individual compute shaders. |
 | Age of Mythology: Retold / PPSA18653 | Ryzen 7 5700G / RTX 5060 Ti 16 GB | b897 · `a1e7371` · 2026-11-10 | Package loading stopped | Package reader reported a zero-byte eboot.bin. Cause under investigation; this does not establish the cause of the package condition. |
 | Ghost of Yōtei / PPSA26344 | Core i5-1235U / Intel Iris Xe | Latest RTX startup: b837 · `913a5ec` · 2026-11-06<br>Result below: 2026-11-01 developer assessment; per-run build not recorded | Splash | Initial splash in the Intel assessment. RTX b837 startup survey separately ended in Vulkan device loss; older RTX b498 calibration images remain historical. RTX startup follow-up: Vulkan failure ([survey details](#latest-rtx-startup-survey)). |
 | God of War Sons of Sparta / — | Core i5-1235U / Intel Iris Xe | 2026-11-01 developer assessment; per-run build not recorded | Opening | Stops at Sony presents in the developer record. |

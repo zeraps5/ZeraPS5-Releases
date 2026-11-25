@@ -9,6 +9,8 @@
 - The launcher displays the game and system library counts even when no system libraries are installed. It identifies required console modules when a game reports them missing.
 - The Windows package includes source, licenses and relinkable objects. Console firmware and shaders extracted from it are excluded.
 
+All 196 Windows checks passed. [Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191).
+
 ## v0.1.1-b1152 — 24 November 2026 UTC
 
 - **System libraries (HLE).** Added **125 function exports** across the emulated libraries, counted by library and symbol ID. This includes full or partial implementations and compatibility stubs. Highlights include **5 zlib exports** for decompression and result handling, **4 JPEG encoding exports**, **5 JSON2 exports**, and **5 AJM exports** for MP3 frame parsing and batched audio jobs. The kernel paths also gained flexible-memory release and page-table statistics.

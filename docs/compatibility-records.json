@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "reviewed": "2026-11-24",
-  "current_release": "v0.1.1-b1152",
-  "source_commit": "c7f3f09daedfb06e04a35195aab5dff9fe4825c1",
+  "reviewed": "2026-11-25",
+  "current_release": "v0.1.1-b1191",
+  "source_commit": "7268bd3fc9b3e98c48b6a1c5196aa208f29812d1",
   "records": [
     {
       "game": "Alone in the Dark 2 — PS1 classic",
@@ -956,6 +956,136 @@
       "notes": "Reached the LET’S PARTY! title screen at approximately 7–16 FPS in the 150-second session on the 4.xx+ backport.",
       "section": "menus",
       "evidence": "b1152-source-development-records"
+    },
+    {
+      "game": "The Messenger",
+      "title_id": "PPSA24643",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Title screen",
+      "notes": "Portuguese opening text and the press-cross title screen at about 50 FPS after the framebuffer alias fix.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Goodnight Universe",
+      "title_id": "PPSA29727",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Main menu",
+      "notes": "About 14 FPS on a 4.xx backport PKG. Two of three runs encountered Vulkan device loss, including runs without the presentation fix.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Octopath Traveler II",
+      "title_id": "PPSA09809",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Language and brightness settings",
+      "notes": "Reached the initial setup screens. No input was exercised.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Harvest Days",
+      "title_id": "PPSA14677",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Main menu",
+      "notes": "Main menu with a 3D scene at about 50 FPS.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Enchanted Portals",
+      "title_id": "PPSA17144",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Menu",
+      "notes": "Portuguese menu at about 4 FPS at 4K.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Aeterna Noctis",
+      "title_id": "PPSA04109",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Menu",
+      "notes": "Opening logos and Portuguese menu at about 47 FPS.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Asterix & Obelix XXL 3",
+      "title_id": "PPSA07498",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Title prompt",
+      "notes": "Startup notice and press-cross title prompt over a 3D scene at about 26 FPS.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Ghost Song",
+      "title_id": "PPSA09232",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Main menu",
+      "notes": "Opening credits and the main menu at about 21 FPS on the 4.xx backport.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Q.U.B.E. 2",
+      "title_id": "PPSA06246",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Menu with black output",
+      "notes": "The game log confirmed menu navigation after the welcome icon. The scene and text stayed black, and the game reported a missing Roboto-Regular font in the package.",
+      "section": "menus",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "What Remains of Edith Finch",
+      "title_id": "PPSA06207",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Opening logos",
+      "notes": "Publisher logos at 4K at about 8 FPS. The session logged 126 pipeline compilations in 38 seconds.",
+      "section": "startup",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "Grendizer: The Feast of the Wolves",
+      "title_id": "PPSA14376",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Opening scene",
+      "notes": "The opening scene rendered at about 21 FPS.",
+      "section": "startup",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "POSTAL: Brain Damaged",
+      "title_id": "PPSA18144",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "Opening scene",
+      "notes": "Opening logos and 3D scenes at about 41 FPS from a 4.xx backport PKG.",
+      "section": "startup",
+      "evidence": "development-main-2e382db-20261125"
+    },
+    {
+      "game": "The Exit 8 / Platform 8",
+      "title_id": "PPSA23276",
+      "hardware": "Intel Iris Xe",
+      "test": "2026-11-25 development session",
+      "stage": "One frame during startup",
+      "notes": "One frame in 90 seconds on the 4.xx backport. At 4K the Unreal workload spent seconds in individual compute shaders.",
+      "section": "startup",
+      "evidence": "development-main-2e382db-20261125"
     }
   ],
   "startup_survey": {
@@ -970,6 +1100,7 @@
     "source-b898+public-history": "Packaged source record reconciled with the earlier published test history.",
     "candidate-011-rtx": "Dated RTX candidate runs on b974/b981, packaged source COMPATIBILIDADE.md and docs/colaboracao/RELEASE-CANDIDATE-0.1.1-2026-11-15.md; English summary in docs/release-candidate-b984.md. Actual tested builds retained.",
     "source-b984-developer": "Matching b984 source archive, COMPATIBILIDADE.md: dated Intel game records and the identified earlier RTX homebrew run. No new b984-package or notebook performance measurement inferred.",
-    "b1152-source-development-records": "Matching b1152 source archive, COMPATIBILIDADE.md, 23 November 2026 Intel Iris Xe entries. The affected rows identify development sessions. The per-session commits are unrecorded."
+    "b1152-source-development-records": "Matching b1152 source archive, COMPATIBILIDADE.md, 23 November 2026 Intel Iris Xe entries. The affected rows identify development sessions. The per-session commits are unrecorded.",
+    "development-main-2e382db-20261125": "Dated Intel Iris Xe development runs documented in COMPATIBILIDADE.md. Session-specific commits were not recorded. These are development observations and not tests of the b1191 ZIP."
   }
 }

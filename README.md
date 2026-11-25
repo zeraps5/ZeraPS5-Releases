@@ -14,17 +14,17 @@
 
 ## Download and run
 
-**Current release: v0.1.1-b1152.**
+**Current release: v0.1.1-b1191.**
 
-**b1152 technical highlights.** 125 new HLE function exports, including 21 for PS4 Gnm and 7 for camera support. The build expands experimental PS4 geometry shader handling, adds webcam and PS4 Camera support on Windows, and updates 18 graphics source files, including 6 in shader translation. [Full technical release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152).
+**b1191 technical highlights.** Vulkan presentation handles additional framebuffer aliases, compute writeback preserves guest memory, and Audio3D and AMM/AMPR support expand. [Release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191).
 
 **KAGE: Shadow of the Ninja reached 60 FPS on a third-generation Intel Core i5 (Ivy Bridge)** in a project test reported on 24 November 2026. [Older CPU test and instruction compatibility](COMPATIBILITY.md#older-cpu-test).
 
 **Latest recorded gameplay:** Quake reached the first map at approximately 33–37 FPS on Intel Iris Xe in a 23 November development session. The compatibility list gives the scope and hardware of every record, including earlier runs of Sonic Origins Plus, Sonic Superstars and Quake II.
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1152/ZeraPS5-v0.1.1-b1152-win64.zip)
-- [Download matching source — build 1152](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1152/ZeraPS5-v0.1.1-b1152-win64-source.zip)
+- [Download for Windows x64 — build 1191](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1191/ZeraPS5-v0.1.1-b1191-win64.zip)
+- [Download matching source — build 1191](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1191/ZeraPS5-v0.1.1-b1191-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
@@ -32,15 +32,15 @@
 
 ## Game compatibility
 
-**b1152 passed 196 automated Windows checks, including 35 GPU checks.** The [release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1152) describe the package validation. Game records retain their tested revisions.
+**b1191 passed 196 automated Windows checks.** [Package and updater validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1191). Game records retain their tested revisions.
 
-[Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 24 November 2026, with dated Intel and RTX sessions, tested revisions where recorded, and the startup survey.
+[Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 25 November 2026, with dated Intel and RTX sessions, tested revisions where recorded, and the startup survey.
 
 [Technical changelog](CHANGELOG.md) · [Contribute or report a result](CONTRIBUTING.md) · [Matching source revision and checksums](SOURCE-VERSION.txt)
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 
-The default branch includes the b1152 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1152) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
+The default branch includes the b1191 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1191) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
 
 ## Experimental software
 
