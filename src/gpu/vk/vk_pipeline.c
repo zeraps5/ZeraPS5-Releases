@@ -5575,6 +5575,14 @@ static bool bytes_zero(const uint8_t *p, uint64_t n) {
     return true;
 }
 
+/* A glyph atlas can receive a small edit long after the rolling scan has
+ * stopped. Sparse samples can miss it indefinitely. Tightly packed 8-bit
+ * linear surfaces can use the fast full hash, with bounded bandwidth. */
+static bool texture_hash_exact_linear8(const texture_cpu_source *s) {
+    return s->layers == 1 && s->bpe == 1 && tex_linear(s->sw) && !s->ox && !s->oy &&
+           s->size > SMALL_TEXTURE && s->size <= (4u << 20) && s->size == (uint64_t)s->w * s->h;
+}
+
 /* Render targets can also be CPU textures. Compare the texels the T#
  * actually exposes: linear row padding and unused tiled texels may belong
  * to other resources. A GPU write establishes a new CPU baseline, otherwise
@@ -5595,7 +5603,8 @@ static uint64_t texture_cpu_hash(renderer *r,const texture_cpu_source *s,bool fu
     /* Fully occupied allocations have no padding to exclude. Their native
      * byte order is an equally stable fingerprint, and needs no detiling. */
     if(!s->ox && !s->oy && s->size==packed*s->layers)
-        return full?texture_xxh64(src,(size_t)s->size,hash)|1:texture_content_hash_fast(src,s->size);
+        return (full || texture_hash_exact_linear8(s)) ? texture_xxh64(src,(size_t)s->size,hash)|1 :
+                                                        texture_content_hash_fast(src,s->size);
     /* Hash logical texels, not allocation padding shared with other surfaces.
      * Large static images retain a bounded detector; CPU-rewritten images use
      * every texel. Both modes use the SAME layout for upload and GPU baselines. */
@@ -6522,7 +6531,8 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
     /* A large texture the CPU keeps rewriting (video planes) is hashed whole: the
      * sampled detector misses most changes of smooth chroma planes, which then
      * kept the colors of an older scene. */
-    bool dynamic = !small && idx < VK_MAX_IMAGES && P->tex_dynamic[idx];
+    bool exact_hash = idx < VK_MAX_IMAGES && texture_hash_exact_linear8(&P->tex_cpu[idx]);
+    bool dynamic = !small && idx < VK_MAX_IMAGES && (exact_hash || P->tex_dynamic[idx]);
     if (src && supported && idx < VK_MAX_IMAGES) texture_arm(P, idx);
     uint64_t hash = src && supported ? texture_cpu_hash(r,&P->tex_cpu[idx],dynamic) : 1;
     bool scanned = !small && !dynamic && !img->gpu_written && src && supported && idx < VK_MAX_IMAGES &&
@@ -6555,7 +6565,7 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
     if (dynamic && src && supported && hash && P->tex_hash[idx] == hash) {
         static int keep = -1;
         if (keep < 0) keep = getenv("PS5C_TEX_DYNAMIC_KEEP") != NULL;
-        if (!keep && ++P->tex_dynamic_still[idx] >= TEX_DYNAMIC_SETTLE) {
+        if (!exact_hash && !keep && ++P->tex_dynamic_still[idx] >= TEX_DYNAMIC_SETTLE) {
             static unsigned settle_logs;
             if (settle_logs++ < 8)
                 LOG_I(GPU, "texture 0x%llx %ux%u x%u (%llu MB) unchanged for %u whole hashes: sampled again",
@@ -6577,7 +6587,7 @@ static vk_image *texture(renderer *r, const uint32_t *t) {
             hash=texture_cpu_hash(r,&P->tex_cpu[idx],true);
         }
         P->tex_hash[idx] = hash;
-        if (!small && src && supported && !P->tex_dynamic[idx]) texture_scan_baseline(P, idx, src, gsize);
+        if (!small && !exact_hash && src && supported && !P->tex_dynamic[idx]) texture_scan_baseline(P, idx, src, gsize);
     }
 
     end_pass(r);
@@ -10668,6 +10678,10 @@ static VK_DRAW_NOINLINE bool do_draw_impl(renderer *r, const gpu *g, const gpu_d
          * write mask together. BGRA8 already uses a native attachment view. */
         if (((info >> 2) & 31u) == 12 && ((info >> 11) & 3u) == 1)
             k.ps_mrt_rb_swap |= 1u << i;
+        /* COLOR_8 with COMP_SWAP_ALT_REV stores the exported alpha. The
+         * Vulkan R8 attachment takes red, so copy alpha to that component. */
+        if (((info >> 2) & 31u) == 1 && ((info >> 11) & 3u) == 3)
+            k.ps_mrt_rb_swap |= 1u << (8 + i);
     }
     ps->info.ps_mrt_rb_swap = k.ps_mrt_rb_swap;
     ps->info.ps_flat_mask = 0;

@@ -1491,8 +1491,43 @@ static const compat_site *find_trap(uint64_t pc) {
     return NULL;
 }
 
+/* CLZERO (0F 01 FC, AMD only): zeroes the 64-byte line holding [rax]. The PS5's Zen 2 has it, Intel hosts
+ * fault. The usual loop `clzero; add rax,0x40; cmp rax,rcx; jb` is run whole in one go. */
+static bool clzero_fault(pal_fault_info *info) {
+    const uint8_t *p = (const uint8_t *)(uintptr_t)info->pc;
+    if (p[0] != 0x0F || p[1] != 0x01 || p[2] != 0xFC) return false;
+    static const uint8_t loop[] = {0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xC8, 0x72, 0xF4};
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        LOG_I(CPU, "clzero emulated (first at %llx)", (unsigned long long)info->pc);
+    }
+    uint64_t rax = info->gpr[0], rcx = info->gpr[1];
+    if (memcmp(p + 3, loop, sizeof(loop)) == 0) {
+        do {
+            memset((void *)(uintptr_t)(rax & ~63ull), 0, 64);
+            rax += 0x40;
+        } while (rax < rcx);
+        info->gpr[0] = rax;
+        /* flags of the last cmp rax,rcx (rax >= rcx): CF=0, ZF on equality, SF/OF/PF from the difference */
+        uint64_t d = rax - rcx, f = info->rflags & ~0x8D5ull;
+        if (d == 0) f |= 0x40;
+        if (d >> 63) f |= 0x80;
+        if ((((rax ^ rcx) & (rax ^ d)) >> 63) & 1) f |= 0x800;
+        if (!(__builtin_popcount((unsigned)(d & 0xFF)) & 1)) f |= 0x4;
+        if (((rax ^ rcx ^ d) >> 4) & 1) f |= 0x10;
+        info->rflags = f;
+        info->pc += 3 + sizeof(loop);
+        return true;
+    }
+    memset((void *)(uintptr_t)(rax & ~63ull), 0, 64);
+    info->pc += 3;
+    return true;
+}
+
 bool x64_compat_fault(pal_fault_info *info) {
     if (info->kind != PAL_FAULT_ILLEGAL_INSTRUCTION) return false;
+    if (clzero_fault(info)) return true;
     const compat_site *s = find_trap(info->pc);
     x64_insn local;
     const x64_insn *in;

@@ -1,5 +1,13 @@
 # Release changelog
 
+## v0.1.1-b1215 - 26 November 2026
+
+- Restore glyphs that were missing after late updates to linear single-channel texture atlases.
+- Route alpha to the correct component of single-channel render targets, restoring text in the GTA VI warning, privacy policy, and terms panels.
+- Emulate the PS5 CLZERO instruction on hosts that raise an illegal-instruction exception, including Intel CPUs.
+
+[Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1215).
+
 ## v0.1.1-b1214 - 26 November 2026
 
 - Simplifies Vulkan shader waterfall loops with one provable iteration per emulated lane.
