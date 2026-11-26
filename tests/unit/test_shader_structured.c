@@ -49,6 +49,19 @@ static const uint32_t exit_block[] = {
     0xbf810000, /*  6: s_endpgm */
 };
 
+/* With one lane per invocation the saved EXEC mask is cleared in one pass. */
+static const uint32_t waterfall[] = {
+    0x7e040281, /* v_mov_b32 v2, 1 */
+    0xbe94047e, /* s_mov_b64 s[20:21], exec */
+    0x7e000502, /* v_readfirstlane_b32 s0, v2 */
+    0x7da40400, /* v_cmpx_eq_u32 s0, v2 */
+    0x7e060282, /* v_mov_b32 v3, 2 */
+    0x8a947e14, /* s_andn2_b64 s[20:21], s[20:21], exec */
+    0xbefe0414, /* s_mov_b64 exec, s[20:21] */
+    0xbf85fffa, /* s_cbranch_scc1 back to v_readfirstlane */
+    0xbf810000, /* s_endpgm */
+};
+
 static void option(const char *name, const char *value) {
 #ifdef _WIN32
     _putenv_s(name, value ? value : "");
@@ -88,6 +101,14 @@ int main(void) {
     CHECK(sw == 0 && loops == 1); /* the program runs as a loop once; its break ends it */
     CHECK(!counts(exit_block, PS5C_ARRAY_COUNT(exit_block), &sw, &sel, &loops));
     CHECK(sw == 0 && loops == 1);
+    CHECK(!counts(waterfall, PS5C_ARRAY_COUNT(waterfall), &sw, &sel, &loops));
+    CHECK(sw == 0 && loops == 0);
+    uint32_t aliased[PS5C_ARRAY_COUNT(waterfall)];
+    for (size_t i = 0; i < PS5C_ARRAY_COUNT(waterfall); i++) aliased[i] = waterfall[i];
+    aliased[2] = 0x7e280502; /* v_readfirstlane_b32 s20, v2 overwrites the saved mask */
+    aliased[3] = 0x7da40414; /* v_cmpx_eq_u32 s20, v2 */
+    CHECK(!counts(aliased, PS5C_ARRAY_COUNT(aliased), &sw, &sel, &loops));
+    CHECK(loops == 1);
     option("PS5C_NO_STRUCTURED", "1");
     CHECK(!counts(chain, PS5C_ARRAY_COUNT(chain), &sw, &sel, &loops));
     CHECK(sw == 1); /* the dispatch loop it used to be */

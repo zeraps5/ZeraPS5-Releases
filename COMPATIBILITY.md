@@ -1,10 +1,10 @@
 # Game compatibility and tested builds
 
-**Current public release [b1192](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1192) · Game records reviewed 25 November 2026.**
+**Current public release [b1214](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214) · Game records reviewed 25 November 2026.**
 
 **Thirteen Intel Iris Xe development records were added on 25 November.** They document startup, title screens or menus in the observed sessions.
 
-The [b1192 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1192) describe code and automated validation. Game sessions retain their original scopes and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
+The [b1214 release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214) describe code and automated validation. Game sessions retain their original scopes and setups. [Earlier b984 release validation](docs/release-candidate-b984.md).
 
 [Gameplay](#gameplay-records) · [Scenes](#scene-progress) · [Menus](#menus-and-title-screens) · [Startup](#opening-and-startup-records) · [PS4](#experimental-ps4-records) · [28-session RTX follow-up](#latest-rtx-startup-survey) · [Report a result](CONTRIBUTING.md#compatibility-reports)
 
@@ -99,6 +99,8 @@ ZeraPS5 detects the host CPU features automatically. When loading game code, it 
 | XIII / PPSA02775 | Core i5-1235U / Intel Iris Xe | b893 · `bbecd5a` · 2026-11-10 | Title | Microids/PlayMagic videos and Press any button prompt, about 36 FPS. |
 
 ## Opening and startup records
+
+**Grand Theft Auto VI.** The 26 November development run reached the loading screen. [Release notes and test scope](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214).
 
 | Game / title ID | Hardware | Recorded test / latest follow-up | Stage reached | Result and remaining issues |
 | --- | --- | --- | --- | --- |

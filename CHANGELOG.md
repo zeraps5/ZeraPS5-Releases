@@ -1,5 +1,13 @@
 # Release changelog
 
+## v0.1.1-b1214 - 26 November 2026
+
+- Simplifies Vulkan shader waterfall loops with one provable iteration per emulated lane.
+- Adds a regression case for the optimization and checks that overlapping registers keep the loop intact.
+- Grand Theft Auto VI reached the loading screen in a development test.
+
+[Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214).
+
 ## v0.1.1-b1192 - 25 November 2026
 
 - Fixed duplicate PKG and exFAT listings for the same file. Mounted .pkg files appear once as PKG. Game copies in separate folders remain visible.
