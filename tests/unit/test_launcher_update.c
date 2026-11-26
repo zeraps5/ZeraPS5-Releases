@@ -104,7 +104,7 @@ int wmain(int argc, wchar_t **argv) {
         }
         /* The selected viewer language can change after a session was recorded. */
         wchar_t original_env[1024];DWORD old_len=GetEnvironmentVariableW(L"PS5C_LAUNCHER_RECORDS",original_env,1024);
-        wchar_t *environment=record_environment_session(records,NULL);if(!environment)return 1;
+        wchar_t *environment=record_environment_session(records,NULL,NULL);if(!environment)return 1;
         bool found=false;const wchar_t *previous=NULL;
         for(const wchar_t *p=environment;*p;p+=wcslen(p)+1) {
             if(previous && _wcsicmp(previous,p)>0)return 1;
@@ -135,6 +135,27 @@ int wmain(int argc, wchar_t **argv) {
         char digest[65]; if(!sha256_file(argv[2],digest))return 2;
         puts(digest);return 0;
     }
+    /* Check the child environment exactly as it is passed to CreateProcessW. */
+    game g = {0};
+    const wchar_t *titles[] = {L"PPSA38500", L"gtavips5", L"PPSA04263"};
+    if (!SetEnvironmentVariableW(L"PS5C_RESOLUTION", L"1080")) return 1;
+    for (unsigned i = 0; i < PS5C_ARRAY_COUNT(titles); i++) {
+        wcscpy(g.id, titles[i]);
+        wchar_t *env = record_environment_session(L"test.records", NULL, &g);
+        if (!env) return 1;
+        unsigned resolutions = 0;
+        bool correct = false;
+        for (const wchar_t *p = env; *p; p += wcslen(p) + 1) {
+            if (_wcsnicmp(p, L"PS5C_RESOLUTION=", 16)) continue;
+            resolutions++;
+            correct = !wcscmp(p, i < 2 ? L"PS5C_RESOLUTION=4k" : L"PS5C_RESOLUTION=1080");
+        }
+        free(env);
+        if (resolutions != 1 || !correct) return 1;
+    }
+    wchar_t inherited[8];
+    if (GetEnvironmentVariableW(L"PS5C_RESOLUTION", inherited, PS5C_ARRAY_COUNT(inherited)) != 4 ||
+        wcscmp(inherited, L"1080")) return 1;
     if(!report_private_line("path C:\\Users\\Private Person\\save", "", ""))return 1;
     if(!report_private_line("loaded G:/private/game/eboot.bin", "", ""))return 1;
     if(!report_private_line("host MY-COMPUTER", "", "my-computer"))return 1;

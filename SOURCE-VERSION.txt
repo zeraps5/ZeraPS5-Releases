@@ -1,8 +1,8 @@
-Public release: v0.1.1-b1215
-Version: 0.1.1+c50a188 (build 1215, 2026-11-26)
-Corresponding emulator source commit: c50a18844bfa99a2da8893ddaeb88a5eb8fb0ed6
-Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1215/ZeraPS5-v0.1.1-b1215-win64-source.zip
-Source archive SHA-256: 65ff9e800c4718dc7933bb75d625ea44cda55cafb21318009ab6ad9543f1e001
-Windows archive SHA-256: 0c887b31e77bb23597d59f5ce72f33e216f98cd028334431dd3db2e482d040c2
+Public release: v0.1.1-b1216
+Version: 0.1.1+9823f93 (build 1216, 2026-11-26)
+Corresponding emulator source commit: 9823f93ad86adc21e06b51bb19fd7f9e92e47f9c
+Corresponding source archive: https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1216/ZeraPS5-v0.1.1-b1216-win64-source.zip
+Source archive SHA-256: 5c2fa4018638a1283eb9618053f197bd707bcc3511de4496efde0cfecb70a411
+Windows archive SHA-256: 361127ba69b6b176bca17aed6c78d5b2ce3bb8ec3d625ab0aa52295a20030a97
 
 The release tag identifies the tested emulator source.
