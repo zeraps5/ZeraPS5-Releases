@@ -309,7 +309,8 @@ typedef struct sh_stage_info {
     /* PS: SPI_SHADER_COL_FORMAT, four bits per MRT; numeric output kind
      * uses two bits per MRT (0 float/normalized, 1 unsigned, 2 signed). */
     uint32_t ps_col_format, ps_mrt_kind;
-    uint32_t ps_mrt_rb_swap; /* bit per MRT: BGRA storage without a native BGRA view */
+    /* Bits 0..7 exchange red and blue. Bits 8..15 route alpha to R8. */
+    uint32_t ps_mrt_rb_swap;
     uint32_t fp16_overflow; /* RSRC1 FP16_OVFL: saturate computed f16 overflow */
     /* Single sample: disabled positions of the 2x2 pixel quad (zero: all
      * enabled). SH_PS_QUAD_DEMOTE records the enabled host helper feature. */

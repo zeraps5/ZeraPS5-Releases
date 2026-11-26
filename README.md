@@ -14,17 +14,17 @@
 
 ## Download and run
 
-**Current release: v0.1.1-b1214.**
+**Current release: v0.1.1-b1215.**
 
-**b1214 shader compiler update.** Vulkan shader translation simplifies proven single-iteration waterfall loops. [Release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214).
+**b1215 menu text and CPU compatibility.** Restores missing menu text and handles the PS5 CLZERO instruction on hosts that lack it. [Release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1215).
 
 **KAGE: Shadow of the Ninja reached 60 FPS on a third-generation Intel Core i5 (Ivy Bridge)** in a project test reported on 24 November 2026. [Older CPU test and instruction compatibility](COMPATIBILITY.md#older-cpu-test).
 
 **Latest recorded gameplay:** Quake reached the first map at approximately 33–37 FPS on Intel Iris Xe in a 23 November development session. The compatibility list gives the scope and hardware of every record, including earlier runs of Sonic Origins Plus, Sonic Superstars and Quake II.
 
 - [Latest release, downloads, and release notes](https://github.com/zeraps5/ZeraPS5-Releases/releases/latest)
-- [Download for Windows x64 — build 1214](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1214/ZeraPS5-v0.1.1-b1214-win64.zip)
-- [Download matching source — build 1214](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1214/ZeraPS5-v0.1.1-b1214-win64-source.zip)
+- [Download for Windows x64 — build 1215](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1215/ZeraPS5-v0.1.1-b1215-win64.zip)
+- [Download matching source — build 1215](https://github.com/zeraps5/ZeraPS5-Releases/releases/download/v0.1.1-b1215/ZeraPS5-v0.1.1-b1215-win64-source.zip)
 
 1. Download the application ZIP above, rather than GitHub’s automatic source archive.
 2. Extract the ZIP to a short, writable folder (for example, `C:\ZeraPS5`) and open **ZeraPS5.exe**. Very long paths can exceed Windows extraction limits during updates.
@@ -32,7 +32,7 @@
 
 ## Game compatibility
 
-**b1214 passed 196 automated Windows checks.** [Package and updater validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1214). Game records retain their tested revisions.
+**b1215 passed 196 automated Windows checks.** [Package and updater validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1215). Game records retain their tested revisions.
 
 [Game compatibility and tested builds](COMPATIBILITY.md) — reviewed 25 November 2026, with dated Intel and RTX sessions, tested revisions where recorded, and the startup survey.
 
@@ -40,7 +40,7 @@
 
 Public distribution maintained by **Metallrock (metallrockdev)**.
 
-The default branch includes the b1214 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1214) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
+The default branch includes the b1215 emulator source and tests. The [release tag](https://github.com/zeraps5/ZeraPS5-Releases/tree/v0.1.1-b1215) identifies the exact packaged revision. The b984 source import includes the [source changelog](docs/source-changelog-b984.md). Releases published before the source import retain their original tags. For the exact source of a published build, use its versioned `*-source.zip` and the `sources/` materials in the Windows package.
 
 ## Experimental software
 

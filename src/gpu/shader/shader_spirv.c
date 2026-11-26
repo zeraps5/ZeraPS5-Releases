@@ -4558,6 +4558,7 @@ static void export_op(tr *t, const rdna2_inst *in) {
         if ((t->info->ps_mrt_rb_swap >> tgt) & 1u) {
             uint32_t tmp = c[0]; c[0] = c[2]; c[2] = tmp;
         }
+        if ((t->info->ps_mrt_rb_swap >> (8 + tgt)) & 1u) c[0] = c[3];
         uint32_t vec = spv_op(&t->b, SpvOpCompositeConstruct, spv_type_vector(&t->b, type, 4), c, 4);
         uint32_t merge = begin_if(t, active(t));
         st(t, t->out_mrt[tgt], vec);
@@ -4584,6 +4585,8 @@ static void export_op(tr *t, const rdna2_inst *in) {
     if (t->info->stage == SH_STAGE_PS && tgt < 8 && ((t->info->ps_mrt_rb_swap >> tgt) & 1u)) {
         uint32_t tmp = c[0]; c[0] = c[2]; c[2] = tmp;
     }
+    if (t->info->stage == SH_STAGE_PS && tgt < 8 && ((t->info->ps_mrt_rb_swap >> (8 + tgt)) & 1u))
+        c[0] = c[3];
     uint32_t vec[4] = {c[0], c[1], c[2], c[3]};
     uint32_t v = spv_op(&t->b, SpvOpCompositeConstruct, t->t_v4f, vec, 4);
     if(t->info->stage==SH_STAGE_MESH) { mesh_export(t,in,v,c);return; }
