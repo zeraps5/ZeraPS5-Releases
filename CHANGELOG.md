@@ -1,5 +1,10 @@
 # Release changelog
 
+## v0.1.1-b1214 preview - 26 November 2026
+
+- Simplified provably single-iteration shader loops to reduce pipeline creation stalls on affected Vulkan drivers.
+- GTAVIPS5 testing reached the loading screen. Gameplay remains unverified.
+
 ## v0.1.1-b1192 - 25 November 2026
 
 - Fixed duplicate PKG and exFAT listings for the same file. Mounted .pkg files appear once as PKG. Game copies in separate folders remain visible.

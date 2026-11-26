@@ -5515,9 +5515,85 @@ static bool sf_range(sf_state *s, uint32_t a, uint32_t b, const sf_loop *loop) {
  * through the merge that follows). */
 static void sf_dead_block(sf_state *s) { spv_label(&s->t->b, spv_id(&s->t->b)); }
 
+/* A waterfall loop [h, j] that one lane per invocation runs exactly once:
+ *   h:   v_readfirstlane_b32 sX, vY
+ *        v_cmpx_eq_u32 sX, vY          exec: the lanes holding the first lane's value
+ *        ... (no branch, no other write to exec or S)
+ *        s_andn2_b64 S, S, exec        the lanes still to do
+ *        ... (vector ALU only: SCC stays)
+ *        s_mov_b64 exec, S
+ *   j:   s_cbranch_scc1 / s_cbranch_execnz h
+ * entered with S equal to exec (s_mov_b64 S, exec; or exec and S both moved from X).
+ * Without a full wave the lane reads its own value, so the compare keeps exec and S & ~exec
+ * is 0: the loop ends after its first pass. Preserving many such loops in SPIR-V
+ * can take minutes to compile on affected drivers. */
+static bool sf_waterfall_once(const tr *t, uint32_t h, uint32_t j) {
+    const sh_program *p = t->p;
+    if (t->full_wave32 || t->full_wave64 || h < 2 || j < h + 4) return false;
+    if (p->ops[j] != SH_OP_S_CBRANCH_SCC1 && p->ops[j] != SH_OP_S_CBRANCH_EXECNZ) return false;
+    const rdna2_inst *rf = &p->insts[h], *cmp = &p->insts[h + 1], *mov = &p->insts[j - 1];
+    if (p->ops[h] != SH_OP_V_READFIRSTLANE_B32 || p->ops[h + 1] != SH_OP_V_CMPX || cmp->enc != RDNA2_ENC_VOPC ||
+        !cmp->name || strncmp(cmp->name, "v_cmpx_eq_u32", 13))
+        return false;
+    uint32_t sx = (rf->dst - RDNA2_OP_VGPR) & 0x7F, vy = rf->src[0];
+    if (vy < RDNA2_OP_VGPR || !((cmp->src[0] == sx && cmp->src[1] == vy) || (cmp->src[0] == vy && cmp->src[1] == sx)))
+        return false;
+    if (p->ops[j - 1] != SH_OP_S_MOV_B64 || mov->dst != RDNA2_OP_EXEC_LO) return false;
+    uint32_t sreg = mov->src[0];
+    if (sreg + 1 >= RDNA2_OP_EXEC_LO || (sreg & 1)) return false;
+    /* The first-lane read must preserve both halves of the saved EXEC mask. */
+    if (sx == sreg || sx == sreg + 1) return false;
+    uint32_t andn2 = 0;
+    for (uint32_t i = h + 2; i < j - 1; i++) {
+        const rdna2_inst *in = &p->insts[i];
+        if (is_branch_op(p->ops[i]) || p->ops[i] == SH_OP_S_SWAPPC_B64 || p->ops[i] == SH_OP_S_BARRIER ||
+            p->ops[i] == SH_OP_S_ENDPGM || p->ops[i] == SH_OP_S_CODE_END)
+            return false;
+        if (p->ops[i] == SH_OP_S_ANDN2_B64 && in->dst == sreg && in->src[0] == sreg && in->src[1] == RDNA2_OP_EXEC_LO) {
+            if (andn2) return false;
+            andn2 = i;
+            continue;
+        }
+        for (uint32_t r = 0; r < 2; r++)
+            if (sh_barrier_writes_s(p, i, RDNA2_OP_EXEC_LO + r) || sh_barrier_writes_s(p, i, sreg + r)) return false;
+        bool valu = in->enc == RDNA2_ENC_VOP1 || in->enc == RDNA2_ENC_VOP2 || in->enc == RDNA2_ENC_VOP3;
+        if (andn2 && p->ops[j] == SH_OP_S_CBRANCH_SCC1 && !valu) return false; /* SCC from the s_andn2 */
+    }
+    if (!andn2) return false;
+    /* entered only by falling through (the back edge aside), S equal to exec */
+    for (uint32_t i = 0; i < p->count; i++)
+        if (i != j && is_branch_op(p->ops[i]) && (uint32_t)p->target[i] + 2u > h && p->target[i] <= j) return false;
+    /* back from h over vector ALU code: the last writes of S and exec are moves of exec, or of one X */
+    uint32_t s_src = 0, exec_src = 0;
+    bool s_found = false, exec_found = false;
+    for (uint32_t k = h; k-- > 0 && k + 8 >= h && !(s_found && exec_found);) {
+        const rdna2_inst *in = &p->insts[k];
+        if (is_branch_op(p->ops[k])) return false;
+        for (uint32_t i = 0; i < p->count; i++)
+            if (is_branch_op(p->ops[i]) && p->target[i] == k + 1 && k + 1 < h) return false;
+        bool to_s = sh_barrier_writes_s(p, k, sreg) || sh_barrier_writes_s(p, k, sreg + 1);
+        bool to_exec = sh_barrier_writes_s(p, k, RDNA2_OP_EXEC_LO) || sh_barrier_writes_s(p, k, RDNA2_OP_EXEC_HI);
+        if (to_s || to_exec) {
+            if (p->ops[k] != SH_OP_S_MOV_B64 || (to_s && to_exec)) return false;
+            if (to_s && !s_found) s_found = true, s_src = in->src[0];
+            if (to_exec && !exec_found) exec_found = true, exec_src = in->src[0];
+            if (s_found && s_src == RDNA2_OP_EXEC_LO && !exec_found) return true; /* S = exec, exec kept since */
+            continue;
+        }
+        bool valu = in->enc == RDNA2_ENC_VOP1 || in->enc == RDNA2_ENC_VOP2 || in->enc == RDNA2_ENC_VOP3;
+        if (!valu) return false;
+        /* the moved value must not change between the two moves */
+        if ((s_found || exec_found) && (sh_barrier_writes_s(p, k, s_found ? s_src : exec_src) ||
+                                        sh_barrier_writes_s(p, k, (s_found ? s_src : exec_src) + 1)))
+            return false;
+    }
+    return s_found && exec_found && s_src == exec_src && s_src + 1 < RDNA2_OP_EXEC_LO && s_src != sreg &&
+           s_src + 1 != sreg && s_src != sreg + 1;
+}
+
 static bool sf_loop_at(sf_state *s, uint32_t h, uint32_t j, const sf_loop *outer) {
-    (void)outer;
     tr *t = s->t;
+    if (sf_waterfall_once(t, h, j)) return sf_range(s, h, j, outer); /* its body once, no loop */
     spv_builder *b = &t->b;
     uint32_t header = 0, body = 0, cont = 0, merge = 0, count = s->count;
     if (s->emit) {
