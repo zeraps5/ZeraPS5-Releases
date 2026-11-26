@@ -450,6 +450,12 @@ static void game_config_path(const game *g, wchar_t *out) {
     swprintf(out, MAX_PATH, L"%ls\\user\\config\\%ls.ini", g_base, g->id);
 }
 
+/* GTA VI's setup UI still uses a 4K surface with the 1080p VideoOut mode.
+ * The folder ID is the launcher's fallback for the local test layout. */
+static bool game_requires_4k_output(const game *g) {
+    return g && (!_wcsicmp(g->id, L"PPSA38500") || !_wcsicmp(g->id, L"GTAVIPS5"));
+}
+
 typedef struct choice {
     int value;
     const wchar_t *name;
@@ -853,8 +859,10 @@ static LRESULT CALLBACK game_config_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         char v[16];
         snprintf(v, sizeof(v), "%d", lang);
         ini_set(doc, "geral", "idioma", lang < 0 ? NULL : v);
-        snprintf(v, sizeof(v), "%d", res);
-        ini_set(doc, "geral", "resolucao", res < 0 ? NULL : v);
+        if (!game_requires_4k_output(g)) {
+            snprintf(v, sizeof(v), "%d", res);
+            ini_set(doc, "geral", "resolucao", res < 0 ? NULL : v);
+        }
         int console = combo_value(g_cfg_console);
         snprintf(v, sizeof(v), "%d", console);
         ini_set(doc, "geral", "console", console < 0 ? NULL : v);
@@ -896,8 +904,10 @@ static void configure_game(int gi) {
     int gres = (int)ini_get_int(g_global, "geral", "resolucao", USER_RESOLUTION_DEFAULT);
     g_cfg_lang = add_combo(w, 170, 44, 230, k_languages, LANGUAGE_COUNT, lang, choice_name(k_languages, LANGUAGE_COUNT, glang));
     add_control(w, L"STATIC", ui_string(L"Resolução da TV:"), 0, 16, 84, 150, 20, 0);
-    g_cfg_res = add_combo(w, 170, 80, 230, k_resolutions, RESOLUTION_COUNT, res,
+    bool requires_4k = game_requires_4k_output(g);
+    g_cfg_res = add_combo(w, 170, 80, 230, k_resolutions, RESOLUTION_COUNT, requires_4k ? 2160 : res,
                           choice_name(k_resolutions, RESOLUTION_COUNT, gres));
+    if (requires_4k) EnableWindow(g_cfg_res, FALSE);
     add_control(w, L"STATIC", ui_string(L"Console:"), 0, 16, 120, 150, 20, 0);
     g_cfg_console = add_combo(w, 170, 116, 230, k_consoles, CONSOLE_COUNT, console,
                               choice_name(k_consoles, CONSOLE_COUNT, (int)ini_get_int(g_global, "geral", "console", 0)));
@@ -2191,25 +2201,33 @@ static void view_log(const game *g) {
 static int environment_compare(const void *a,const void *b) {
     return _wcsicmp(*(const wchar_t *const *)a,*(const wchar_t *const *)b);
 }
-static wchar_t *record_environment_session(const wchar_t *path,const char *id) {
+static wchar_t *record_environment_session(const wchar_t *path, const char *id, const game *g) {
     const wchar_t key[]=L"PS5C_LAUNCHER_RECORDS=",session_key[]=L"PS5C_LAUNCHER_SESSION=";
+    const wchar_t resolution_key[] = L"PS5C_RESOLUTION=";
+    const wchar_t resolution_entry[] = L"PS5C_RESOLUTION=4k";
+    bool requires_4k = game_requires_4k_output(g);
     wchar_t *env=GetEnvironmentStringsW();
     if(!env)return NULL;
-    size_t len=1,count=2;
+    size_t len=1,count=2 + requires_4k;
     for(const wchar_t *p=env;*p;p+=wcslen(p)+1){len+=wcslen(p)+1;
     count++;
     }
     wchar_t record_entry[2*MAX_PATH],session_entry[80];
     swprintf(record_entry,2*MAX_PATH,L"%ls%ls",key,path);
     if(id)swprintf(session_entry,80,L"%ls%hs",session_key,id);
-    wchar_t *out=calloc(len+wcslen(record_entry)+82,sizeof(wchar_t));
+    wchar_t *out=calloc(len+wcslen(record_entry)+82+
+                        (requires_4k ? PS5C_ARRAY_COUNT(resolution_entry) : 0),sizeof(wchar_t));
     const wchar_t **entries=calloc(count,sizeof(*entries));
     if(out&&entries) {
         size_t used=0;
         entries[used++]=record_entry;
         if(id)entries[used++]=session_entry;
-        for(const wchar_t *p=env;*p;p+=wcslen(p)+1)
-            if(_wcsnicmp(p,key,wcslen(key))&&_wcsnicmp(p,session_key,wcslen(session_key)))entries[used++]=p;
+        if(requires_4k)entries[used++]=resolution_entry;
+        for(const wchar_t *p=env;*p;p+=wcslen(p)+1) {
+            if (!_wcsnicmp(p,key,wcslen(key)) || !_wcsnicmp(p,session_key,wcslen(session_key)) ||
+                (requires_4k && !_wcsnicmp(p,resolution_key,PS5C_ARRAY_COUNT(resolution_key)-1))) continue;
+            entries[used++]=p;
+        }
         qsort(entries,used,sizeof(*entries),environment_compare);
         wchar_t *at=out;
         for(size_t n=0;n<used;n++){size_t size=wcslen(entries[n])+1;
@@ -2298,7 +2316,7 @@ static void run_game(int gi) {
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = si.hStdError = log;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    wchar_t *environment=record_environment_session(records,g_proc_meta.id);
+    wchar_t *environment=record_environment_session(records,g_proc_meta.id,g);
     if(!environment) {
         report_session_stage(&g_proc_session,&g_proc_meta,SESSION_UNAVAILABLE);
         session_unavailable(g);

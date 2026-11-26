@@ -1,5 +1,11 @@
 # Release changelog
 
+## v0.1.1-b1216 - 26 November 2026
+
+- Use 4K VideoOut when the launcher starts GTA VI so the setup menu fills the game window even with the global TV resolution configured for 1080p.
+
+[Release assets and validation](https://github.com/zeraps5/ZeraPS5-Releases/releases/tag/v0.1.1-b1216).
+
 ## v0.1.1-b1215 - 26 November 2026
 
 - Restore glyphs that were missing after late updates to linear single-channel texture atlases.
